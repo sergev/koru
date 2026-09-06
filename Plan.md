@@ -8,8 +8,9 @@ yield to its executor between "call" and "return". This project designs a fresh 
 built for async/await from the start — no POSIX compatibility, no `errno`, no fds — and
 proves it with a working userspace program driven entirely through the new interface.
 
-Both sides are Rust: an out-of-tree Rust kernel module for dispatch, and a userspace crate
-with `Future` impls and its own executor.
+The kernel side is an out-of-tree Rust module for dispatch. Two independent userspace
+bindings sit on top of the same unchanged ABI: a Rust crate with `Future` impls, and a
+C++20 header library with `co_await`-able awaiters. Each has its own executor.
 
 The defining constraint, chosen deliberately: **a coroutine can never own kernel-visible
 memory.** Rust futures can be dropped at any await point (`select!`, timeouts, cancelled
@@ -17,8 +18,9 @@ tasks), and `Drop` cannot be async — so any design where an in-flight operatio
 userspace pointer has an unavoidable use-after-free. We remove the possibility rather than
 manage it.
 
-Outcome: `/dev/xring`, a Rust module implementing it, and a demo that opens and reads a
-real file through coroutines while timers complete out of order.
+Outcome: `/dev/xring`, a Rust module implementing it, and two demos — one Rust, one
+C++20 — that each open and read a real file through coroutines while timers complete out
+of order.
 
 ## Research findings that shaped this design
 
@@ -70,7 +72,7 @@ abstractions. Budget accordingly.
   the *kernel* allocates and holds an owning reference to, inserted with `vm_insert_page`.
 
 Since `ENTER` is the only entry point, a shared SQ would save zero syscalls. A shared CQ
-would save syscalls on reaping — a real but deferrable optimization (T16).
+would save syscalls on reaping — a real but deferrable optimization (T22).
 
 ### The central invariant
 
@@ -193,6 +195,89 @@ run from `____fput` on a kworker).
 unkillable in D-state with an unloadable module. On signal return `-EINTR` — but still
 report SQEs consumed, so userspace knows not to resubmit.
 
+## C++20 userspace binding
+
+The kernel side is **unchanged** — same device, same ioctls, same wire format, not one line
+of new kernel code. That is the point: a second userspace implementation in an unrelated
+language is the strongest available evidence that this is a language-neutral ABI rather
+than a Rust idiom with a device node bolted on.
+
+### C++20 coroutines fit this ABI better than Rust futures do
+
+Rust futures are *poll*-based: the executor asks "are you ready?" and must re-poll after
+every wakeup. That is a real impedance mismatch against a completion-based ring, and it is
+why `tokio-uring` exists as a separate runtime at all.
+
+C++20 coroutines are *continuation*-based. `await_suspend(h)` hands the reactor a
+`std::coroutine_handle`; the reactor calls `h.resume()` when the CQE lands. No polling, no
+`Waker` indirection, no spurious-wakeup case. Submission → completion → resume maps
+one-to-one onto suspend → CQE → resume, so the awaiter is thinner than the Rust `Future`:
+
+```
+op_awaiter {
+    await_ready()    -> false        // always suspends; the op is already submitted
+    await_suspend(h) -> void         // store h in the slab entry; that is all
+    await_resume()   -> result<T>    // read cqe.res back out of the slab entry
+}
+```
+
+### Where C++ is weaker, and what actually carries the safety
+
+Rust's move semantics make "the buffer is moved into the operation" a compile-time fact.
+C++ cannot enforce that. `BufSlot` can be made move-only (deleted copy operations), but
+use-after-move is UB the compiler will not catch.
+
+This does **not** weaken the kernel's safety property, and saying so precisely is the whole
+argument for the design:
+
+> The central invariant — the kernel never dereferences a userspace address — is a property
+> of the *ABI*, not of the language binding. A use-after-move bug in C++ can corrupt the
+> program's own view of which slot holds what. It cannot produce a kernel use-after-free,
+> cannot make the kernel touch freed memory, and cannot escape the process. Worst case, a
+> program reads its own stale bytes.
+
+That is a stronger guarantee than any pointer-passing ABI can offer a C++ client.
+
+### The C++-specific hazard: dangling coroutine frames
+
+The awaiter object lives *inside the coroutine frame*. If the frame is destroyed while an
+op is in flight — an abandoned `task`, an exception unwinding a caller, an executor shut
+down early — the reactor holds a `coroutine_handle` into freed memory, and resuming it is
+UB. This is the exact analogue of "drop a Rust future mid-flight" and gets the same
+treatment:
+
+- **`~op_awaiter()` is the C++ spelling of `Future::drop`.** It marks the slab entry
+  `Abandoned`, **moves the `BufSlot` out of the awaiter into the slab entry** (which
+  outlives the frame), and submits `CANCEL`.
+- The reactor never resumes an `Abandoned` entry — it discards it and recycles the slot
+  when the CQE lands.
+- The `(index, generation)` key does the same job as in Rust: a late completion for a
+  cancelled op cannot resume a reused slab entry.
+
+### Other C++ decisions to pin down
+
+- **Symmetric transfer is mandatory.** `final_suspend()` must return an awaiter whose
+  `await_suspend` *returns* the continuation handle rather than calling `.resume()` on it.
+  Without it, a chain of N awaits consumes N stack frames. T19's done test is exactly this.
+- **`await_suspend` must not touch `this` after publishing the handle.** Once the handle is
+  visible to the reactor, the coroutine may already have been resumed and its frame
+  destroyed. Harmless under the single-threaded executor, fatal the moment a waiter thread
+  appears (T23) — so write the rule down now, not then.
+- **No `std::expected` in C++20** (that is C++23). Define `xr::result<T>` holding either a
+  value or an `errno`. Errors travel as values: an exception cannot cross the ABI boundary,
+  and `unhandled_exception()` in a detached task has nowhere to send one. Define it as
+  `std::terminate()` and document the runtime as exception-free by construction.
+- **`task<T>` is lazy and move-only.** `initial_suspend()` returns `suspend_always`, so
+  nothing runs until the task is awaited or handed to `sync_wait`. This makes ownership
+  explicit and forecloses the classic detached-coroutine leak where `run()` returns with
+  frames still suspended.
+- **Coroutine frames heap-allocate.** HALO elision is real but unreliable across compilers;
+  do not design around it. If allocation shows up in a profile, a pooled `operator new` on
+  the promise type is the fix.
+- **Toolchain**: GCC ≥ 11 or Clang ≥ 14, `-std=c++20`. Build with
+  `-fsanitize=address,undefined` from day one — ASan catches the resumed-dangling-handle
+  bug immediately, and that is the bug this binding is most likely to have.
+
 ## Known gaps, accepted for the PoC
 
 - **`rmmod` hole.** An open fd pins the module; a queued work item does not. With no
@@ -226,6 +311,13 @@ Created in dependency order:
 - `kernel/xring_arena.rs` — `KVec<Page>`, the `mmap` validation matrix, the
   `vm_insert_page` loop, slot busy tracking.
 - `user/xring/src/lib.rs` — op slab, `OpState` owning `BufSlot`, `Future` impls, executor.
+- `user/cpp/include/xring_abi.h` — the C mirror of `xring_abi.rs`, kept byte-identical by
+  the T16 conformance test.
+- `user/cpp/include/xring.hpp` — `Ring`, `BufPool`, move-only `BufSlot`, `result<T>`.
+- `user/cpp/include/xring/task.hpp` — `task<T>` promise type, symmetric transfer,
+  `sync_wait`.
+- `user/cpp/include/xring/awaiter.hpp` — op slab, `op_awaiter`, the abandonment path.
+- `user/cpp/examples/read_file.cpp` — the C++20 demo.
 
 ## Tasks
 
@@ -273,7 +365,7 @@ is realism or optimization.
 | T11 **[R]** | `CANCEL`: `res = 0` found/cancelled, `-ENOENT` unknown, `-EALREADY` already running. Target always gets its own CQE (C1); relative ordering unspecified. | Cancel a pending `DELAY_NS` → target `-ECANCELED`, canceller `0`. Cancel a running one → `-EALREADY`, target still completes. Both CQEs always arrive. |
 | T12 **[R]** | **Hostile-userspace fuzz.** Random SQE bytes, random slot/handle/len/off, garbage reserved fields, 8 concurrent `ENTER` threads, concurrent `munmap`, random `kill -9`. | 10 minutes under KASAN + lockdep + kmemleak with zero kernel messages. **Do not skip — this is the only thing that validates the TOCTOU and validation rules.** |
 
-### Phase 4 — userspace
+### Phase 4 — Rust userspace
 
 | # | Task | Done test |
 |---|---|---|
@@ -281,15 +373,33 @@ is realism or optimization.
 | T14 **[R]** | Op slab keyed by `(index, generation)`; `Future` impls; single-threaded executor whose `park()` is `ENTER`. `BufSlot` owned by `OpState`, never by the future. | `async { let h = open("/etc/hostname").await?; let (n, buf) = read(h, buf).await?; print(&buf[..n]); close(h).await?; }` prints the file, concurrently with timers completing out of order. **This is the deliverable.** |
 | T15 **[R]** | Drop-safety test. | Race a `read` future against a timer and drop it mid-flight. Assert a `CANCEL` is submitted, the slot is *not* in the free pool until the target's CQE lands, and a later op on that index does not get `-EBUSY`. 100k iterations under ASAN. |
 
-### Phase 5 — only if justified
+### Phase 5 — C++20 userspace
 
-- **T16 [R]** Shared mmap'd SQ/CQ with `Atomic<u32>` indices, behind a `features` bit,
+No kernel changes. Depends only on T12 (a validated kernel), so it *can* run in parallel
+with Phase 4 — but **do it after T14**. The Rust binding shakes the ABI out; writing the
+second binding against a settled ABI is a test of language-neutrality, whereas writing both
+at once just churns the wire format twice.
+
+| # | Task | Done test |
+|---|---|---|
+| T16 **[M]** | `xring_abi.h` mirroring `xring_abi.rs`, with `static_assert` on every `sizeof` and `offsetof` and on every opcode value. Add an `abi_dump` binary to each side emitting a canonical text dump of the whole ABI surface. | `diff` of the two dumps is empty. Deliberately perturbing one field in either file makes the test fail — verify that, or the test proves nothing. |
+| T17 **[M]** | `libxring` synchronous core: RAII `Ring` (open, `SETUP`, `mmap`, close), `BufPool`, move-only `BufSlot` (deleted copy ops), raw `submit()`/`reap()`, `result<T>`. No coroutines yet. | The entire T4–T11 test matrix re-expressed in C++ and passing — same assertions as T13, different language. Any divergence here is an ABI ambiguity worth fixing before coroutines hide it. |
+| T18 **[R]** | Op slab + `op_awaiter`. `(index, generation)`-keyed slab of `op_state`; `await_ready`/`await_suspend`/`await_resume`; `~op_awaiter` marks `Abandoned`, moves the `BufSlot` into the slab entry, submits `CANCEL`. | Destroy a coroutine frame with an op in flight: under ASan, no resume of a freed handle; the slot is not recycled until the CQE lands; a later op on that index does not get `-EBUSY`. |
+| T19 **[R]** | `task<T>` promise type: lazy `initial_suspend`, **symmetric transfer** on `final_suspend`, move-only, `unhandled_exception -> std::terminate`. `sync_wait(task<T>)`. | 100,000 nested `co_await`s complete with stack usage *measured* flat, not assumed — this is the symmetric-transfer regression test and it silently passes if you write it wrong and only try 10 levels. A task destroyed without being awaited leaks nothing under LSan. |
+| T20 **[R]** | Executor: ready queue, `run()` whose park is `ENTER(min_complete=1, timeout)`, CQE → slab lookup → resume or discard. Close the same empty-ring deadlock foot-gun as the Rust side. | **The C++ demo**: `co_await open("/etc/hostname")`, `read`, print, `close`, concurrent with `delay` ops completing out of order — byte-identical output to the Rust demo. |
+| T21 **[R]** | C++ drop-safety and cross-language interop. | Mirror of T15: race a read against a timer, destroy the frame mid-flight, 100k iterations under ASan + UBSan. Then run the Rust and C++ demos **concurrently** against the same module, each with its own ring, both producing correct output — the language-neutrality claim, actually tested rather than asserted. |
+
+### Phase 6 — only if justified
+
+- **T22 [R]** Shared mmap'd SQ/CQ with `Atomic<u32>` indices, behind a `features` bit,
   keeping the ioctl path as fallback. **Requires first solving finding #2** — obtaining a
   legitimate stable kernel VA into a `Page`, which may mean patching `rust/kernel/page.rs`.
   Re-examine whether it is worth it: with `ENTER`-per-submit the only win is syscall-free
-  CQE reading. Done test: the whole T4–T12 suite passes in both modes, fuzz included.
-- **T17 [R]** eventfd registration + tokio `AsyncFd` bridge. Only if tokio integration
-  becomes a goal, and try the pure-userspace waiter thread first.
+  CQE reading. Done test: the whole T4–T12 suite passes in both modes, fuzz included, in
+  **both** language bindings.
+- **T23 [R]** eventfd registration + tokio `AsyncFd` bridge. Only if tokio integration
+  becomes a goal, and try the pure-userspace waiter thread first. Note this is the point at
+  which the "`await_suspend` must not touch `this`" rule stops being theoretical for C++.
 
 ## Verification
 
@@ -301,9 +411,16 @@ Every phase gate is a runnable test, listed above. Overall end-to-end:
    coroutines while timers complete out of order.
 4. `cargo run --example fuzz --release` for 10 minutes (T12), with `dmesg -w` in another
    terminal. Zero kernel messages is the pass condition.
-5. `echo scan > /sys/kernel/debug/kmemleak; cat /sys/kernel/debug/kmemleak` — empty.
-6. Unprivileged-user creds test (T9) — must fail `-EACCES`.
-7. `rmmod xring` cleanly at the end.
+5. `cmake -B build -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined" && cmake --build build`
+6. `diff <(./build/abi_dump) <(cargo run -q --bin abi_dump)` — empty (T16).
+7. `ctest --test-dir build` — the C++ test matrix (T17), abandonment path (T18), symmetric
+   transfer (T19) and drop-safety loop (T21), all under ASan + UBSan.
+8. `./build/examples/read_file` — the C++20 demo (T20). Output must match step 3 byte for
+   byte.
+9. Run steps 3 and 8 **concurrently** (T21) — both must still be correct.
+10. `echo scan > /sys/kernel/debug/kmemleak; cat /sys/kernel/debug/kmemleak` — empty.
+11. Unprivileged-user creds test (T9) — must fail `-EACCES`.
+12. `rmmod xring` cleanly at the end.
 
 The dev kernel must have KASAN, `PROVE_LOCKING` and `DEBUG_KMEMLEAK` on from day one; they
 pay for themselves in the first week.
