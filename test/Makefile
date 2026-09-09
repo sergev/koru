@@ -7,7 +7,7 @@
 
 CFLAGS := -std=c11 -O1 -g -Wall -Wextra -Werror -D_GNU_SOURCE
 
-TESTS := t3_setup
+TESTS := t3_setup t4_enter
 
 all: $(TESTS)
 

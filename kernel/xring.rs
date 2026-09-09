@@ -6,9 +6,7 @@
 //! to its executor between the call and the answer. See `Plan.md` in the
 //! repository root for the design.
 //!
-//! This is T3: `/dev/xring` exists, each open gets a per-fd [`RingCtx`], and the
-//! ring can be configured once with `SETUP`. There is no submission path and no
-//! arena yet.
+//! T4: `SETUP`, `GET_PARAMS` and `ENTER` with `NOP`. No arena yet.
 
 mod xring_abi;
 
@@ -16,9 +14,9 @@ use kernel::{
     fs::File,
     ioctl::{_IOC_NR, _IOC_SIZE, _IOC_TYPE},
     miscdevice::{MiscDevice, MiscDeviceOptions, MiscDeviceRegistration},
-    new_mutex,
+    new_mutex, new_spinlock,
     prelude::*,
-    sync::{Arc, ArcBorrow, Mutex},
+    sync::{Arc, ArcBorrow, Mutex, SpinLock},
     uaccess::{UserPtr, UserSlice, UserSliceReader, UserSliceWriter},
 };
 
@@ -32,10 +30,7 @@ module! {
     license: "GPL",
 }
 
-/// Module state: just the device registration.
-///
-/// `MiscDeviceRegistration` deregisters in its `Drop`, so unload needs no
-/// explicit teardown.
+/// Module state. `MiscDeviceRegistration` deregisters in `Drop`.
 #[pin_data(PinnedDrop)]
 struct XringModule {
     #[pin]
@@ -47,9 +42,7 @@ impl kernel::InPlaceModule for XringModule {
         // `pr_info!` already prefixes the module name, so do not repeat it.
         pr_info!("init, registering /dev/xring\n");
 
-        // `MiscDeviceOptions` carries no mode, so `miscdevice.mode` stays zero
-        // and the node is created 0600 root:root. That is the intended
-        // permission model for now; see Plan.md.
+        // No mode field, so the node is created 0600 root:root, as intended.
         let options = MiscDeviceOptions { name: c"xring" };
 
         try_pin_init!(Self {
@@ -58,8 +51,7 @@ impl kernel::InPlaceModule for XringModule {
     }
 }
 
-// `#[pin_data]` generates its own `Drop`, so the unload hook must go through
-// `PinnedDrop` rather than a plain `impl Drop`.
+// `#[pin_data]` generates its own `Drop`, so the hook goes through `PinnedDrop`.
 #[pinned_drop]
 impl PinnedDrop for XringModule {
     fn drop(self: Pin<&mut Self>) {
@@ -67,10 +59,8 @@ impl PinnedDrop for XringModule {
     }
 }
 
-/// The configuration a successful `SETUP` established, kept kernel-private.
-///
-/// Held separately from the wire struct so the kernel never reads back values
-/// it once copied from userspace.
+/// What `SETUP` established. Kept separately from the wire struct so the kernel
+/// never reads back values it copied from userspace.
 #[derive(Copy, Clone)]
 struct RingConfig {
     sq_entries: u32,
@@ -80,19 +70,77 @@ struct RingConfig {
     arena_size: u64,
 }
 
-/// Per-fd ring context, the root of the object graph.
+/// Fixed-capacity completion FIFO, allocated at `SETUP` so `ENTER` never
+/// allocates. Used circularly: `cq.len()` is capacity, not occupancy.
 ///
-/// Plan.md's Lifetimes section is the reference for what lands here next: the
-/// arena, the captured credential, the state spinlock for submission, the
-/// handle table and the completion `CondVar`.
-///
-/// `config` is a `Mutex` rather than a `SpinLock` because nothing on this path
-/// is atomic context. The ring `SpinLock` arrives with the submission state in
-/// T4 and covers different fields.
+/// `reserved` counts slots claimed by a consumed SQE that has not completed yet.
+/// Reserving before consuming is what makes CQ overflow unrepresentable.
+struct RingState {
+    cq: KVec<Cqe>,
+    head: usize,
+    len: usize,
+    reserved: usize,
+}
+
+impl RingState {
+    fn capacity(&self) -> usize {
+        self.cq.len()
+    }
+
+    /// Claim a slot. False means full: stop consuming, report a short count.
+    fn reserve(&mut self) -> bool {
+        if self.len + self.reserved >= self.capacity() {
+            return false;
+        }
+        self.reserved += 1;
+        true
+    }
+
+    /// Return an unused claim.
+    fn unreserve(&mut self) {
+        self.reserved -= 1;
+    }
+
+    /// Post a completion, consuming its reservation.
+    fn post(&mut self, cqe: Cqe) {
+        let cap = self.capacity();
+        let idx = (self.head + self.len) % cap;
+        self.cq[idx] = cqe;
+        self.len += 1;
+        self.reserved -= 1;
+    }
+
+    fn front(&self) -> Option<Cqe> {
+        (self.len > 0).then(|| self.cq[self.head])
+    }
+
+    fn pop(&mut self) {
+        self.head = (self.head + 1) % self.capacity();
+        self.len -= 1;
+    }
+}
+
+/// Per-fd ring context, root of the object graph. Plan.md's Lifetimes section
+/// lists what lands here next.
 #[pin_data]
 struct RingCtx {
+    /// `Mutex`, not `SpinLock`: nothing on this path is atomic context.
     #[pin]
     config: Mutex<Option<RingConfig>>,
+
+    /// Serialises all of `ENTER`: the consumer must be single-threaded, and it
+    /// keeps a second reaper out of the peek-then-pop window.
+    ///
+    /// T5 must drop this around the `CondVar` wait, or a waiter blocks every
+    /// submitter on the ring.
+    #[pin]
+    submit_lock: Mutex<()>,
+
+    /// `SpinLock`: from T5 workers post completions from non-sleepable context.
+    ///
+    /// **No `UserSlice` access while held** — `copy_*_user` can fault and sleep.
+    #[pin]
+    state: SpinLock<RingState>,
 }
 
 #[vtable]
@@ -103,56 +151,65 @@ impl MiscDevice for RingCtx {
         Arc::pin_init(
             pin_init!(RingCtx {
                 config <- new_mutex!(None),
+                submit_lock <- new_mutex!(()),
+                // Zero capacity until `SETUP` installs the real queue.
+                state <- new_spinlock!(RingState {
+                    cq: KVec::new(),
+                    head: 0,
+                    len: 0,
+                    reserved: 0,
+                }),
             }),
             GFP_KERNEL,
         )
     }
 
     fn ioctl(me: ArcBorrow<'_, RingCtx>, _file: &File, cmd: u32, arg: usize) -> Result<isize> {
-        // Dispatch on type and command number, never on the whole ioctl number.
-        // The number encodes the caller's struct size, so an exact match would
-        // report a version skew as "no such ioctl" and hide it.
+        // Dispatch on type and command number: matching the whole ioctl number
+        // would report a version skew as "no such ioctl" and hide it.
         if _IOC_TYPE(cmd) != XRING_IOC_TYPE {
             return Err(ENOTTY);
         }
 
         let ptr = UserPtr::from_addr(arg);
-        let size = core::mem::size_of::<XringParams>();
 
-        // Only meaningful for a command we recognise: a size mismatch there
-        // means the two sides were built against different ABI revisions.
-        let check_size = || {
-            if _IOC_SIZE(cmd) == size {
+        // Only for a recognised command: a mismatch means ABI skew.
+        let check_size = |expected: usize| {
+            if _IOC_SIZE(cmd) == expected {
                 Ok(())
             } else {
                 Err(eproto())
             }
         };
+        let params_size = core::mem::size_of::<XringParams>();
+        let enter_size = core::mem::size_of::<XringEnter>();
 
         match _IOC_NR(cmd) {
             XRING_NR_SETUP => {
-                check_size()?;
-                let (reader, writer) = UserSlice::new(ptr, size).reader_writer();
-                me.setup(reader, writer)
+                check_size(params_size)?;
+                let (reader, writer) = UserSlice::new(ptr, params_size).reader_writer();
+                me.setup(reader, writer)?;
+                Ok(0)
             }
             XRING_NR_GET_PARAMS => {
-                check_size()?;
-                me.get_params(UserSlice::new(ptr, size).writer())
+                check_size(params_size)?;
+                me.get_params(UserSlice::new(ptr, params_size).writer())?;
+                Ok(0)
+            }
+            // The only ioctl returning a value: SQEs consumed (E1).
+            XRING_NR_ENTER => {
+                check_size(enter_size)?;
+                me.enter(ptr)
             }
             _ => Err(ENOTTY),
-        }?;
-
-        Ok(0)
+        }
     }
 
-    // `release` is left as the default, which drops the `Arc`. The refcount is
-    // balanced by `ForeignOwnable`: `into_foreign` on open, `from_foreign` on
-    // release. In-flight work will hold its own `Arc` from T5 onward, so the
-    // last one out frees the context.
+    // `release` stays the default; `ForeignOwnable` balances the refcount.
 }
 
 impl RingCtx {
-    /// Fill the fields the kernel always owns: the caps and the ABI identity.
+    /// Fill what the kernel always owns: caps and ABI identity.
     fn fill_caps(p: &mut XringParams) {
         p.magic = XRING_MAGIC;
         p.abi_version = XRING_ABI_VERSION;
@@ -164,19 +221,15 @@ impl RingCtx {
         p.max_arena_bytes = XRING_MAX_ARENA_BYTES;
     }
 
-    /// Validate a `SETUP` request and derive the configuration it asks for.
-    ///
-    /// Pure: it takes no lock and mutates nothing, so a rejected request cannot
-    /// consume the one-shot.
+    /// Validate a `SETUP` request. Pure, so a rejected one cannot consume the
+    /// one-shot.
     fn validate(req: &XringParams) -> Result<RingConfig> {
-        // Identity first, so a binding built against a different module gets an
-        // unambiguous answer rather than a complaint about some field.
+        // Identity first: ABI skew should not surface as a field complaint.
         if req.magic != XRING_MAGIC || req.abi_version != XRING_ABI_VERSION {
             return Err(eproto());
         }
 
-        // Reserved-zero and unknown-flag rejection. This is what allows fields
-        // to be added later without breaking old binaries.
+        // Reserved-zero and unknown-flag rejection: the extensibility rule.
         if req.flags & !XRING_SETUP_FLAGS_ALL != 0 {
             return Err(EINVAL);
         }
@@ -198,8 +251,7 @@ impl RingCtx {
         if cq_entries > XRING_MAX_CQ_ENTRIES {
             return Err(EINVAL);
         }
-        // Admission control reserves a CQ slot per consumed SQE, which is what
-        // makes CQ overflow unrepresentable. A shallower CQ would break it.
+        // A shallower CQ would break the reserve-per-SQE rule.
         if cq_entries < sq_entries {
             return Err(EINVAL);
         }
@@ -213,8 +265,7 @@ impl RingCtx {
             return Err(EINVAL);
         }
 
-        // Both operands are user-controlled `u32`, so this product overflows
-        // trivially. Compute it in `u64` and check the result against the cap.
+        // User-controlled u32s: this product overflows trivially.
         let arena_size = u64::from(slot_size)
             .checked_mul(u64::from(slot_count))
             .ok_or(EINVAL)?;
@@ -236,16 +287,29 @@ impl RingCtx {
         let req: XringParams = reader.read()?;
         let cfg = Self::validate(&req)?;
 
+        // Allocate before locking, so ENTER never allocates.
+        let n = cfg.cq_entries as usize;
+        let mut cq = KVec::with_capacity(n, GFP_KERNEL)?;
+        for _ in 0..n {
+            cq.push(Cqe::default(), GFP_KERNEL)?;
+        }
+
         {
             let mut guard = self.config.lock();
             if guard.is_some() {
                 return Err(EBUSY);
             }
+            // Under the config lock, so no ENTER sees configured-but-empty.
+            let mut state = self.state.lock();
+            state.cq = cq;
+            state.head = 0;
+            state.len = 0;
+            state.reserved = 0;
+            drop(state);
             *guard = Some(cfg);
         }
 
-        // Write back a struct we built from scratch, never one echoed from
-        // userspace, so no unvalidated bytes travel back out.
+        // Built from scratch, not echoed: no unvalidated bytes travel back.
         let mut out = XringParams::default();
         Self::fill_caps(&mut out);
         Self::fill_config(&mut out, &cfg);
@@ -260,6 +324,145 @@ impl RingCtx {
             Self::fill_config(&mut out, &cfg);
         }
         writer.write(&out)
+    }
+
+    /// `XRING_IOC_ENTER`: submit, then reap. Returns SQEs **consumed** (E1);
+    /// completions are counted in `completed`.
+    fn enter(&self, arg: UserPtr) -> Result<isize> {
+        let size = core::mem::size_of::<XringEnter>();
+        let (mut arg_reader, mut arg_writer) = UserSlice::new(arg, size).reader_writer();
+        let mut req: XringEnter = arg_reader.read()?;
+
+        // Protocol failures fail the ioctl; only SQE errors become completions.
+        if req.flags & !XRING_ENTER_FLAGS_ALL != 0 {
+            return Err(EINVAL);
+        }
+        if req.rsvd0 != 0 || req.reserved.iter().any(|&r| r != 0) {
+            return Err(EINVAL);
+        }
+
+        let Some(cfg) = *self.config.lock() else {
+            // No SETUP, so no queue to submit to.
+            return Err(EINVAL);
+        };
+        if req.to_submit > cfg.sq_entries {
+            return Err(EINVAL);
+        }
+        // Unsatisfiable by construction.
+        if req.min_complete > req.cq_space {
+            return Err(EINVAL);
+        }
+
+        // User-controlled u32s: size the regions in u64.
+        let entry = core::mem::size_of::<Sqe>() as u64;
+        let sq_bytes = u64::from(req.to_submit).checked_mul(entry).ok_or(EINVAL)?;
+        let cq_bytes = u64::from(req.cq_space)
+            .checked_mul(core::mem::size_of::<Cqe>() as u64)
+            .ok_or(EINVAL)?;
+        let sq_bytes = usize::try_from(sq_bytes).map_err(|_| EINVAL)?;
+        let cq_bytes = usize::try_from(cq_bytes).map_err(|_| EINVAL)?;
+
+        // One submitter and one reaper at a time.
+        let _submitting = self.submit_lock.lock();
+
+        let consumed = self.submit(
+            UserSlice::new(UserPtr::from_addr(req.sq_addr as usize), sq_bytes).reader(),
+            req.to_submit,
+        )?;
+
+        // T5 adds the `CondVar` wait here for `min_complete`/`timeout_ns`.
+        // Until then every opcode completes inline, so there is no wait.
+        let completed = self.reap(
+            UserSlice::new(UserPtr::from_addr(req.cq_addr as usize), cq_bytes).writer(),
+            req.cq_space,
+        );
+
+        req.completed = completed;
+        arg_writer.write(&req)?;
+        Ok(consumed as isize)
+    }
+
+    /// Consume up to `to_submit` SQEs, returning how many. Every consumed SQE
+    /// posts exactly one completion, malformed ones included (C1).
+    fn submit(&self, mut sq: UserSliceReader, to_submit: u32) -> Result<u32> {
+        let mut consumed: u32 = 0;
+
+        for _ in 0..to_submit {
+            // Reserve before consuming, so the completion always has a home.
+            if !self.state.lock().reserve() {
+                break; // Ring full: short submit count, not an error.
+            }
+
+            // Outside the spinlock: this can fault, and faulting sleeps.
+            let sqe: Sqe = match sq.read() {
+                Ok(sqe) => sqe,
+                Err(e) => {
+                    self.state.lock().unreserve();
+                    // A faulting SQ array is not a completion. Report it only
+                    // if nothing was consumed; else the short count says where.
+                    return if consumed == 0 { Err(e) } else { Ok(consumed) };
+                }
+            };
+
+            consumed += 1;
+            let cqe = Self::execute(&sqe);
+            self.state.lock().post(cqe);
+        }
+
+        Ok(consumed)
+    }
+
+    /// Copy out up to `cq_space` completions. Returns how many were written.
+    fn reap(&self, mut cq: UserSliceWriter, cq_space: u32) -> u32 {
+        let mut completed: u32 = 0;
+
+        while completed < cq_space {
+            // Peek, copy, pop. Popping first would lose the completion on a
+            // faulting copy, breaking C1. Posters only append at the tail.
+            let Some(cqe) = self.state.lock().front() else {
+                break;
+            };
+            if cq.write(&cqe).is_err() {
+                break; // Leave it queued for the next ENTER.
+            }
+            self.state.lock().pop();
+            completed += 1;
+        }
+
+        completed
+    }
+
+    /// Run one SQE and build the completion it owes.
+    fn execute(sqe: &Sqe) -> Cqe {
+        Cqe {
+            user_data: sqe.user_data,
+            res: Self::run(sqe),
+            flags: 0,
+            rsvd0: 0,
+            extra: 0,
+        }
+    }
+
+    /// Opcode dispatch. Returns the CQE `res`. Never fails the ioctl: per E1 a
+    /// bad SQE is a completion.
+    fn run(sqe: &Sqe) -> i64 {
+        let einval = i64::from(EINVAL.to_errno());
+
+        if sqe.rsvd0 != 0 || sqe.flags & !XRING_SQE_FLAGS_ALL != 0 {
+            return einval;
+        }
+
+        match sqe.opcode {
+            XRING_OP_NOP => {
+                // NOP reads no argument fields, so all must be zero.
+                if sqe.len != 0 || sqe.off != 0 || sqe.slot != 0 || sqe.handle != 0 {
+                    return einval;
+                }
+                0
+            }
+            // Unknown, or defined but not yet implemented.
+            _ => einval,
+        }
     }
 
     fn fill_config(p: &mut XringParams, cfg: &RingConfig) {

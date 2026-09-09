@@ -4,11 +4,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## State of the repository
 
-**Design only — no code exists yet.** The repo holds two documents:
+**T0–T4 are done.** The module registers `/dev/xring`, configures a ring with `SETUP`, and
+submits and completes `NOP` through `ENTER`. There is no arena and no blocking wait yet.
 
 - `Plan.md` — canonical design plus a task list T0–T23, each with a "done" test. Read it
   before writing anything. It records *why* several obvious-looking approaches are wrong.
+  Completed tasks are marked, with what their done test actually showed.
 - `README.md` — the short explanation of the idea.
+- `kernel/` — the out-of-tree Rust module. `xring_abi.rs` is the canonical wire format.
+- `test/` — interim C tests, one per task. See Commands.
 
 Work proceeds in plan order. Task numbers are referenced across both documents; if you
 renumber, fix the cross-references.
@@ -50,7 +54,7 @@ with `-fsanitize=address,undefined`.
 
 ## Commands
 
-These work today (T0 through T3):
+These work today (T0 through T4):
 
 ```sh
 KDIR=../kernel-dev/linux-source-7.1
@@ -77,6 +81,8 @@ vng --run $KDIR --user root --memory 4G --cpus 4 \
     --exec "sh ../kernel-dev/t2-donetest.sh"      # 10k open/close, kmemleak
 vng --run $KDIR --user root --memory 4G --cpus 4 \
     --exec "sh ../kernel-dev/t3-donetest.sh"      # SETUP / GET_PARAMS
+vng --run $KDIR --user root --memory 4G --cpus 4 \
+    --exec "sh ../kernel-dev/t4-donetest.sh"      # ENTER, NOP
 
 # Interim userspace tests, built on the host and run in the guest.
 make -C test
@@ -86,6 +92,10 @@ make -C test
 one at T13 and the C++ one at T17. Until T16 exists these programs declare the wire structs
 by hand, so **a change to `kernel/xring_abi.rs` means a matching change in `test/`**, and the
 `_Static_assert` on struct size is what catches you forgetting.
+
+`ENTER` must never touch a `UserSlice` while holding the ring `SpinLock`: `copy_*_user` can
+fault and therefore sleep. The submit and reap loops are structured around that, and
+`DEBUG_ATOMIC_SLEEP` plus lockdep in the dev kernel is what catches a slip.
 
 Assert the exact errno, never just that a call failed. The T3 dispatcher returned `EPROTO`
 where it owed `ENOTTY`, and only an exact-errno assertion noticed. Every rejection test was
