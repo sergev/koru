@@ -4,9 +4,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## State of the repository
 
-**T0–T6 are done.** The module registers `/dev/xring`, configures a ring with `SETUP`, and
-submits `NOP` and `DELAY_NS` through `ENTER`, which blocks for completions. Teardown is
-safe and `rmmod` is refused while anything is live. There is no arena yet.
+**T0–T7 are done.** The module registers `/dev/xring`, configures a ring with `SETUP`, and
+submits `NOP`, `DELAY_NS` and `CHECKSUM` through `ENTER`, which blocks for completions. The
+arena is mmap'd. Teardown is safe and `rmmod` is refused while anything is live. Slot
+exclusivity is T8.
 
 - `Plan.md` — canonical design plus a task list T0–T23, each with a "done" test. Read it
   before writing anything. It records *why* several obvious-looking approaches are wrong.
@@ -55,7 +56,7 @@ with `-fsanitize=address,undefined`.
 
 ## Commands
 
-These work today (T0 through T6):
+These work today (T0 through T7):
 
 ```sh
 KDIR=../kernel-dev/linux-source-7.1
@@ -88,6 +89,8 @@ vng --run $KDIR --user root --memory 4G --cpus 4 \
     --exec "sh ../kernel-dev/t5-donetest.sh"      # DELAY_NS, blocking wait
 vng --run $KDIR --user root --memory 4G --cpus 4 \
     --exec "sh ../kernel-dev/t6-donetest.sh"      # teardown, module pinning
+vng --run $KDIR --user root --memory 4G --cpus 4 \
+    --exec "sh ../kernel-dev/t7-donetest.sh"      # arena mmap, CHECKSUM
 
 # Interim userspace tests, built on the host and run in the guest.
 make -C test
@@ -107,6 +110,18 @@ Wait semantics: `min_complete` decides whether `ENTER` waits at all, `timeout_ns
 the wait and 0 means no cap. `ENTER` returns SQEs consumed on success and `-EINTR` on a
 signal; either way `submitted` and `completed` are written back, so an interrupted call
 still says what not to resubmit.
+
+**The arena.** `slot_size` must be a multiple of `PAGE_SIZE`, so every slot is a whole
+number of pages and nothing straddles a page boundary. Pages are allocated and zeroed at
+`SETUP`, not at `mmap`, so `mmap` never allocates and `SETUP` cannot promise memory it has
+not got. `mmap` is one-shot and demands `MAP_SHARED`, `vm_pgoff == 0` and a length exactly
+equal to `arena_size`; `MAP_PRIVATE` would silently give copy-on-write and is the failure
+Plan.md singles out.
+
+`VM_IO` is deliberately **not** set. The `set_dontcopy` doc says `VM_DONTCOPY` is only
+permanent with `VM_IO`, but `MADV_DOFORK` actually refuses on `VM_SPECIAL`, which includes
+`VM_MIXEDMAP` and `VM_DONTEXPAND`. Both are already set, so userspace cannot undo it, and
+there is a test asserting the `madvise` fails.
 
 **The module pins itself.** `kernel::miscdevice` leaves `fops.owner` NULL, so neither an
 open fd nor a queued work item pins the module on its own. `open`/`release` and the deferred

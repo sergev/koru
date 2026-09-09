@@ -134,7 +134,8 @@ pub(crate) const XRING_OP_READ: u8 = 3; // T10
 pub(crate) const XRING_OP_CLOSE: u8 = 4; // T9
 #[expect(dead_code)]
 pub(crate) const XRING_OP_CANCEL: u8 = 5; // T11
-#[expect(dead_code)]
+/// FNV-1a over `len` bytes at `off` in slot `slot`, returned in `res`.
+/// `handle` must be zero. Scaffolding for the arena; see Plan.md.
 pub(crate) const XRING_OP_CHECKSUM: u8 = 6; // T7
 
 /// Any bit set is rejected.

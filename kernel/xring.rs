@@ -6,9 +6,8 @@
 //! to its executor between the call and the answer. See `Plan.md` in the
 //! repository root for the design.
 //!
-//! T6: `SETUP`, `GET_PARAMS`, `ENTER` with `NOP` and `DELAY_NS`, a blocking
-//! wait, and module pinning so `rmmod` cannot pull text from under a live fd or
-//! a queued op. No arena yet.
+//! T7: the control plane plus the mmap'd arena. Buffers are named by slot
+//! index and live in pages the kernel owns, never by userspace address.
 
 mod xring_abi;
 
@@ -17,6 +16,8 @@ use kernel::{
     fs::File,
     ioctl::{_IOC_NR, _IOC_SIZE, _IOC_TYPE},
     miscdevice::{MiscDevice, MiscDeviceOptions, MiscDeviceRegistration},
+    mm::virt::{flags as vmflags, VmaNew},
+    page::{Page, PAGE_SIZE},
     impl_has_delayed_work, new_condvar, new_delayed_work, new_mutex, new_spinlock,
     prelude::*,
     sync::{Arc, ArcBorrow, CondVar, CondVarTimeoutResult, Mutex, SpinLock},
@@ -186,6 +187,22 @@ struct RingCtx {
     /// Waits on `state`. Notified by every completion, inline or deferred.
     #[pin]
     cq_wait: CondVar,
+
+    /// The arena: one entry per page, allocated at `SETUP`.
+    ///
+    /// `vm_insert_page` takes its own reference, so these can be dropped while a
+    /// mapping still exists. That is what makes `close(fd)` before `munmap`
+    /// safe. Guarded by `config`'s lock, which is only taken outside atomic
+    /// context.
+    #[pin]
+    arena: Mutex<Arena>,
+}
+
+/// Kernel-owned buffer pages, plus whether they have been mapped.
+struct Arena {
+    pages: KVec<Page>,
+    /// `mmap` is one-shot: a second call gets `EBUSY`.
+    mapped: bool,
 }
 
 /// A deferred operation. Plan.md's Lifetimes diagram is the shape.
@@ -252,6 +269,10 @@ impl MiscDevice for RingCtx {
                     inflight: 0,
                 }),
                 cq_wait <- new_condvar!("RingCtx::cq_wait"),
+                arena <- new_mutex!(Arena {
+                    pages: KVec::new(),
+                    mapped: false,
+                }),
             }),
             GFP_KERNEL,
         );
@@ -259,6 +280,56 @@ impl MiscDevice for RingCtx {
             module_put();
         }
         ctx
+    }
+
+    /// Map the arena. One-shot, exact length, `MAP_SHARED` only.
+    fn mmap(me: ArcBorrow<'_, RingCtx>, _file: &File, vma: &VmaNew) -> Result {
+        let Some(cfg) = *me.config.lock() else {
+            return Err(EINVAL);
+        };
+
+        // No `vm_pgoff` accessor on `VmaNew`, so read it raw. A non-zero offset
+        // would mean mapping part of the arena, which we do not support.
+        // SAFETY: the VMA is valid for this call and undergoing setup.
+        let pgoff = unsafe { (*vma.as_ptr()).vm_pgoff };
+        if pgoff != 0 {
+            return Err(EINVAL);
+        }
+
+        // Exact, not "at least": a short mapping would leave slots unbacked.
+        let len = vma.end() - vma.start();
+        if len as u64 != cfg.arena_size {
+            return Err(EINVAL);
+        }
+
+        // MAP_PRIVATE would silently give copy-on-write, so userspace writes
+        // would land in a private copy the kernel never sees. Plan.md calls
+        // this the single most likely day-loser.
+        if vma.flags() & vmflags::SHARED == 0 {
+            return Err(EINVAL);
+        }
+
+        let mut arena = me.arena.lock();
+        if arena.mapped {
+            return Err(EBUSY);
+        }
+
+        // DONTCOPY keeps the arena out of forked children. MIXEDMAP and
+        // DONTEXPAND are both in VM_SPECIAL, which is what makes MADV_DOFORK
+        // refuse, so userspace cannot undo it. VM_IO is not needed for that and
+        // is not set.
+        let mm = vma.set_mixedmap();
+        vma.set_dontcopy();
+        vma.set_dontexpand();
+
+        for (i, page) in arena.pages.iter().enumerate() {
+            // Propagate a partial insert: the kernel tears down the VMA on a
+            // failed mmap, which beats a half-backed arena that reads as valid.
+            mm.vm_insert_page(vma.start() + i * PAGE_SIZE, page)?;
+        }
+
+        arena.mapped = true;
+        Ok(())
     }
 
     /// Drops the `Arc`, then the module reference `open` took.
@@ -363,6 +434,12 @@ impl RingCtx {
         if slot_size == 0 || slot_size > XRING_MAX_SLOT_SIZE {
             return Err(EINVAL);
         }
+        // Whole pages per slot: the arena is order-0 pages, and a slot that
+        // straddled a page boundary would put split logic on the security
+        // boundary. Also makes `arena_size` exactly page-aligned.
+        if slot_size as usize % PAGE_SIZE != 0 {
+            return Err(EINVAL);
+        }
         if slot_count == 0 || slot_count > XRING_MAX_SLOT_COUNT {
             return Err(EINVAL);
         }
@@ -396,6 +473,18 @@ impl RingCtx {
             cq.push(Cqe::default(), GFP_KERNEL)?;
         }
 
+        // The arena too: SETUP reports `arena_size`, so it should fail here
+        // rather than promise memory `mmap` cannot deliver.
+        let npages = (cfg.arena_size as usize) / PAGE_SIZE;
+        let mut pages = KVec::with_capacity(npages, GFP_KERNEL)?;
+        for _ in 0..npages {
+            let page = Page::alloc_page(GFP_KERNEL)?;
+            // Never hand userspace whatever was in the page before.
+            // SAFETY: we hold the only reference; nothing else can touch it.
+            unsafe { page.fill_zero_raw(0, PAGE_SIZE)? };
+            pages.push(page, GFP_KERNEL)?;
+        }
+
         {
             let mut guard = self.config.lock();
             if guard.is_some() {
@@ -409,6 +498,12 @@ impl RingCtx {
             state.reserved = 0;
             state.inflight = 0;
             drop(state);
+
+            let mut arena = self.arena.lock();
+            arena.pages = pages;
+            arena.mapped = false;
+            drop(arena);
+
             *guard = Some(cfg);
         }
 
@@ -630,9 +725,64 @@ impl RingCtx {
                 }
                 RingCtx::defer_delay(me, sqe)
             }
+            XRING_OP_CHECKSUM => {
+                if sqe.handle != 0 {
+                    return Some(einval);
+                }
+                Some(RingCtx::checksum(&me, sqe).unwrap_or_else(|e| i64::from(e.to_errno())))
+            }
             // Unknown, or defined but not yet implemented.
             _ => Some(einval),
         }
+    }
+
+    /// FNV-1a over `len` bytes at `off` in slot `slot`.
+    ///
+    /// Masked to 63 bits so the result is never mistaken for an errno.
+    fn checksum(&self, sqe: &Sqe) -> Result<i64> {
+        let Some(cfg) = *self.config.lock() else {
+            return Err(EINVAL);
+        };
+        if sqe.slot >= cfg.slot_count {
+            return Err(EINVAL);
+        }
+        // All user-controlled: check in u64 before deriving any page index.
+        let end = u64::from(sqe.len).checked_add(sqe.off).ok_or(EINVAL)?;
+        if end > u64::from(cfg.slot_size) {
+            return Err(EINVAL);
+        }
+
+        let base = u64::from(sqe.slot)
+            .checked_mul(u64::from(cfg.slot_size))
+            .ok_or(EINVAL)?
+            .checked_add(sqe.off)
+            .ok_or(EINVAL)?;
+        let mut pos = usize::try_from(base).map_err(|_| EINVAL)?;
+        let mut left = sqe.len as usize;
+
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        let mut buf = [0u8; 256];
+        let arena = self.arena.lock();
+
+        while left > 0 {
+            let page = arena.pages.get(pos / PAGE_SIZE).ok_or(EINVAL)?;
+            let in_page = pos % PAGE_SIZE;
+            let n = core::cmp::min(core::cmp::min(left, PAGE_SIZE - in_page), buf.len());
+
+            // SAFETY: `buf` is valid for `n` bytes and `in_page + n <= PAGE_SIZE`.
+            // Slot exclusivity, which is what rules out a concurrent writer, is
+            // T8; until then nothing else touches a slot under test.
+            unsafe { page.read_raw(buf.as_mut_ptr(), in_page, n)? };
+
+            for &b in &buf[..n] {
+                hash ^= u64::from(b);
+                hash = hash.wrapping_mul(0x100_0000_01b3);
+            }
+            pos += n;
+            left -= n;
+        }
+
+        Ok((hash & 0x7fff_ffff_ffff_ffff) as i64)
     }
 
     /// Queue a `DELAY_NS`. `None` once it owns the reservation.
