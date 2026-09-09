@@ -1,3 +1,5 @@
+.claude
+
 # Kbuild builds in place with M=$PWD, so its output lands here.
 *.o
 *.ko
@@ -9,3 +11,6 @@
 modules.order
 Module.symvers
 .tmp_versions/
+
+# Compiled test binaries.
+t3_setup
