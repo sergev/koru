@@ -6,7 +6,8 @@
 //! to its executor between the call and the answer. See `Plan.md` in the
 //! repository root for the design.
 //!
-//! T4: `SETUP`, `GET_PARAMS` and `ENTER` with `NOP`. No arena yet.
+//! T5: `SETUP`, `GET_PARAMS`, `ENTER` with `NOP` and `DELAY_NS`, and a
+//! blocking wait. No arena yet.
 
 mod xring_abi;
 
@@ -14,10 +15,12 @@ use kernel::{
     fs::File,
     ioctl::{_IOC_NR, _IOC_SIZE, _IOC_TYPE},
     miscdevice::{MiscDevice, MiscDeviceOptions, MiscDeviceRegistration},
-    new_mutex, new_spinlock,
+    impl_has_delayed_work, new_condvar, new_delayed_work, new_mutex, new_spinlock,
     prelude::*,
-    sync::{Arc, ArcBorrow, Mutex, SpinLock},
+    sync::{Arc, ArcBorrow, CondVar, CondVarTimeoutResult, Mutex, SpinLock},
+    time::{msecs_to_jiffies, Jiffies},
     uaccess::{UserPtr, UserSlice, UserSliceReader, UserSliceWriter},
+    workqueue::{self, DelayedWork, WorkItem},
 };
 
 use xring_abi::*;
@@ -73,13 +76,15 @@ struct RingConfig {
 /// Fixed-capacity completion FIFO, allocated at `SETUP` so `ENTER` never
 /// allocates. Used circularly: `cq.len()` is capacity, not occupancy.
 ///
-/// `reserved` counts slots claimed by a consumed SQE that has not completed yet.
-/// Reserving before consuming is what makes CQ overflow unrepresentable.
+/// `reserved` counts slots claimed by a consumed SQE that has not completed yet;
+/// `inflight` counts deferred ops among them. Reserving before consuming is what
+/// makes CQ overflow unrepresentable.
 struct RingState {
     cq: KVec<Cqe>,
     head: usize,
     len: usize,
     reserved: usize,
+    inflight: usize,
 }
 
 impl RingState {
@@ -118,6 +123,11 @@ impl RingState {
         self.head = (self.head + 1) % self.capacity();
         self.len -= 1;
     }
+
+    /// Nothing queued and nothing that could ever arrive.
+    fn idle(&self) -> bool {
+        self.len == 0 && self.inflight == 0
+    }
 }
 
 /// Per-fd ring context, root of the object graph. Plan.md's Lifetimes section
@@ -141,6 +151,42 @@ struct RingCtx {
     /// **No `UserSlice` access while held** — `copy_*_user` can fault and sleep.
     #[pin]
     state: SpinLock<RingState>,
+
+    /// Waits on `state`. Notified by every completion, inline or deferred.
+    #[pin]
+    cq_wait: CondVar,
+}
+
+/// A deferred operation. Plan.md's Lifetimes diagram is the shape.
+///
+/// Holds its own `Arc<RingCtx>`, so the ring outlives `close(fd)` while work is
+/// still queued and the last one out frees it.
+#[pin_data]
+struct OpWork {
+    #[pin]
+    work: DelayedWork<OpWork>,
+    ring: Arc<RingCtx>,
+    sqe: Sqe,
+}
+
+impl_has_delayed_work! {
+    impl HasDelayedWork<Self> for OpWork { self.work }
+}
+
+impl WorkItem for OpWork {
+    type Pointer = Arc<OpWork>;
+
+    /// Runs in a kworker: no user memory, and the submitting task may be gone.
+    fn run(this: Arc<OpWork>) {
+        let cqe = Cqe {
+            user_data: this.sqe.user_data,
+            res: 0,
+            flags: 0,
+            rsvd0: 0,
+            extra: 0,
+        };
+        this.ring.complete(cqe);
+    }
 }
 
 #[vtable]
@@ -158,7 +204,9 @@ impl MiscDevice for RingCtx {
                     head: 0,
                     len: 0,
                     reserved: 0,
+                    inflight: 0,
                 }),
+                cq_wait <- new_condvar!("RingCtx::cq_wait"),
             }),
             GFP_KERNEL,
         )
@@ -199,7 +247,7 @@ impl MiscDevice for RingCtx {
             // The only ioctl returning a value: SQEs consumed (E1).
             XRING_NR_ENTER => {
                 check_size(enter_size)?;
-                me.enter(ptr)
+                RingCtx::enter(me, ptr)
             }
             _ => Err(ENOTTY),
         }
@@ -305,6 +353,7 @@ impl RingCtx {
             state.head = 0;
             state.len = 0;
             state.reserved = 0;
+            state.inflight = 0;
             drop(state);
             *guard = Some(cfg);
         }
@@ -328,7 +377,8 @@ impl RingCtx {
 
     /// `XRING_IOC_ENTER`: submit, then reap. Returns SQEs **consumed** (E1);
     /// completions are counted in `completed`.
-    fn enter(&self, arg: UserPtr) -> Result<isize> {
+    fn enter(me: ArcBorrow<'_, RingCtx>, arg: UserPtr) -> Result<isize> {
+        let this = &*me;
         let size = core::mem::size_of::<XringEnter>();
         let (mut arg_reader, mut arg_writer) = UserSlice::new(arg, size).reader_writer();
         let mut req: XringEnter = arg_reader.read()?;
@@ -337,11 +387,11 @@ impl RingCtx {
         if req.flags & !XRING_ENTER_FLAGS_ALL != 0 {
             return Err(EINVAL);
         }
-        if req.rsvd0 != 0 || req.reserved.iter().any(|&r| r != 0) {
+        if req.reserved.iter().any(|&r| r != 0) {
             return Err(EINVAL);
         }
 
-        let Some(cfg) = *self.config.lock() else {
+        let Some(cfg) = *this.config.lock() else {
             // No SETUP, so no queue to submit to.
             return Err(EINVAL);
         };
@@ -363,33 +413,46 @@ impl RingCtx {
         let cq_bytes = usize::try_from(cq_bytes).map_err(|_| EINVAL)?;
 
         // One submitter and one reaper at a time.
-        let _submitting = self.submit_lock.lock();
+        let submitting = this.submit_lock.lock();
 
-        let consumed = self.submit(
+        let consumed = RingCtx::submit(
+            me,
             UserSlice::new(UserPtr::from_addr(req.sq_addr as usize), sq_bytes).reader(),
             req.to_submit,
         )?;
 
-        // T5 adds the `CondVar` wait here for `min_complete`/`timeout_ns`.
-        // Until then every opcode completes inline, so there is no wait.
-        let completed = self.reap(
+        // Dropped before waiting: sleeping while holding it would block every
+        // other submitter on the ring. Retaken for the reap.
+        drop(submitting);
+        let interrupted = this.wait(req.min_complete as usize, req.timeout_ns);
+        let _submitting = this.submit_lock.lock();
+
+        let completed = this.reap(
             UserSlice::new(UserPtr::from_addr(req.cq_addr as usize), cq_bytes).writer(),
             req.cq_space,
         );
 
+        // Written even on the EINTR path, so the caller knows what not to
+        // resubmit. A single ioctl return value cannot carry both.
+        req.submitted = consumed;
         req.completed = completed;
         arg_writer.write(&req)?;
+
+        if interrupted {
+            return Err(EINTR);
+        }
         Ok(consumed as isize)
     }
 
     /// Consume up to `to_submit` SQEs, returning how many. Every consumed SQE
     /// posts exactly one completion, malformed ones included (C1).
-    fn submit(&self, mut sq: UserSliceReader, to_submit: u32) -> Result<u32> {
+    fn submit(me: ArcBorrow<'_, RingCtx>, mut sq: UserSliceReader, to_submit: u32) -> Result<u32> {
+        let this = &*me;
         let mut consumed: u32 = 0;
 
         for _ in 0..to_submit {
             // Reserve before consuming, so the completion always has a home.
-            if !self.state.lock().reserve() {
+            if !this.state.lock().reserve() {
                 break; // Ring full: short submit count, not an error.
             }
 
@@ -397,7 +460,7 @@ impl RingCtx {
             let sqe: Sqe = match sq.read() {
                 Ok(sqe) => sqe,
                 Err(e) => {
-                    self.state.lock().unreserve();
+                    this.state.lock().unreserve();
                     // A faulting SQ array is not a completion. Report it only
                     // if nothing was consumed; else the short count says where.
                     return if consumed == 0 { Err(e) } else { Ok(consumed) };
@@ -405,11 +468,57 @@ impl RingCtx {
             };
 
             consumed += 1;
-            let cqe = Self::execute(&sqe);
-            self.state.lock().post(cqe);
+            match RingCtx::dispatch(me, &sqe) {
+                // Completed inline: post now, consuming the reservation.
+                Some(res) => this.state.lock().post(Self::cqe(&sqe, res)),
+                // Deferred: the reservation stays claimed until `run` posts.
+                None => {}
+            }
         }
 
         Ok(consumed)
+    }
+
+    /// Post a completion and wake anyone waiting. Called from kworkers too.
+    fn complete(&self, cqe: Cqe) {
+        {
+            let mut state = self.state.lock();
+            state.inflight -= 1;
+            state.post(cqe);
+        }
+        self.cq_wait.notify_all();
+    }
+
+    /// Wait for `min_complete` completions. Returns true if a signal arrived.
+    fn wait(&self, min_complete: usize, timeout_ns: u64) -> bool {
+        if min_complete == 0 {
+            return false;
+        }
+
+        // `timeout_ns == 0` means no cap. Round up so a sub-millisecond request
+        // does not become a zero-jiffy no-wait.
+        let jiffies: Jiffies = if timeout_ns == 0 {
+            Jiffies::MAX
+        } else {
+            msecs_to_jiffies(timeout_ns.div_ceil(1_000_000).try_into().unwrap_or(u32::MAX))
+        };
+
+        let mut state = self.state.lock();
+        loop {
+            if state.len >= min_complete {
+                return false;
+            }
+            // Nothing queued and nothing that could ever arrive: returning
+            // beats sleeping forever. io_uring gets this wrong.
+            if state.idle() {
+                return false;
+            }
+            match self.cq_wait.wait_interruptible_timeout(&mut state, jiffies) {
+                CondVarTimeoutResult::Woken { .. } => {}
+                CondVarTimeoutResult::Timeout => return false,
+                CondVarTimeoutResult::Signal { .. } => return true,
+            }
+        }
     }
 
     /// Copy out up to `cq_space` completions. Returns how many were written.
@@ -432,37 +541,70 @@ impl RingCtx {
         completed
     }
 
-    /// Run one SQE and build the completion it owes.
-    fn execute(sqe: &Sqe) -> Cqe {
+    fn cqe(sqe: &Sqe, res: i64) -> Cqe {
         Cqe {
             user_data: sqe.user_data,
-            res: Self::run(sqe),
+            res,
             flags: 0,
             rsvd0: 0,
             extra: 0,
         }
     }
 
-    /// Opcode dispatch. Returns the CQE `res`. Never fails the ioctl: per E1 a
-    /// bad SQE is a completion.
-    fn run(sqe: &Sqe) -> i64 {
+    /// Opcode dispatch. `Some(res)` completed inline, `None` was deferred and
+    /// will post its own completion. Never fails the ioctl: per E1 a bad SQE is
+    /// a completion.
+    fn dispatch(me: ArcBorrow<'_, RingCtx>, sqe: &Sqe) -> Option<i64> {
         let einval = i64::from(EINVAL.to_errno());
 
         if sqe.rsvd0 != 0 || sqe.flags & !XRING_SQE_FLAGS_ALL != 0 {
-            return einval;
+            return Some(einval);
         }
 
         match sqe.opcode {
             XRING_OP_NOP => {
                 // NOP reads no argument fields, so all must be zero.
                 if sqe.len != 0 || sqe.off != 0 || sqe.slot != 0 || sqe.handle != 0 {
-                    return einval;
+                    return Some(einval);
                 }
-                0
+                Some(0)
+            }
+            XRING_OP_DELAY_NS => {
+                // DELAY_NS reads only `off`.
+                if sqe.len != 0 || sqe.slot != 0 || sqe.handle != 0 {
+                    return Some(einval);
+                }
+                RingCtx::defer_delay(me, sqe)
             }
             // Unknown, or defined but not yet implemented.
-            _ => einval,
+            _ => Some(einval),
         }
+    }
+
+    /// Queue a `DELAY_NS`. `None` once it owns the reservation.
+    fn defer_delay(me: ArcBorrow<'_, RingCtx>, sqe: &Sqe) -> Option<i64> {
+        let jiffies = msecs_to_jiffies(sqe.off.div_ceil(1_000_000).try_into().unwrap_or(u32::MAX));
+
+        let op = match Arc::pin_init(
+            pin_init!(OpWork {
+                work <- new_delayed_work!("OpWork::work"),
+                ring: Arc::from(me),
+                sqe: *sqe,
+            }),
+            GFP_KERNEL,
+        ) {
+            Ok(op) => op,
+            // C1 still holds: a failed op is a completion, not an ioctl error.
+            Err(e) => return Some(i64::from(e.to_errno())),
+        };
+
+        // Counted before enqueueing, or `run` could decrement first.
+        me.state.lock().inflight += 1;
+        if workqueue::system().enqueue_delayed(op, jiffies).is_err() {
+            me.state.lock().inflight -= 1;
+            return Some(i64::from(EAGAIN.to_errno()));
+        }
+        None
     }
 
     fn fill_config(p: &mut XringParams, cfg: &RingConfig) {

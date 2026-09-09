@@ -44,7 +44,7 @@ struct xring_cqe {
 struct xring_enter {
 	uint64_t sq_addr, cq_addr, timeout_ns;
 	uint32_t to_submit, cq_space, min_complete, flags;
-	uint32_t completed, rsvd0;
+	uint32_t completed, submitted;
 	uint64_t reserved[2];
 };
 
@@ -61,7 +61,8 @@ _Static_assert(offsetof(struct xring_enter, to_submit) == 24, "enter.to_submit o
 #define XRING_IOC_ENTER _IOWR('x', 0x02, struct xring_enter)
 
 #define XRING_OP_NOP 0
-#define XRING_OP_DELAY_NS 1
+/* Reserved in the ABI but not implemented yet; repoint as opcodes land. */
+#define XRING_OP_UNIMPLEMENTED 2 /* OPEN, T9 */
 
 #define SQ_ENTRIES 64
 #define CQ_ENTRIES 128
@@ -157,6 +158,7 @@ int main(void)
 	ret = ioctl(fd, XRING_IOC_ENTER, &e);
 	check(ret == 8, "ENTER returns 8 SQEs consumed");
 	check(e.completed == 8, "  completed == 8");
+	check(e.submitted == 8, "  submitted == 8");
 	int ok = 1, res_ok = 1;
 	for (i = 0; i < 8; i++) {
 		if (cq[i].user_data != 0x1000 + i)
@@ -198,7 +200,7 @@ int main(void)
 	      "non-zero unused field yields res == -EINVAL");
 
 	nop(&sq[0], 0x2004);
-	sq[0].opcode = XRING_OP_DELAY_NS; /* defined, not yet implemented */
+	sq[0].opcode = XRING_OP_UNIMPLEMENTED;
 	enter_init(&e, sq, 1, cq, 16);
 	ret = ioctl(fd, XRING_IOC_ENTER, &e);
 	check(ret == 1 && e.completed == 1 && cq[0].res == -EINVAL,
@@ -249,10 +251,6 @@ int main(void)
 	e.reserved[1] = 1;
 	check_errno(ioctl(fd, XRING_IOC_ENTER, &e), EINVAL,
 		    "non-zero ENTER reserved returns EINVAL");
-
-	enter_init(&e, sq, 1, cq, 16);
-	e.rsvd0 = 1;
-	check_errno(ioctl(fd, XRING_IOC_ENTER, &e), EINVAL, "non-zero ENTER rsvd0 returns EINVAL");
 
 	enter_init(&e, sq, SQ_ENTRIES + 1, cq, 16);
 	check_errno(ioctl(fd, XRING_IOC_ENTER, &e), EINVAL,

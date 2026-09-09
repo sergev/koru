@@ -124,7 +124,7 @@ unsafe impl AsBytes for XringParams {}
 
 /// Opcodes. These numbers are ABI; unimplemented ones complete with `EINVAL`.
 pub(crate) const XRING_OP_NOP: u8 = 0; // T4
-#[expect(dead_code)]
+/// Delay for `off` nanoseconds. `len`, `slot` and `handle` must be zero.
 pub(crate) const XRING_OP_DELAY_NS: u8 = 1; // T5
 #[expect(dead_code)]
 pub(crate) const XRING_OP_OPEN: u8 = 2; // T9
@@ -196,22 +196,23 @@ pub(crate) struct XringEnter {
     pub(crate) sq_addr: u64,
     /// in: address of an array of at least `cq_space` [`Cqe`].
     pub(crate) cq_addr: u64,
-    /// in: relative MONOTONIC timeout, 0 means do not wait. Rounds to jiffy
-    /// granularity. Honoured from T5.
+    /// in: relative MONOTONIC cap on the wait; 0 means no cap. Only consulted
+    /// when `min_complete > 0`. Rounds to jiffy granularity.
     pub(crate) timeout_ns: u64,
     /// in: number of SQEs to consume.
     pub(crate) to_submit: u32,
     /// in: capacity of the CQE array, counted in entries, not bytes.
     pub(crate) cq_space: u32,
-    /// in: completions to wait for before returning. Honoured from T5.
+    /// in: completions to wait for. 0 returns immediately without waiting.
     pub(crate) min_complete: u32,
     /// in: any bit outside [`XRING_ENTER_FLAGS_ALL`] fails the ioctl.
     pub(crate) flags: u32,
     /// out: CQEs written. Separate from the ioctl return, which E1 reserves for
     /// SQEs consumed; the two differ when completions are left queued.
     pub(crate) completed: u32,
-    /// in: must be zero.
-    pub(crate) rsvd0: u32,
+    /// out: SQEs consumed. Written on every path, error ones included, so an
+    /// `EINTR` return still tells the caller what not to resubmit.
+    pub(crate) submitted: u32,
     /// in: must be zero.
     pub(crate) reserved: [u64; 2],
 }
@@ -246,7 +247,7 @@ kernel::static_assert!(core::mem::offset_of!(XringEnter, cq_space) == 28);
 kernel::static_assert!(core::mem::offset_of!(XringEnter, min_complete) == 32);
 kernel::static_assert!(core::mem::offset_of!(XringEnter, flags) == 36);
 kernel::static_assert!(core::mem::offset_of!(XringEnter, completed) == 40);
-kernel::static_assert!(core::mem::offset_of!(XringEnter, rsvd0) == 44);
+kernel::static_assert!(core::mem::offset_of!(XringEnter, submitted) == 44);
 kernel::static_assert!(core::mem::offset_of!(XringEnter, reserved) == 48);
 
 // SAFETY: `repr(C)`, integers only, so every bit pattern is valid. No interior
