@@ -73,7 +73,17 @@ vng --run $KDIR --user root --memory 4G --cpus 4 \
     --exec "sh ../kernel-dev/t0-donetest.sh"      # kernel itself
 vng --run $KDIR --user root --memory 4G --cpus 4 \
     --exec "sh ../kernel-dev/t1-donetest.sh"      # insmod/rmmod xring.ko
+vng --run $KDIR --user root --memory 4G --cpus 4 \
+    --exec "sh ../kernel-dev/t2-donetest.sh"      # 10k open/close, kmemleak
 ```
+
+**kmemleak reports nothing about an object younger than five seconds**
+(`MSECS_MIN_AGE` in `mm/kmemleak.c`). Scanning right after a test loop reports a clean
+result no matter how badly the code leaks. Every leak check must sleep past that age first;
+`t2-donetest.sh` sleeps 8 seconds, then scans twice, because the first pass after heavy
+allocation is not settled. This was caught by deliberately leaking an `Arc` per open and
+finding the check silent, so treat any new leak test as untrustworthy until it has been
+shown to fail on a real leak.
 
 Expected taint with the module loaded is exactly 4096, `TAINT_OOT_MODULE`. Module signing
 is off in this kernel, so bit 13 must never appear; anything other than 4096 is a finding.
