@@ -4,10 +4,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## State of the repository
 
-**T0–T7 are done.** The module registers `/dev/xring`, configures a ring with `SETUP`, and
+**T0–T8 are done.** The module registers `/dev/xring`, configures a ring with `SETUP`, and
 submits `NOP`, `DELAY_NS` and `CHECKSUM` through `ENTER`, which blocks for completions. The
-arena is mmap'd. Teardown is safe and `rmmod` is refused while anything is live. Slot
-exclusivity is T8.
+arena is mmap'd, with slot exclusivity enforced by the kernel. Teardown is safe and `rmmod`
+is refused while anything is live.
 
 - `Plan.md` — canonical design plus a task list T0–T23, each with a "done" test. Read it
   before writing anything. It records *why* several obvious-looking approaches are wrong.
@@ -56,7 +56,7 @@ with `-fsanitize=address,undefined`.
 
 ## Commands
 
-These work today (T0 through T7):
+These work today (T0 through T8):
 
 ```sh
 KDIR=../kernel-dev/linux-source-7.1
@@ -91,6 +91,8 @@ vng --run $KDIR --user root --memory 4G --cpus 4 \
     --exec "sh ../kernel-dev/t6-donetest.sh"      # teardown, module pinning
 vng --run $KDIR --user root --memory 4G --cpus 4 \
     --exec "sh ../kernel-dev/t7-donetest.sh"      # arena mmap, CHECKSUM
+vng --run $KDIR --user root --memory 4G --cpus 4 \
+    --exec "sh ../kernel-dev/t8-donetest.sh"      # slot exclusivity
 
 # Interim userspace tests, built on the host and run in the guest.
 make -C test
@@ -122,6 +124,14 @@ Plan.md singles out.
 permanent with `VM_IO`, but `MADV_DOFORK` actually refuses on `VM_SPECIAL`, which includes
 `VM_MIXEDMAP` and `VM_DONTEXPAND`. Both are already set, so userspace cannot undo it, and
 there is a test asserting the `madvise` fails.
+
+**Slot exclusivity is kernel-enforced**, by a bitmap in `RingState`. A slot is claimed in
+ioctl context after validation and released in the same critical section that posts the CQE,
+so it is free exactly when userspace can see the completion. An op that is refused a slot
+gets `-EBUSY` as its completion and must not release the slot the winner holds. **`CHECKSUM`
+is deferred to the workqueue**, not run inline: an inline op holds its slot only inside the
+submit loop, so a collision could never happen and the rule would be untestable. `READ` takes
+the same shape at T10.
 
 **The module pins itself.** `kernel::miscdevice` leaves `fops.owner` NULL, so neither an
 open fd nor a queued work item pins the module on its own. `open`/`release` and the deferred

@@ -6,8 +6,9 @@
 //! to its executor between the call and the answer. See `Plan.md` in the
 //! repository root for the design.
 //!
-//! T7: the control plane plus the mmap'd arena. Buffers are named by slot
-//! index and live in pages the kernel owns, never by userspace address.
+//! T8: the control plane, the mmap'd arena, and kernel-enforced slot
+//! exclusivity. Buffers are named by slot index and live in pages the kernel
+//! owns, never by userspace address.
 
 mod xring_abi;
 
@@ -65,6 +66,11 @@ impl PinnedDrop for XringModule {
     }
 }
 
+/// Nanoseconds to jiffies, rounded up so a sub-millisecond delay still waits.
+fn delay_jiffies(ns: u64) -> Jiffies {
+    msecs_to_jiffies(ns.div_ceil(1_000_000).try_into().unwrap_or(u32::MAX))
+}
+
 /// Pin the module. `false` means it is already going away.
 ///
 /// The Rust `miscdevice` abstraction builds its `file_operations` with
@@ -117,6 +123,14 @@ struct RingState {
     len: usize,
     reserved: usize,
     inflight: usize,
+    /// One bit per arena slot, set while an op owns it.
+    ///
+    /// `index < slot_count` is not sufficient validation: nothing stops
+    /// userspace naming one slot in two concurrent SQEs, which would race two
+    /// accesses on one page and break `read_raw`'s no-concurrent-access
+    /// precondition. Exclusivity is enforced here; the userspace pool is
+    /// advisory.
+    slot_busy: KVec<u64>,
 }
 
 impl RingState {
@@ -159,6 +173,21 @@ impl RingState {
     /// Nothing queued and nothing that could ever arrive.
     fn idle(&self) -> bool {
         self.len == 0 && self.inflight == 0
+    }
+
+    /// Claim a slot. False means another op already owns it.
+    fn slot_try_acquire(&mut self, slot: u32) -> bool {
+        let (w, b) = (slot as usize / 64, slot as usize % 64);
+        if self.slot_busy[w] & (1u64 << b) != 0 {
+            return false;
+        }
+        self.slot_busy[w] |= 1u64 << b;
+        true
+    }
+
+    fn slot_release(&mut self, slot: u32) {
+        let (w, b) = (slot as usize / 64, slot as usize % 64);
+        self.slot_busy[w] &= !(1u64 << b);
     }
 }
 
@@ -237,14 +266,18 @@ impl WorkItem for OpWork {
 
     /// Runs in a kworker: no user memory, and the submitting task may be gone.
     fn run(this: Arc<OpWork>) {
-        let cqe = Cqe {
-            user_data: this.sqe.user_data,
-            res: 0,
-            flags: 0,
-            rsvd0: 0,
-            extra: 0,
+        let sqe = &this.sqe;
+        let (res, slot) = match sqe.opcode {
+            XRING_OP_DELAY_NS => (0, None),
+            XRING_OP_CHECKSUM => (
+                this.ring
+                    .checksum(sqe)
+                    .unwrap_or_else(|e| i64::from(e.to_errno())),
+                Some(sqe.slot),
+            ),
+            _ => (i64::from(EINVAL.to_errno()), None),
         };
-        this.ring.complete(cqe);
+        this.ring.complete(RingCtx::cqe(sqe, res), slot);
     }
 }
 
@@ -267,6 +300,7 @@ impl MiscDevice for RingCtx {
                     len: 0,
                     reserved: 0,
                     inflight: 0,
+                    slot_busy: KVec::new(),
                 }),
                 cq_wait <- new_condvar!("RingCtx::cq_wait"),
                 arena <- new_mutex!(Arena {
@@ -485,6 +519,12 @@ impl RingCtx {
             pages.push(page, GFP_KERNEL)?;
         }
 
+        let nwords = (cfg.slot_count as usize).div_ceil(64);
+        let mut slot_busy = KVec::with_capacity(nwords, GFP_KERNEL)?;
+        for _ in 0..nwords {
+            slot_busy.push(0u64, GFP_KERNEL)?;
+        }
+
         {
             let mut guard = self.config.lock();
             if guard.is_some() {
@@ -497,6 +537,7 @@ impl RingCtx {
             state.len = 0;
             state.reserved = 0;
             state.inflight = 0;
+            state.slot_busy = slot_busy;
             drop(state);
 
             let mut arena = self.arena.lock();
@@ -629,10 +670,16 @@ impl RingCtx {
     }
 
     /// Post a completion and wake anyone waiting. Called from kworkers too.
-    fn complete(&self, cqe: Cqe) {
+    ///
+    /// The slot is released in the same critical section that posts the CQE, so
+    /// it is free exactly when userspace can see the completion, never before.
+    fn complete(&self, cqe: Cqe, free_slot: Option<u32>) {
         {
             let mut state = self.state.lock();
             state.inflight -= 1;
+            if let Some(slot) = free_slot {
+                state.slot_release(slot);
+            }
             state.post(cqe);
         }
         self.cq_wait.notify_all();
@@ -723,13 +770,29 @@ impl RingCtx {
                 if sqe.len != 0 || sqe.slot != 0 || sqe.handle != 0 {
                     return Some(einval);
                 }
-                RingCtx::defer_delay(me, sqe)
+                RingCtx::defer(me, sqe, delay_jiffies(sqe.off))
             }
             XRING_OP_CHECKSUM => {
                 if sqe.handle != 0 {
                     return Some(einval);
                 }
-                Some(RingCtx::checksum(&me, sqe).unwrap_or_else(|e| i64::from(e.to_errno())))
+                // Validate in ioctl context, before claiming anything.
+                if let Err(e) = RingCtx::check_range(&me, sqe) {
+                    return Some(i64::from(e.to_errno()));
+                }
+                if !me.state.lock().slot_try_acquire(sqe.slot) {
+                    return Some(i64::from(EBUSY.to_errno()));
+                }
+                // Deferred, so the slot is genuinely held across a window. That
+                // window is what makes exclusivity observable, and it is the
+                // same shape READ takes in T10.
+                match RingCtx::defer(me, sqe, 0) {
+                    None => None,
+                    Some(res) => {
+                        me.state.lock().slot_release(sqe.slot);
+                        Some(res)
+                    }
+                }
             }
             // Unknown, or defined but not yet implemented.
             _ => Some(einval),
@@ -739,7 +802,7 @@ impl RingCtx {
     /// FNV-1a over `len` bytes at `off` in slot `slot`.
     ///
     /// Masked to 63 bits so the result is never mistaken for an errno.
-    fn checksum(&self, sqe: &Sqe) -> Result<i64> {
+    fn check_range(&self, sqe: &Sqe) -> Result<()> {
         let Some(cfg) = *self.config.lock() else {
             return Err(EINVAL);
         };
@@ -751,6 +814,14 @@ impl RingCtx {
         if end > u64::from(cfg.slot_size) {
             return Err(EINVAL);
         }
+        Ok(())
+    }
+
+    fn checksum(&self, sqe: &Sqe) -> Result<i64> {
+        self.check_range(sqe)?;
+        let Some(cfg) = *self.config.lock() else {
+            return Err(EINVAL);
+        };
 
         let base = u64::from(sqe.slot)
             .checked_mul(u64::from(cfg.slot_size))
@@ -785,10 +856,8 @@ impl RingCtx {
         Ok((hash & 0x7fff_ffff_ffff_ffff) as i64)
     }
 
-    /// Queue a `DELAY_NS`. `None` once it owns the reservation.
-    fn defer_delay(me: ArcBorrow<'_, RingCtx>, sqe: &Sqe) -> Option<i64> {
-        let jiffies = msecs_to_jiffies(sqe.off.div_ceil(1_000_000).try_into().unwrap_or(u32::MAX));
-
+    /// Queue an op on the workqueue. `None` once it owns the reservation.
+    fn defer(me: ArcBorrow<'_, RingCtx>, sqe: &Sqe, jiffies: Jiffies) -> Option<i64> {
         // Paired with `PinnedDrop for OpWork`. Taken before the allocation so
         // the drop impl always has a reference to release.
         module_get_live();
