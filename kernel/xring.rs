@@ -6,12 +6,14 @@
 //! to its executor between the call and the answer. See `Plan.md` in the
 //! repository root for the design.
 //!
-//! T5: `SETUP`, `GET_PARAMS`, `ENTER` with `NOP` and `DELAY_NS`, and a
-//! blocking wait. No arena yet.
+//! T6: `SETUP`, `GET_PARAMS`, `ENTER` with `NOP` and `DELAY_NS`, a blocking
+//! wait, and module pinning so `rmmod` cannot pull text from under a live fd or
+//! a queued op. No arena yet.
 
 mod xring_abi;
 
 use kernel::{
+    bindings,
     fs::File,
     ioctl::{_IOC_NR, _IOC_SIZE, _IOC_TYPE},
     miscdevice::{MiscDevice, MiscDeviceOptions, MiscDeviceRegistration},
@@ -60,6 +62,35 @@ impl PinnedDrop for XringModule {
     fn drop(self: Pin<&mut Self>) {
         pr_info!("exit\n");
     }
+}
+
+/// Pin the module. `false` means it is already going away.
+///
+/// The Rust `miscdevice` abstraction builds its `file_operations` with
+/// `..zeroed()`, so `fops.owner` is NULL and `fops_get` pins nothing. Without
+/// this, `rmmod` frees text that an open file still points into.
+fn module_get() -> bool {
+    // SAFETY: `THIS_MODULE` is valid for the life of the module.
+    unsafe { bindings::try_module_get(THIS_MODULE.as_ptr()) }
+}
+
+/// Pin the module when a reference is already held, so it cannot fail.
+fn module_get_live() {
+    // SAFETY: the caller holds a reference via the open fd, so the refcount is
+    // non-zero and this cannot race the module going away.
+    unsafe { bindings::__module_get(THIS_MODULE.as_ptr()) }
+}
+
+/// Drop a reference taken by [`module_get`] or [`module_get_live`].
+///
+/// Called from module text, so a *blocking* `delete_module` could in principle
+/// proceed while this function returns. Default `rmmod` is non-blocking and
+/// fails on a non-zero count, so the window needs a blocking unload racing the
+/// last close. The real fix is upstream: `MiscDeviceOptions` has no way to set
+/// `fops.owner`, which is what makes the VFS drop the reference from core text.
+fn module_put() {
+    // SAFETY: balanced against a get taken on this path.
+    unsafe { bindings::module_put(THIS_MODULE.as_ptr()) }
 }
 
 /// What `SETUP` established. Kept separately from the wire struct so the kernel
@@ -161,12 +192,23 @@ struct RingCtx {
 ///
 /// Holds its own `Arc<RingCtx>`, so the ring outlives `close(fd)` while work is
 /// still queued and the last one out frees it.
-#[pin_data]
+///
+/// Also holds a module reference for its whole life, including the delay before
+/// it runs: a queued work item points at `run` in module text, and nothing else
+/// keeps that text alive once the fd is closed.
+#[pin_data(PinnedDrop)]
 struct OpWork {
     #[pin]
     work: DelayedWork<OpWork>,
     ring: Arc<RingCtx>,
     sqe: Sqe,
+}
+
+#[pinned_drop]
+impl PinnedDrop for OpWork {
+    fn drop(self: Pin<&mut Self>) {
+        module_put();
+    }
 }
 
 impl_has_delayed_work! {
@@ -194,7 +236,10 @@ impl MiscDevice for RingCtx {
     type Ptr = Arc<Self>;
 
     fn open(_file: &File, _misc: &MiscDeviceRegistration<Self>) -> Result<Arc<Self>> {
-        Arc::pin_init(
+        if !module_get() {
+            return Err(ENODEV);
+        }
+        let ctx = Arc::pin_init(
             pin_init!(RingCtx {
                 config <- new_mutex!(None),
                 submit_lock <- new_mutex!(()),
@@ -209,7 +254,17 @@ impl MiscDevice for RingCtx {
                 cq_wait <- new_condvar!("RingCtx::cq_wait"),
             }),
             GFP_KERNEL,
-        )
+        );
+        if ctx.is_err() {
+            module_put();
+        }
+        ctx
+    }
+
+    /// Drops the `Arc`, then the module reference `open` took.
+    fn release(device: Arc<Self>, _file: &File) {
+        drop(device);
+        module_put();
     }
 
     fn ioctl(me: ArcBorrow<'_, RingCtx>, _file: &File, cmd: u32, arg: usize) -> Result<isize> {
@@ -253,7 +308,6 @@ impl MiscDevice for RingCtx {
         }
     }
 
-    // `release` stays the default; `ForeignOwnable` balances the refcount.
 }
 
 impl RingCtx {
@@ -585,6 +639,10 @@ impl RingCtx {
     fn defer_delay(me: ArcBorrow<'_, RingCtx>, sqe: &Sqe) -> Option<i64> {
         let jiffies = msecs_to_jiffies(sqe.off.div_ceil(1_000_000).try_into().unwrap_or(u32::MAX));
 
+        // Paired with `PinnedDrop for OpWork`. Taken before the allocation so
+        // the drop impl always has a reference to release.
+        module_get_live();
+
         let op = match Arc::pin_init(
             pin_init!(OpWork {
                 work <- new_delayed_work!("OpWork::work"),
@@ -595,7 +653,10 @@ impl RingCtx {
         ) {
             Ok(op) => op,
             // C1 still holds: a failed op is a completion, not an ioctl error.
-            Err(e) => return Some(i64::from(e.to_errno())),
+            Err(e) => {
+                module_put();
+                return Some(i64::from(e.to_errno()));
+            }
         };
 
         // Counted before enqueueing, or `run` could decrement first.

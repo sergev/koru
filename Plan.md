@@ -280,10 +280,16 @@ treatment:
 
 ## Known gaps, accepted for the PoC
 
-- **`rmmod` hole.** An open fd pins the module; a queued work item does not. With no
-  `cancel_work_sync`/`flush_workqueue` in Rust, close-then-`rmmod` with work pending is a
-  UAF on module text. Fix with a module-scope live-work counter + `CondVar` in
-  `Drop` (~25 lines, T6), or document "do not `rmmod` with ops in flight".
+- **`rmmod` hole — closed in T6, with a documented remnant.** The premise here was wrong:
+  an open fd did *not* pin the module either. `kernel::miscdevice` builds its
+  `file_operations` with `..zeroed()`, so `fops.owner` is NULL, and `fops_get` pins nothing
+  for a NULL owner. Both an open fd and a queued work item were UAFs on module text.
+  T6 takes an explicit reference per open fd (`try_module_get` in `open`, `module_put` in
+  `release`) and per in-flight op (`__module_get` in the deferred path, released in
+  `OpWork`'s `PinnedDrop`), so `rmmod` returns `-EBUSY` instead of corrupting.
+  **Remnant:** both `module_put` calls run from module text, so a *blocking* `delete_module`
+  could proceed as one returns. Default `rmmod` is non-blocking and fails fast on a non-zero
+  count. The real fix is upstream — `MiscDeviceOptions` has no way to set `fops.owner`.
 - **Cancellation is best-effort.** `DELAY_NS` via `enqueue_delayed` is genuinely
   cancellable. `OPEN`/`READ` already executing are not — no equivalent of io_uring setting
   `TIF_NOTIFY_SIGNAL` on a blocked worker. `CANCEL` returns `-EALREADY`. A per-op
@@ -344,7 +350,7 @@ is settled while it is still cheap to change.
 | T3 **[M]** ✅ | `SETUP` + `GET_PARAMS` ioctls via `UserSlice`. `_IOWR` encoding, magic + ABI version. `SETUP` callable exactly once, before `mmap`, with kernel-side caps. | **Done.** 24 assertions in `test/t3_setup.c`, all passing: params round-trip, `GET_PARAMS` legal before `SETUP`, magic/version mismatch → `-EPROTO`, unknown flags and non-zero reserved → `-EINVAL`, over-cap rejected not clamped, rejected attempts do not consume the one-shot, second `SETUP` → `-EBUSY`. Caps are reported in the struct rather than fixed as header constants, so raising one is not an ABI change. Verified by deleting three kernel checks and confirming exactly the three matching tests failed. |
 | T4 **[M]** ✅ | `ENTER`: SQEs in, CQEs out via `UserSlice`. `NOP` only. Enforce reserved-zero and unknown-flag rejection. Unknown opcode → `-EINVAL` CQE (E1). | **Done.** 25 assertions in `test/t4_enter.c`. 8 NOPs in, 8 CQEs out, `user_data` matching in order. Unknown opcode, unknown SQE flag, non-zero `rsvd0` and non-zero unused field each yield a `-EINVAL` CQE with the ioctl still succeeding (E1); a mixed batch completes every entry (C1). Short `cq_space` leaves the remainder queued for the next `ENTER`. `Sqe`, `Cqe` (32 bytes) and `XringEnter` (64) are asserted field by field on both sides. Unused fields must be zero per opcode, so they stay available later. Admission control reserves a CQ slot before consuming an SQE, so submitting past `cq_entries` stops at a short count. Verified by breaking C1 and the capacity check and confirming exactly the 8 matching assertions failed. |
 | T5 **[R]** ✅ | `CondVar` blocking wait; `DELAY_NS` via `enqueue_delayed`; `wait_interruptible_timeout`; admission control. | **Done.** 15 assertions in `test/t5_delay.c`. 4 × `DELAY_NS(50ms)` with `min_complete=4` returned in 51 ms, not 200. 10 ms timeout against a 1 s delay returns 0 completions promptly. `SIGINT` gives `-EINTR`, `SIGKILL` actually kills. In-flight ops count against `cq_entries`. The idle-ring foot-gun is closed: `ENTER(0, min_complete=1)` returns at once. Two ABI changes: the `ENTER` reserved word became a `submitted` out-field, since one ioctl return cannot carry both `-EINTR` and the consumed count; and `min_complete` now gates the wait while `timeout_ns` only caps it, with 0 meaning no cap. Verified by serialising the delays (timing assertion failed at 202 ms) and removing the idle-ring escape (that assertion hung and died on its alarm). |
-| T6 **[R]** | Teardown torture; module live-work counter. | `close(fd)` with 4 × `DELAY_NS(5s)` in flight → no oops, kmemleak clean after they elapse. `kill -9` a task blocked in `ENTER` → clean. `rmmod` right after close with work pending → works, or is documented as forbidden. All under KASAN + lockdep. |
+| T6 **[R]** ✅ | Teardown torture; module live-work counter. | **Done.** 6 assertions in `test/t6_teardown.c` plus three `rmmod` cases in the script. `close(fd)` with 4 × `DELAY_NS(5s)` in flight is clean and kmemleak-clean once they elapse; `SIGKILL` on a task blocked in `ENTER` kills it; a new ring opens and submits while old work is still queued. Instead of a live-work counter, the module is **pinned by reference**: `rmmod` is refused while an fd is open *or* an op is in flight, and succeeds once both drain (5 s in the run). This was scoped up after finding that an open fd never pinned the module either — see the corrected known-gaps entry above. Verified by removing the per-op reference, which made the work-pending `rmmod` wrongly succeed while the fd case still refused. |
 
 **T6 is the first demoable milestone: a working async syscall interface.** Everything after
 is realism or optimization.

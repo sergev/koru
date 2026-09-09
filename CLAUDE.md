@@ -4,9 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## State of the repository
 
-**T0–T5 are done.** The module registers `/dev/xring`, configures a ring with `SETUP`, and
-submits `NOP` and `DELAY_NS` through `ENTER`, which blocks for completions. There is no
-arena yet, and teardown with work in flight is T6.
+**T0–T6 are done.** The module registers `/dev/xring`, configures a ring with `SETUP`, and
+submits `NOP` and `DELAY_NS` through `ENTER`, which blocks for completions. Teardown is
+safe and `rmmod` is refused while anything is live. There is no arena yet.
 
 - `Plan.md` — canonical design plus a task list T0–T23, each with a "done" test. Read it
   before writing anything. It records *why* several obvious-looking approaches are wrong.
@@ -55,7 +55,7 @@ with `-fsanitize=address,undefined`.
 
 ## Commands
 
-These work today (T0 through T5):
+These work today (T0 through T6):
 
 ```sh
 KDIR=../kernel-dev/linux-source-7.1
@@ -86,6 +86,8 @@ vng --run $KDIR --user root --memory 4G --cpus 4 \
     --exec "sh ../kernel-dev/t4-donetest.sh"      # ENTER, NOP
 vng --run $KDIR --user root --memory 4G --cpus 4 \
     --exec "sh ../kernel-dev/t5-donetest.sh"      # DELAY_NS, blocking wait
+vng --run $KDIR --user root --memory 4G --cpus 4 \
+    --exec "sh ../kernel-dev/t6-donetest.sh"      # teardown, module pinning
 
 # Interim userspace tests, built on the host and run in the guest.
 make -C test
@@ -105,6 +107,12 @@ Wait semantics: `min_complete` decides whether `ENTER` waits at all, `timeout_ns
 the wait and 0 means no cap. `ENTER` returns SQEs consumed on success and `-EINTR` on a
 signal; either way `submitted` and `completed` are written back, so an interrupted call
 still says what not to resubmit.
+
+**The module pins itself.** `kernel::miscdevice` leaves `fops.owner` NULL, so neither an
+open fd nor a queued work item pins the module on its own. `open`/`release` and the deferred
+op path take and drop explicit references, which makes `rmmod` return `-EBUSY` rather than
+free text still in use. Every new path that outlives an `ENTER` needs the same treatment, and
+a missing `module_put` wedges the module as permanently unloadable.
 
 A test that can hang must arm an alarm and be line-buffered. `_exit` from the handler drops
 a full stdout buffer, which turns a diagnosable hang into a silent one.
