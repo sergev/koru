@@ -50,7 +50,7 @@ with `-fsanitize=address,undefined`.
 
 ## Commands
 
-These work today (T0, T1):
+These work today (T0 through T3):
 
 ```sh
 KDIR=../kernel-dev/linux-source-7.1
@@ -75,7 +75,22 @@ vng --run $KDIR --user root --memory 4G --cpus 4 \
     --exec "sh ../kernel-dev/t1-donetest.sh"      # insmod/rmmod xring.ko
 vng --run $KDIR --user root --memory 4G --cpus 4 \
     --exec "sh ../kernel-dev/t2-donetest.sh"      # 10k open/close, kmemleak
+vng --run $KDIR --user root --memory 4G --cpus 4 \
+    --exec "sh ../kernel-dev/t3-donetest.sh"      # SETUP / GET_PARAMS
+
+# Interim userspace tests, built on the host and run in the guest.
+make -C test
 ```
+
+`test/` holds a small C program per task. It is scaffolding: the real suites are the Rust
+one at T13 and the C++ one at T17. Until T16 exists these programs declare the wire structs
+by hand, so **a change to `kernel/xring_abi.rs` means a matching change in `test/`**, and the
+`_Static_assert` on struct size is what catches you forgetting.
+
+Assert the exact errno, never just that a call failed. The T3 dispatcher returned `EPROTO`
+where it owed `ENOTTY`, and only an exact-errno assertion noticed. Every rejection test was
+then confirmed to have teeth by deleting the corresponding kernel check and watching that
+one test, and only that one, fail.
 
 **kmemleak reports nothing about an object younger than five seconds**
 (`MSECS_MIN_AGE` in `mm/kmemleak.c`). Scanning right after a test loop reports a clean
