@@ -23,22 +23,56 @@ on the same unchanged ABI.
 
 ## Development environment
 
-The host here is macOS and **cannot build or run any of this**. All kernel work happens on
-a separate Linux machine, which needs a kernel ≥6.16 built with `CONFIG_RUST=y` *and its
-full build tree retained* — distro `linux-headers` packages omit `rust/*.rmeta` and cannot
-build out-of-tree Rust modules. Build the dev kernel with KASAN, `PROVE_LOCKING` and
-`DEBUG_KMEMLEAK` on. Use a VM; module bugs panic the machine.
+The host is Debian forky/sid on bare metal (Apple iMac19,1, i9-9900K, 16 threads). It builds
+everything, but **never load a development module on the host kernel** — module bugs panic
+the machine, and this is somebody's desktop, not an expendable box. All module loading
+happens in a VM (see below).
 
-Toolchain floors: rustc 1.85.0, bindgen 0.71.1, `make LLVM=1`. For C++: GCC ≥ 11 or
-Clang ≥ 14, `-std=c++20`, built with `-fsanitize=address,undefined`.
+T0 is done. The dev kernel lives outside this repo at `../kernel-dev/`:
+
+- `../kernel-dev/linux-source-7.1/` — Debian `linux-source-7.1` (7.1.12, same version as the
+  host's running kernel), configured and built. Keep the whole tree: `rust/*.rmeta` is only
+  there, and the installed `linux-headers-7.1.12` genuinely has no `rust/` directory, so
+  out-of-tree Rust modules cannot be built against it.
+- `../kernel-dev/xring-debug.config` — the debug fragment: KASAN generic+inline+vmalloc,
+  `PROVE_LOCKING`, `DEBUG_KMEMLEAK`, `DEBUG_OBJECTS`, DWARF5, `SAMPLE_RUST_MINIMAL=m`.
+  `MODVERSIONS`, `MODULE_SIG`, `DEBUG_INFO_BTF` and `RANDSTRUCT` are deliberately off.
+- `../kernel-dev/t0-donetest.sh` — the T0 done test, run inside the guest.
+
+The base config comes from `vng --kconfig`, so it is a small VM-only kernel; a full build
+takes about 9 minutes and the tree is ~5.4 GB. After any config change, re-check that the
+options actually survived `olddefconfig` — `merge_config.sh` drops unmet ones silently.
+
+Verified toolchain (all from Debian testing): rustc 1.95.0 with rust-src, bindgen 0.72.1,
+clang and lld 21, `make LLVM=1`. `make LLVM=1 rustavailable` passes. Floors from the design
+were rustc 1.85.0 and bindgen 0.71.1. For C++: GCC ≥ 11 or Clang ≥ 14, `-std=c++20`, built
+with `-fsanitize=address,undefined`.
 
 ## Commands
 
-None work yet. `Plan.md`'s Verification section defines the intended end-to-end sequence;
-the load-bearing ones will be:
+These work today (T0):
 
 ```sh
-make -C <kernel-tree> M=$PWD LLVM=1 && insmod xring.ko
+KDIR=../kernel-dev/linux-source-7.1
+
+# Rebuild the dev kernel after a config or source change.
+make -C $KDIR LLVM=1 -j16 && make -C $KDIR LLVM=1 -j16 modules
+
+# Boot it in a VM and run a command. virtme-ng mounts the host filesystem
+# read-only under a tmpfs overlay, so there is no disk image and a panic
+# costs nothing. Drop --exec for an interactive shell.
+vng --run $KDIR --user root --memory 4G --cpus 4 --exec "<command>"
+
+# The T0 done test.
+vng --run $KDIR --user root --memory 4G --cpus 4 \
+    --exec "sh ../kernel-dev/t0-donetest.sh"
+```
+
+The rest of `Plan.md`'s Verification sequence does not work yet; the load-bearing ones will
+be:
+
+```sh
+make -C $KDIR M=$PWD LLVM=1 && insmod xring.ko
 cargo test -p xring-sys                  # Rust ABI + per-opcode integration tests
 cargo run --example read_file            # Rust demo
 ctest --test-dir build                   # C++ tests, under ASan+UBSan

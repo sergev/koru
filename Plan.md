@@ -333,7 +333,7 @@ is settled while it is still cheap to change.
 
 | # | Task | Done test |
 |---|---|---|
-| T0 **[R]** | Build and boot a Rust-enabled kernel on the Linux box (≥6.16, `make LLVM=1`, `CONFIG_RUST=y`, plus KASAN + `PROVE_LOCKING` + `DEBUG_KMEMLEAK`). Keep the full build tree — distro `linux-headers` omit `rust/*.rmeta` and cannot build OOT Rust modules. rustc floor 1.85.0, bindgen 0.71.1. Use an expendable VM: module bugs will panic the kernel. | `modprobe rust_minimal` from `samples/rust` loads and unloads cleanly. |
+| T0 **[R]** ✅ | Build and boot a Rust-enabled kernel on the Linux box (≥6.16, `make LLVM=1`, `CONFIG_RUST=y`, plus KASAN + `PROVE_LOCKING` + `DEBUG_KMEMLEAK`). Keep the full build tree — distro `linux-headers` omit `rust/*.rmeta` and cannot build OOT Rust modules. rustc floor 1.85.0, bindgen 0.71.1. Use an expendable VM: module bugs will panic the kernel. | **Done.** `modprobe rust_minimal` loads, `lsmod` lists it, `rmmod` unloads it, taint 0, under a 7.1.12 kernel with KASAN generic+inline, lockdep and kmemleak all confirmed live. See `CLAUDE.md` for the tree location and commands. |
 | T1 **[R]** | Out-of-tree module skeleton: `Kbuild`, `make -C <tree> M=$PWD LLVM=1`. | `insmod`/`rmmod` cycle, `init`/`exit` print, no unexpected taint. **If T0+T1 exceed ~2 days, switch to an in-tree module under `drivers/` as the PoC vehicle.** |
 | T2 **[M]** | `MiscDevice` with `open`/`release` only; `Arc<RingCtx>` as `Ptr`. | 10,000 open/close loop; `echo scan > /sys/kernel/debug/kmemleak` reports nothing. |
 
