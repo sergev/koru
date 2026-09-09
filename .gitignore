@@ -12,5 +12,11 @@ modules.order
 Module.symvers
 .tmp_versions/
 
-# Compiled test binaries.
-t3_setup
+# Compiled test binaries. Allowlist rather than a name per test: everything in
+# test/ is build output unless it is a source file or the Makefile, so adding a
+# test needs no change here. Note `test/*`, not `test/`: git cannot re-include
+# anything inside a directory it has been told to ignore wholesale.
+test/*
+!test/*.c
+!test/*.h
+!test/Makefile
