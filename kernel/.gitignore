@@ -1,0 +1,11 @@
+# Kbuild builds in place with M=$PWD, so its output lands here.
+*.o
+*.ko
+*.mod
+*.mod.c
+*.d
+*.rmeta
+.*.cmd
+modules.order
+Module.symvers
+.tmp_versions/

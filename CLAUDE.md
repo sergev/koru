@@ -50,7 +50,7 @@ with `-fsanitize=address,undefined`.
 
 ## Commands
 
-These work today (T0):
+These work today (T0, T1):
 
 ```sh
 KDIR=../kernel-dev/linux-source-7.1
@@ -58,21 +58,34 @@ KDIR=../kernel-dev/linux-source-7.1
 # Rebuild the dev kernel after a config or source change.
 make -C $KDIR LLVM=1 -j16 && make -C $KDIR LLVM=1 -j16 modules
 
-# Boot it in a VM and run a command. virtme-ng mounts the host filesystem
-# read-only under a tmpfs overlay, so there is no disk image and a panic
-# costs nothing. Drop --exec for an interactive shell.
+# Build the module, from kernel/. LLVM=1 is not optional: the dev kernel is
+# built with clang and lld. Output lands in kernel/ and is gitignored.
+make -C $KDIR M=$PWD LLVM=1
+
+# Boot the dev kernel in a VM and run a command. virtme-ng mounts the host
+# filesystem read-only under a tmpfs overlay, so there is no disk image, a
+# panic costs nothing, and this repo is visible at its usual path inside the
+# guest. Drop --exec for an interactive shell.
 vng --run $KDIR --user root --memory 4G --cpus 4 --exec "<command>"
 
-# The T0 done test.
+# Done tests.
 vng --run $KDIR --user root --memory 4G --cpus 4 \
-    --exec "sh ../kernel-dev/t0-donetest.sh"
+    --exec "sh ../kernel-dev/t0-donetest.sh"      # kernel itself
+vng --run $KDIR --user root --memory 4G --cpus 4 \
+    --exec "sh ../kernel-dev/t1-donetest.sh"      # insmod/rmmod xring.ko
 ```
+
+Expected taint with the module loaded is exactly 4096, `TAINT_OOT_MODULE`. Module signing
+is off in this kernel, so bit 13 must never appear; anything other than 4096 is a finding.
+
+Only `xring.rs` is named in `kernel/Kbuild`. The other kernel `.rs` files are submodules of
+that one crate, reached by `mod` declarations, not separate `obj-m` entries. This is
+verified working, including rebuilds triggered by editing a submodule alone.
 
 The rest of `Plan.md`'s Verification sequence does not work yet; the load-bearing ones will
 be:
 
 ```sh
-make -C $KDIR M=$PWD LLVM=1 && insmod xring.ko
 cargo test -p xring-sys                  # Rust ABI + per-opcode integration tests
 cargo run --example read_file            # Rust demo
 ctest --test-dir build                   # C++ tests, under ASan+UBSan
