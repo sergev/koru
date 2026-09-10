@@ -1,157 +1,18 @@
 // SPDX-License-Identifier: GPL-2.0
 //
 // T5 done test: DELAY_NS, blocking wait, admission control.
-// Structs mirror kernel/xring_abi.rs by hand until T16.
+
+#include "xring_test.h"
 
 #include <errno.h>
-#include <fcntl.h>
 #include <signal.h>
-#include <stddef.h>
-#include <stdint.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
-#include <sys/ioctl.h>
 #include <sys/wait.h>
-#include <time.h>
 #include <unistd.h>
-
-#define XRING_DEV "/dev/xring"
-#define XRING_MAGIC 0x676e7278u
-#define XRING_ABI_VERSION 1u
-
-struct xring_params {
-	uint32_t magic, abi_version, flags, sq_entries;
-	uint32_t cq_entries, slot_size, slot_count, configured;
-	uint64_t features, arena_size;
-	uint32_t max_sq_entries, max_cq_entries, max_slot_size, max_slot_count;
-	uint64_t max_arena_bytes;
-	uint64_t reserved[4];
-};
-
-struct xring_sqe {
-	uint8_t opcode, flags;
-	uint16_t rsvd0;
-	uint32_t len;
-	uint64_t off;
-	uint64_t user_data;
-	uint32_t slot, handle;
-};
-
-struct xring_cqe {
-	uint64_t user_data;
-	int64_t res;
-	uint32_t flags, rsvd0;
-	uint64_t extra;
-};
-
-struct xring_enter {
-	uint64_t sq_addr, cq_addr, timeout_ns;
-	uint32_t to_submit, cq_space, min_complete, flags;
-	uint32_t completed, submitted;
-	uint64_t reserved[2];
-};
-
-_Static_assert(sizeof(struct xring_sqe) == 32, "sqe size");
-_Static_assert(sizeof(struct xring_cqe) == 32, "cqe size");
-_Static_assert(sizeof(struct xring_enter) == 64, "enter size");
-_Static_assert(offsetof(struct xring_enter, submitted) == 44, "enter.submitted offset");
-
-#define XRING_IOC_SETUP _IOWR('x', 0x00, struct xring_params)
-#define XRING_IOC_ENTER _IOWR('x', 0x02, struct xring_enter)
-
-#define XRING_OP_NOP 0
-#define XRING_OP_DELAY_NS 1
 
 #define SQ_ENTRIES 64
 #define CQ_ENTRIES 128
-#define MS 1000000ull
-
-static int failures;
-
-static void check(int ok, const char *what)
-{
-	printf("%-58s %s\n", what, ok ? "PASS" : "FAIL");
-	if (!ok)
-		failures++;
-}
-
-static void check_errno(int ret, int want, const char *what)
-{
-	if (ret >= 0) {
-		printf("%-58s FAIL (succeeded, expected %s)\n", what, strerror(want));
-		failures++;
-	} else if (errno != want) {
-		printf("%-58s FAIL (got %s, expected %s)\n", what, strerror(errno),
-		       strerror(want));
-		failures++;
-	} else {
-		printf("%-58s PASS\n", what);
-	}
-}
-
-static uint64_t now_ms(void)
-{
-	struct timespec ts;
-	clock_gettime(CLOCK_MONOTONIC, &ts);
-	return (uint64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
-}
-
-static int open_ring(void)
-{
-	struct xring_params p;
-	int fd = open(XRING_DEV, O_RDWR);
-	if (fd < 0) {
-		perror("open " XRING_DEV);
-		failures++;
-		return -1;
-	}
-	memset(&p, 0, sizeof(p));
-	p.magic = XRING_MAGIC;
-	p.abi_version = XRING_ABI_VERSION;
-	p.sq_entries = SQ_ENTRIES;
-	p.cq_entries = CQ_ENTRIES;
-	p.slot_size = 4096;
-	p.slot_count = 32;
-	if (ioctl(fd, XRING_IOC_SETUP, &p) != 0) {
-		perror("SETUP");
-		failures++;
-		close(fd);
-		return -1;
-	}
-	return fd;
-}
-
-static void enter_init(struct xring_enter *e, struct xring_sqe *sq, unsigned n,
-		       struct xring_cqe *cq, unsigned space)
-{
-	memset(e, 0, sizeof(*e));
-	e->sq_addr = (uint64_t)(uintptr_t)sq;
-	e->to_submit = n;
-	e->cq_addr = (uint64_t)(uintptr_t)cq;
-	e->cq_space = space;
-}
-
-static void delay(struct xring_sqe *s, uint64_t user_data, uint64_t ns)
-{
-	memset(s, 0, sizeof(*s));
-	s->opcode = XRING_OP_DELAY_NS;
-	s->off = ns;
-	s->user_data = user_data;
-}
-
-/* A hang is a failure, not a wedged test run. */
-static void alarm_die(int sig)
-{
-	(void)sig;
-	_exit(99);
-}
-
-static void arm_alarm(unsigned secs)
-{
-	signal(SIGALRM, alarm_die);
-	alarm(secs);
-}
 
 static void sigint_noop(int sig)
 {
@@ -167,17 +28,14 @@ int main(void)
 	int fd, ret;
 	unsigned i;
 
-	/* Line-buffered: the alarm handler _exit()s, which would drop a full buffer
-	 * and leave a hang with no output saying where. */
-	setvbuf(stdout, NULL, _IOLBF, 0);
-	arm_alarm(60);
+	test_begin(60);
 
 	/* 1. Four 50 ms delays, min_complete 4: concurrent, not serial. */
-	fd = open_ring();
+	fd = open_ring(SQ_ENTRIES, CQ_ENTRIES, 4096, 32);
 	if (fd < 0)
 		return 1;
 	for (i = 0; i < 4; i++)
-		delay(&sq[i], 0x1000 + i, 50 * MS);
+		sqe_delay(&sq[i], 0x1000 + i, 50 * MS);
 	enter_init(&e, sq, 4, cq, 16);
 	e.min_complete = 4;
 	t0 = now_ms();
@@ -205,7 +63,7 @@ int main(void)
 	check(ok, "  every user_data comes back");
 
 	/* 2. A timeout shorter than the delay returns nothing. */
-	delay(&sq[0], 0x2000, 1000 * MS);
+	sqe_delay(&sq[0], 0x2000, 1000 * MS);
 	enter_init(&e, sq, 1, cq, 16);
 	e.min_complete = 1;
 	e.timeout_ns = 10 * MS;
@@ -224,7 +82,7 @@ int main(void)
 	close(fd); /* abandons the 1 s delay; teardown is T6 */
 
 	/* 4. The idle-ring deadlock foot-gun. */
-	fd = open_ring();
+	fd = open_ring(SQ_ENTRIES, CQ_ENTRIES, 4096, 32);
 	if (fd < 0)
 		return 1;
 	enter_init(&e, NULL, 0, cq, 16);
@@ -236,7 +94,7 @@ int main(void)
 	      "ENTER(0, min_complete 1) on an idle ring returns at once");
 
 	/* 5. DELAY_NS reads only off. */
-	delay(&sq[0], 0x3000, MS);
+	sqe_delay(&sq[0], 0x3000, MS);
 	sq[0].len = 1;
 	enter_init(&e, sq, 1, cq, 16);
 	e.min_complete = 1;
@@ -244,7 +102,7 @@ int main(void)
 	check(ret == 1 && e.completed == 1 && cq[0].res == -EINVAL,
 	      "DELAY_NS with non-zero len yields res == -EINVAL");
 
-	delay(&sq[0], 0x3001, MS);
+	sqe_delay(&sq[0], 0x3001, MS);
 	sq[0].handle = 9;
 	enter_init(&e, sq, 1, cq, 16);
 	e.min_complete = 1;
@@ -257,7 +115,7 @@ int main(void)
 	for (i = 0; i < CQ_ENTRIES / 8 + 2; i++) {
 		unsigned j;
 		for (j = 0; j < 8; j++)
-			delay(&sq[j], 0x4000 + total + j, 2000 * MS);
+			sqe_delay(&sq[j], 0x4000 + total + j, 2000 * MS);
 		enter_init(&e, sq, 8, cq, 0);
 		ret = ioctl(fd, XRING_IOC_ENTER, &e);
 		if (ret < 0) {
@@ -283,11 +141,11 @@ int main(void)
 		struct xring_sqe s;
 		struct xring_cqe c;
 		struct xring_enter en;
-		int r, cfd = open_ring();
+		int r, cfd = open_ring(SQ_ENTRIES, CQ_ENTRIES, 4096, 32);
 		signal(SIGINT, sigint_noop);
 		if (cfd < 0)
 			_exit(2);
-		delay(&s, 0x5000, 30ull * 1000 * MS);
+		sqe_delay(&s, 0x5000, 30ull * 1000 * MS);
 		enter_init(&en, &s, 1, &c, 1);
 		en.min_complete = 1;
 		write(pipefd[1], "x", 1);
@@ -317,10 +175,10 @@ int main(void)
 		struct xring_sqe s;
 		struct xring_cqe c;
 		struct xring_enter en;
-		int cfd = open_ring();
+		int cfd = open_ring(SQ_ENTRIES, CQ_ENTRIES, 4096, 32);
 		if (cfd < 0)
 			_exit(2);
-		delay(&s, 0x6000, 60ull * 1000 * MS);
+		sqe_delay(&s, 0x6000, 60ull * 1000 * MS);
 		enter_init(&en, &s, 1, &c, 1);
 		en.min_complete = 1;
 		write(pipefd[1], "x", 1);
@@ -337,7 +195,5 @@ int main(void)
 	close(pipefd[0]);
 	close(pipefd[1]);
 
-	(void)check_errno;
-	printf("\n%s: %d failure(s)\n", failures ? "FAILED" : "OK", failures);
-	return failures ? 1 : 0;
+	return test_end();
 }

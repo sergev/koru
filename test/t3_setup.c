@@ -1,78 +1,13 @@
 // SPDX-License-Identifier: GPL-2.0
 //
 // T3 done test: SETUP and GET_PARAMS.
-//
-// Interim harness. The struct and ioctl numbers below are declared by hand and
-// MUST agree with kernel/xring_abi.rs, which is canonical. At T16 this file
-// switches to including user/cpp/include/xring_abi.h, and the conformance test
-// takes over the job of keeping the two in step.
+
+#include "xring_test.h"
 
 #include <errno.h>
-#include <fcntl.h>
-#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
-#include <sys/ioctl.h>
 #include <unistd.h>
-
-#define XRING_DEV "/dev/xring"
-
-#define XRING_MAGIC 0x676e7278u /* "xrng" */
-#define XRING_ABI_VERSION 1u
-
-struct xring_params {
-	/* in */
-	uint32_t magic;
-	uint32_t abi_version;
-	uint32_t flags;
-	/* in/out */
-	uint32_t sq_entries;
-	uint32_t cq_entries;
-	uint32_t slot_size;
-	uint32_t slot_count;
-	/* out */
-	uint32_t configured;
-	uint64_t features;
-	uint64_t arena_size;
-	uint32_t max_sq_entries;
-	uint32_t max_cq_entries;
-	uint32_t max_slot_size;
-	uint32_t max_slot_count;
-	uint64_t max_arena_bytes;
-	/* in: must be zero */
-	uint64_t reserved[4];
-};
-
-_Static_assert(sizeof(struct xring_params) == 104, "params size must match kernel");
-
-#define XRING_IOC_SETUP _IOWR('x', 0x00, struct xring_params)
-#define XRING_IOC_GET_PARAMS _IOR('x', 0x01, struct xring_params)
-
-static int failures;
-
-static void check(int ok, const char *what)
-{
-	printf("%-58s %s\n", what, ok ? "PASS" : "FAIL");
-	if (!ok)
-		failures++;
-}
-
-/* Assert the ioctl failed with exactly this errno, not merely that it failed. */
-static void check_errno(int ret, int want, const char *what)
-{
-	if (ret == 0) {
-		printf("%-58s FAIL (succeeded, expected %s)\n", what, strerror(want));
-		failures++;
-		return;
-	}
-	if (errno != want) {
-		printf("%-58s FAIL (got %s, expected %s)\n", what, strerror(errno),
-		       strerror(want));
-		failures++;
-		return;
-	}
-	printf("%-58s PASS\n", what);
-}
 
 /* A request that must succeed, so each rejection test starts from a valid base. */
 static void good_request(struct xring_params *p)
@@ -84,17 +19,6 @@ static void good_request(struct xring_params *p)
 	p->cq_entries = 128;
 	p->slot_size = 4096;
 	p->slot_count = 32;
-}
-
-/* Each rejection test needs a pristine fd: a successful SETUP is one-shot. */
-static int open_dev(void)
-{
-	int fd = open(XRING_DEV, O_RDWR);
-	if (fd < 0) {
-		perror("open " XRING_DEV);
-		failures++;
-	}
-	return fd;
 }
 
 /* Run one SETUP that is expected to fail, on its own fd. */
@@ -126,6 +50,8 @@ int main(void)
 {
 	struct xring_params p, q;
 	int fd;
+
+	test_begin(120);
 
 	/* 1. GET_PARAMS before SETUP reports caps and configured == 0. */
 	fd = open_dev();
@@ -199,6 +125,5 @@ int main(void)
 	check(ioctl(fd, XRING_IOC_SETUP, &p) == 0, "SETUP still works after rejected attempts");
 	close(fd);
 
-	printf("\n%s: %d failure(s)\n", failures ? "FAILED" : "OK", failures);
-	return failures ? 1 : 0;
+	return test_end();
 }

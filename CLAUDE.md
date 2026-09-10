@@ -98,10 +98,12 @@ vng --run $KDIR --user root --memory 4G --cpus 4 \
 make -C test
 ```
 
-`test/` holds a small C program per task. It is scaffolding: the real suites are the Rust
-one at T13 and the C++ one at T17. Until T16 exists these programs declare the wire structs
-by hand, so **a change to `kernel/xring_abi.rs` means a matching change in `test/`**, and the
-`_Static_assert` on struct size is what catches you forgetting.
+`test/` holds a small C program per task plus a shared harness in `xring_test.h` and
+`xring_test.c`. It is scaffolding: the real suites are the Rust one at T13 and the C++ one at
+T17. The header's first section is a hand-written mirror of `kernel/xring_abi.rs`, so **a
+change there means a matching change in that one place**, and its `_Static_assert`s are what
+catch you forgetting. T16 deletes that section in favour of including the real
+`user/cpp/include/xring_abi.h`.
 
 `ENTER` must never touch a `UserSlice` while holding the ring `SpinLock`: `copy_*_user` can
 fault and therefore sleep. The submit and reap loops are structured around that, and
