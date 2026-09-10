@@ -2,7 +2,7 @@
 //
 // T7 done test: the mmap'd arena and CHECKSUM.
 
-#include "xring_test.h"
+#include "koru_test.h"
 
 #include <errno.h>
 #include <stdio.h>
@@ -25,7 +25,7 @@ static int region_in_maps(void)
 	if (!f)
 		return -1;
 	while (fgets(line, sizeof(line), f))
-		if (strstr(line, "/dev/xring"))
+		if (strstr(line, "/dev/koru"))
 			found = 1;
 	fclose(f);
 	return found;
@@ -33,7 +33,7 @@ static int region_in_maps(void)
 
 int main(void)
 {
-	struct xring_sqe s;
+	struct koru_sqe s;
 	uint8_t *arena, *pattern;
 	int fd, ret;
 	int64_t res;
@@ -152,9 +152,9 @@ int main(void)
 
 	/* 7. munmap with an op in flight. */
 	sqe_delay(&s, 0xd1, 300 * MS);
-	struct xring_enter e;
+	struct koru_enter e;
 	enter_init(&e, &s, 1, NULL, 0);
-	ret = ioctl(fd, XRING_IOC_ENTER, &e);
+	ret = ioctl(fd, KORU_IOC_ENTER, &e);
 	check(ret == 1, "a delay is in flight");
 	check(munmap(arena, ARENA) == 0, "munmap with an op in flight succeeds");
 	usleep(500000);

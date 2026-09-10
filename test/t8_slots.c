@@ -2,7 +2,7 @@
 //
 // T8 done test: kernel-enforced slot exclusivity.
 
-#include "xring_test.h"
+#include "koru_test.h"
 
 #include <errno.h>
 #include <stdio.h>
@@ -16,7 +16,7 @@
 #define ARENA ((uint64_t)SLOT_SIZE * SLOT_COUNT)
 
 /* Find a completion by user_data. */
-static const struct xring_cqe *find(const struct xring_cqe *cq, unsigned n, uint64_t ud)
+static const struct koru_cqe *find(const struct koru_cqe *cq, unsigned n, uint64_t ud)
 {
 	unsigned i;
 
@@ -28,9 +28,9 @@ static const struct xring_cqe *find(const struct xring_cqe *cq, unsigned n, uint
 
 int main(void)
 {
-	struct xring_sqe sq[8];
-	struct xring_cqe cq[8];
-	const struct xring_cqe *a, *b;
+	struct koru_sqe sq[8];
+	struct koru_cqe cq[8];
+	const struct koru_cqe *a, *b;
 	uint8_t *arena, *pattern;
 	unsigned completed;
 	int fd, ret;

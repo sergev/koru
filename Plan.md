@@ -1,4 +1,4 @@
-# xring — a coroutine-oriented, non-POSIX Linux kernel API (PoC)
+# koru — a coroutine-oriented, non-POSIX Linux kernel API (PoC)
 
 ## Context
 
@@ -18,7 +18,7 @@ tasks), and `Drop` cannot be async — so any design where an in-flight operatio
 userspace pointer has an unavoidable use-after-free. We remove the possibility rather than
 manage it.
 
-Outcome: `/dev/xring`, a Rust module implementing it, and two demos — one Rust, one
+Outcome: `/dev/koru`, a Rust module implementing it, and two demos — one Rust, one
 C++20 — that each open and read a real file through coroutines while timers complete out
 of order.
 
@@ -63,7 +63,7 @@ abstractions. Budget accordingly.
 
 ### Boundary
 
-`/dev/xring`, a misc device. `open()` creates a per-fd ring context.
+`/dev/koru`, a misc device. `open()` creates a per-fd ring context.
 
 - **Control plane — `ENTER` ioctl.** Carries submissions in and completions out via
   `UserSlice`. `copy_from_user` gives the kernel a private snapshot by construction, which
@@ -309,20 +309,20 @@ treatment:
 
 Created in dependency order:
 
-- `kernel/xring_abi.rs` — `#[repr(C)]` SQE/CQE/params/ioctl definitions. Mirrored
-  byte-for-byte by `user/xring-sys/src/abi.rs`. The most consequential file in the project.
-- `kernel/xring.rs` — `MiscDevice` impl, the `Arc<RingCtx>` graph, admission control.
-- `kernel/xring_ops.rs` — opcode dispatch, SQE validation, `OpWork`, and the raw
+- `kernel/koru_abi.rs` — `#[repr(C)]` SQE/CQE/params/ioctl definitions. Mirrored
+  byte-for-byte by `user/koru-sys/src/abi.rs`. The most consequential file in the project.
+- `kernel/koru.rs` — `MiscDevice` impl, the `Arc<RingCtx>` graph, admission control.
+- `kernel/koru_ops.rs` — opcode dispatch, SQE validation, `OpWork`, and the raw
   `bindings::` calls for `filp_open`/`kernel_read`.
-- `kernel/xring_arena.rs` — `KVec<Page>`, the `mmap` validation matrix, the
+- `kernel/koru_arena.rs` — `KVec<Page>`, the `mmap` validation matrix, the
   `vm_insert_page` loop, slot busy tracking.
-- `user/xring/src/lib.rs` — op slab, `OpState` owning `BufSlot`, `Future` impls, executor.
-- `user/cpp/include/xring_abi.h` — the C mirror of `xring_abi.rs`, kept byte-identical by
+- `user/koru/src/lib.rs` — op slab, `OpState` owning `BufSlot`, `Future` impls, executor.
+- `user/cpp/include/koru_abi.h` — the C mirror of `koru_abi.rs`, kept byte-identical by
   the T16 conformance test.
-- `user/cpp/include/xring.hpp` — `Ring`, `BufPool`, move-only `BufSlot`, `result<T>`.
-- `user/cpp/include/xring/task.hpp` — `task<T>` promise type, symmetric transfer,
+- `user/cpp/include/koru.hpp` — `Ring`, `BufPool`, move-only `BufSlot`, `result<T>`.
+- `user/cpp/include/koru/task.hpp` — `task<T>` promise type, symmetric transfer,
   `sync_wait`.
-- `user/cpp/include/xring/awaiter.hpp` — op slab, `op_awaiter`, the abandonment path.
+- `user/cpp/include/koru/awaiter.hpp` — op slab, `op_awaiter`, the abandonment path.
 - `user/cpp/examples/read_file.cpp` — the C++20 demo.
 
 ## Tasks
@@ -340,15 +340,15 @@ is settled while it is still cheap to change.
 | # | Task | Done test |
 |---|---|---|
 | T0 **[R]** ✅ | Build and boot a Rust-enabled kernel on the Linux box (≥6.16, `make LLVM=1`, `CONFIG_RUST=y`, plus KASAN + `PROVE_LOCKING` + `DEBUG_KMEMLEAK`). Keep the full build tree — distro `linux-headers` omit `rust/*.rmeta` and cannot build OOT Rust modules. rustc floor 1.85.0, bindgen 0.71.1. Use an expendable VM: module bugs will panic the kernel. | **Done.** `modprobe rust_minimal` loads, `lsmod` lists it, `rmmod` unloads it, taint 0, under a 7.1.12 kernel with KASAN generic+inline, lockdep and kmemleak all confirmed live. See `CLAUDE.md` for the tree location and commands. |
-| T1 **[R]** ✅ | Out-of-tree module skeleton: `Kbuild`, `make -C <tree> M=$PWD LLVM=1`. | **Done.** `kernel/xring.rs` + `kernel/Kbuild` build out-of-tree; `insmod`/`rmmod` cycle prints `init` then `exit`, taint is exactly 4096 (`TAINT_OOT_MODULE`) and nothing else, no oops or KASAN report. The multi-file crate layout below is verified: submodules reached by `mod` from `xring.rs`, correctly rebuilt when only a submodule changes. No need for the in-tree fallback; T0+T1 took about an hour. |
-| T2 **[M]** ✅ | `MiscDevice` with `open`/`release` only; `Arc<RingCtx>` as `Ptr`. | **Done.** `/dev/xring` registers at 0600 root:root; 10,000 open/close iterations, zero failures, kmemleak clean before and after unload, taint 4096, no KASAN report. The scan is only meaningful after sleeping past kmemleak's 5 s `MSECS_MIN_AGE`; verified by a throwaway build leaking one `Arc` per open, which the test then reported (9,685 objects) and which an unslept scan had missed entirely. |
+| T1 **[R]** ✅ | Out-of-tree module skeleton: `Kbuild`, `make -C <tree> M=$PWD LLVM=1`. | **Done.** `kernel/koru.rs` + `kernel/Kbuild` build out-of-tree; `insmod`/`rmmod` cycle prints `init` then `exit`, taint is exactly 4096 (`TAINT_OOT_MODULE`) and nothing else, no oops or KASAN report. The multi-file crate layout below is verified: submodules reached by `mod` from `koru.rs`, correctly rebuilt when only a submodule changes. No need for the in-tree fallback; T0+T1 took about an hour. |
+| T2 **[M]** ✅ | `MiscDevice` with `open`/`release` only; `Arc<RingCtx>` as `Ptr`. | **Done.** `/dev/koru` registers at 0600 root:root; 10,000 open/close iterations, zero failures, kmemleak clean before and after unload, taint 4096, no KASAN report. The scan is only meaningful after sleeping past kmemleak's 5 s `MSECS_MIN_AGE`; verified by a throwaway build leaking one `Arc` per open, which the test then reported (9,685 objects) and which an unslept scan had missed entirely. |
 
 ### Phase 1 — control plane, zero shared memory
 
 | # | Task | Done test |
 |---|---|---|
 | T3 **[M]** ✅ | `SETUP` + `GET_PARAMS` ioctls via `UserSlice`. `_IOWR` encoding, magic + ABI version. `SETUP` callable exactly once, before `mmap`, with kernel-side caps. | **Done.** 24 assertions in `test/t3_setup.c`, all passing: params round-trip, `GET_PARAMS` legal before `SETUP`, magic/version mismatch → `-EPROTO`, unknown flags and non-zero reserved → `-EINVAL`, over-cap rejected not clamped, rejected attempts do not consume the one-shot, second `SETUP` → `-EBUSY`. Caps are reported in the struct rather than fixed as header constants, so raising one is not an ABI change. Verified by deleting three kernel checks and confirming exactly the three matching tests failed. |
-| T4 **[M]** ✅ | `ENTER`: SQEs in, CQEs out via `UserSlice`. `NOP` only. Enforce reserved-zero and unknown-flag rejection. Unknown opcode → `-EINVAL` CQE (E1). | **Done.** 25 assertions in `test/t4_enter.c`. 8 NOPs in, 8 CQEs out, `user_data` matching in order. Unknown opcode, unknown SQE flag, non-zero `rsvd0` and non-zero unused field each yield a `-EINVAL` CQE with the ioctl still succeeding (E1); a mixed batch completes every entry (C1). Short `cq_space` leaves the remainder queued for the next `ENTER`. `Sqe`, `Cqe` (32 bytes) and `XringEnter` (64) are asserted field by field on both sides. Unused fields must be zero per opcode, so they stay available later. Admission control reserves a CQ slot before consuming an SQE, so submitting past `cq_entries` stops at a short count. Verified by breaking C1 and the capacity check and confirming exactly the 8 matching assertions failed. |
+| T4 **[M]** ✅ | `ENTER`: SQEs in, CQEs out via `UserSlice`. `NOP` only. Enforce reserved-zero and unknown-flag rejection. Unknown opcode → `-EINVAL` CQE (E1). | **Done.** 25 assertions in `test/t4_enter.c`. 8 NOPs in, 8 CQEs out, `user_data` matching in order. Unknown opcode, unknown SQE flag, non-zero `rsvd0` and non-zero unused field each yield a `-EINVAL` CQE with the ioctl still succeeding (E1); a mixed batch completes every entry (C1). Short `cq_space` leaves the remainder queued for the next `ENTER`. `Sqe`, `Cqe` (32 bytes) and `KoruEnter` (64) are asserted field by field on both sides. Unused fields must be zero per opcode, so they stay available later. Admission control reserves a CQ slot before consuming an SQE, so submitting past `cq_entries` stops at a short count. Verified by breaking C1 and the capacity check and confirming exactly the 8 matching assertions failed. |
 | T5 **[R]** ✅ | `CondVar` blocking wait; `DELAY_NS` via `enqueue_delayed`; `wait_interruptible_timeout`; admission control. | **Done.** 15 assertions in `test/t5_delay.c`. 4 × `DELAY_NS(50ms)` with `min_complete=4` returned in 51 ms, not 200. 10 ms timeout against a 1 s delay returns 0 completions promptly. `SIGINT` gives `-EINTR`, `SIGKILL` actually kills. In-flight ops count against `cq_entries`. The idle-ring foot-gun is closed: `ENTER(0, min_complete=1)` returns at once. Two ABI changes: the `ENTER` reserved word became a `submitted` out-field, since one ioctl return cannot carry both `-EINTR` and the consumed count; and `min_complete` now gates the wait while `timeout_ns` only caps it, with 0 meaning no cap. Verified by serialising the delays (timing assertion failed at 202 ms) and removing the idle-ring escape (that assertion hung and died on its alarm). |
 | T6 **[R]** ✅ | Teardown torture; module live-work counter. | **Done.** 6 assertions in `test/t6_teardown.c` plus three `rmmod` cases in the script. `close(fd)` with 4 × `DELAY_NS(5s)` in flight is clean and kmemleak-clean once they elapse; `SIGKILL` on a task blocked in `ENTER` kills it; a new ring opens and submits while old work is still queued. Instead of a live-work counter, the module is **pinned by reference**: `rmmod` is refused while an fd is open *or* an op is in flight, and succeeds once both drain (5 s in the run). This was scoped up after finding that an open fd never pinned the module either — see the corrected known-gaps entry above. Verified by removing the per-op reference, which made the work-pending `rmmod` wrongly succeed while the fd case still refused. |
 
@@ -375,7 +375,7 @@ is realism or optimization.
 
 | # | Task | Done test |
 |---|---|---|
-| T13 **[M]** | `xring-sys` crate: `#[repr(C)]` ABI structs, ioctl wrappers, `Ring::{setup, enter, mmap}`, and a compile-time assertion that every struct's `size_of` matches the kernel's. | T4–T11's tests re-expressed as Rust integration tests, passing. |
+| T13 **[M]** | `koru-sys` crate: `#[repr(C)]` ABI structs, ioctl wrappers, `Ring::{setup, enter, mmap}`, and a compile-time assertion that every struct's `size_of` matches the kernel's. | T4–T11's tests re-expressed as Rust integration tests, passing. |
 | T14 **[R]** | Op slab keyed by `(index, generation)`; `Future` impls; single-threaded executor whose `park()` is `ENTER`. `BufSlot` owned by `OpState`, never by the future. | `async { let h = open("/etc/hostname").await?; let (n, buf) = read(h, buf).await?; print(&buf[..n]); close(h).await?; }` prints the file, concurrently with timers completing out of order. **This is the deliverable.** |
 | T15 **[R]** | Drop-safety test. | Race a `read` future against a timer and drop it mid-flight. Assert a `CANCEL` is submitted, the slot is *not* in the free pool until the target's CQE lands, and a later op on that index does not get `-EBUSY`. 100k iterations under ASAN. |
 
@@ -388,8 +388,8 @@ at once just churns the wire format twice.
 
 | # | Task | Done test |
 |---|---|---|
-| T16 **[M]** | `xring_abi.h` mirroring `xring_abi.rs`, with `static_assert` on every `sizeof` and `offsetof` and on every opcode value. Add an `abi_dump` binary to each side emitting a canonical text dump of the whole ABI surface. | `diff` of the two dumps is empty. Deliberately perturbing one field in either file makes the test fail — verify that, or the test proves nothing. |
-| T17 **[M]** | `libxring` synchronous core: RAII `Ring` (open, `SETUP`, `mmap`, close), `BufPool`, move-only `BufSlot` (deleted copy ops), raw `submit()`/`reap()`, `result<T>`. No coroutines yet. | The entire T4–T11 test matrix re-expressed in C++ and passing — same assertions as T13, different language. Any divergence here is an ABI ambiguity worth fixing before coroutines hide it. |
+| T16 **[M]** | `koru_abi.h` mirroring `koru_abi.rs`, with `static_assert` on every `sizeof` and `offsetof` and on every opcode value. Add an `abi_dump` binary to each side emitting a canonical text dump of the whole ABI surface. | `diff` of the two dumps is empty. Deliberately perturbing one field in either file makes the test fail — verify that, or the test proves nothing. |
+| T17 **[M]** | `libkoru` synchronous core: RAII `Ring` (open, `SETUP`, `mmap`, close), `BufPool`, move-only `BufSlot` (deleted copy ops), raw `submit()`/`reap()`, `result<T>`. No coroutines yet. | The entire T4–T11 test matrix re-expressed in C++ and passing — same assertions as T13, different language. Any divergence here is an ABI ambiguity worth fixing before coroutines hide it. |
 | T18 **[R]** | Op slab + `op_awaiter`. `(index, generation)`-keyed slab of `op_state`; `await_ready`/`await_suspend`/`await_resume`; `~op_awaiter` marks `Abandoned`, moves the `BufSlot` into the slab entry, submits `CANCEL`. | Destroy a coroutine frame with an op in flight: under ASan, no resume of a freed handle; the slot is not recycled until the CQE lands; a later op on that index does not get `-EBUSY`. |
 | T19 **[R]** | `task<T>` promise type: lazy `initial_suspend`, **symmetric transfer** on `final_suspend`, move-only, `unhandled_exception -> std::terminate`. `sync_wait(task<T>)`. | 100,000 nested `co_await`s complete with stack usage *measured* flat, not assumed — this is the symmetric-transfer regression test and it silently passes if you write it wrong and only try 10 levels. A task destroyed without being awaited leaks nothing under LSan. |
 | T20 **[R]** | Executor: ready queue, `run()` whose park is `ENTER(min_complete=1, timeout)`, CQE → slab lookup → resume or discard. Close the same empty-ring deadlock foot-gun as the Rust side. | **The C++ demo**: `co_await open("/etc/hostname")`, `read`, print, `close`, concurrent with `delay` ops completing out of order — byte-identical output to the Rust demo. |
@@ -411,8 +411,8 @@ at once just churns the wire format twice.
 
 Every phase gate is a runnable test, listed above. Overall end-to-end:
 
-1. `make -C <kernel-tree> M=$PWD LLVM=1 && insmod xring.ko`
-2. `cargo test -p xring-sys` — ABI round-trip and per-opcode integration tests (T13).
+1. `make -C <kernel-tree> M=$PWD LLVM=1 && insmod koru.ko`
+2. `cargo test -p koru-sys` — ABI round-trip and per-opcode integration tests (T13).
 3. `cargo run --example read_file` — the T14 demo: opens and reads a real file through
    coroutines while timers complete out of order.
 4. `cargo run --example fuzz --release` for 10 minutes (T12), with `dmesg -w` in another
@@ -426,7 +426,7 @@ Every phase gate is a runnable test, listed above. Overall end-to-end:
 9. Run steps 3 and 8 **concurrently** (T21) — both must still be correct.
 10. `echo scan > /sys/kernel/debug/kmemleak; cat /sys/kernel/debug/kmemleak` — empty.
 11. Unprivileged-user creds test (T9) — must fail `-EACCES`.
-12. `rmmod xring` cleanly at the end.
+12. `rmmod koru` cleanly at the end.
 
 The dev kernel must have KASAN, `PROVE_LOCKING` and `DEBUG_KMEMLEAK` on from day one; they
 pay for themselves in the first week.

@@ -7,7 +7,7 @@
 //   hold     keep an fd open, print READY, sleep; the script tries rmmod
 //   pending  submit delays and exit at once, leaving work queued
 
-#include "xring_test.h"
+#include "koru_test.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -21,22 +21,22 @@
 /* Submit n delays without waiting for them. */
 static int submit_delays(int fd, unsigned n, uint64_t ns)
 {
-	struct xring_sqe sq[8];
-	struct xring_enter e;
+	struct koru_sqe sq[8];
+	struct koru_enter e;
 	unsigned i;
 
 	for (i = 0; i < n; i++)
 		sqe_delay(&sq[i], 0x7000 + i, ns);
 	enter_init(&e, sq, n, NULL, 0);
-	return ioctl(fd, XRING_IOC_ENTER, &e);
+	return ioctl(fd, KORU_IOC_ENTER, &e);
 }
 
 /* Block in ENTER on a long delay, then die however the parent decides. */
 static void child_blocks_forever(void)
 {
-	struct xring_sqe s;
-	struct xring_cqe c;
-	struct xring_enter e;
+	struct koru_sqe s;
+	struct koru_cqe c;
+	struct koru_enter e;
 	int fd = open_ring(SQ_ENTRIES, CQ_ENTRIES, 4096, 32);
 
 	if (fd < 0)
@@ -47,7 +47,7 @@ static void child_blocks_forever(void)
 	e.min_complete = 1;
 	printf("R\n");
 	fflush(stdout);
-	ioctl(fd, XRING_IOC_ENTER, &e);
+	ioctl(fd, KORU_IOC_ENTER, &e);
 	_exit(0);
 }
 

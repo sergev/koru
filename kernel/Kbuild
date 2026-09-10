@@ -6,7 +6,7 @@
 # LLVM=1 is required: the dev kernel is built with clang and lld, and a
 # gcc-built module against it is a toolchain mismatch.
 #
-# Kbuild finds xring.rs from this object name. Further .rs files are pulled in
+# Kbuild finds koru.rs from this object name. Further .rs files are pulled in
 # as submodules of that crate via `mod` declarations, not listed here.
 
-obj-m += xring.o
+obj-m += koru.o

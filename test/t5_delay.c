@@ -2,7 +2,7 @@
 //
 // T5 done test: DELAY_NS, blocking wait, admission control.
 
-#include "xring_test.h"
+#include "koru_test.h"
 
 #include <errno.h>
 #include <signal.h>
@@ -21,9 +21,9 @@ static void sigint_noop(int sig)
 
 int main(void)
 {
-	struct xring_sqe sq[16];
-	struct xring_cqe cq[16];
-	struct xring_enter e;
+	struct koru_sqe sq[16];
+	struct koru_cqe cq[16];
+	struct koru_enter e;
 	uint64_t t0, dt;
 	int fd, ret;
 	unsigned i;
@@ -39,7 +39,7 @@ int main(void)
 	enter_init(&e, sq, 4, cq, 16);
 	e.min_complete = 4;
 	t0 = now_ms();
-	ret = ioctl(fd, XRING_IOC_ENTER, &e);
+	ret = ioctl(fd, KORU_IOC_ENTER, &e);
 	dt = now_ms() - t0;
 	printf("  (four 50 ms delays took %llu ms)\n", (unsigned long long)dt);
 	check(ret == 4 && e.submitted == 4, "4 x DELAY_NS(50ms): 4 consumed");
@@ -68,7 +68,7 @@ int main(void)
 	e.min_complete = 1;
 	e.timeout_ns = 10 * MS;
 	t0 = now_ms();
-	ret = ioctl(fd, XRING_IOC_ENTER, &e);
+	ret = ioctl(fd, KORU_IOC_ENTER, &e);
 	dt = now_ms() - t0;
 	check(ret == 1 && e.completed == 0, "10 ms timeout vs 1 s delay: 0 completions");
 	check(dt < 500, "  returned promptly, did not wait out the delay");
@@ -76,7 +76,7 @@ int main(void)
 	/* 3. min_complete 0 does not wait, even with work in flight. */
 	enter_init(&e, NULL, 0, cq, 16);
 	t0 = now_ms();
-	ret = ioctl(fd, XRING_IOC_ENTER, &e);
+	ret = ioctl(fd, KORU_IOC_ENTER, &e);
 	dt = now_ms() - t0;
 	check(ret == 0 && dt < 200, "min_complete 0 returns immediately");
 	close(fd); /* abandons the 1 s delay; teardown is T6 */
@@ -88,7 +88,7 @@ int main(void)
 	enter_init(&e, NULL, 0, cq, 16);
 	e.min_complete = 1;
 	t0 = now_ms();
-	ret = ioctl(fd, XRING_IOC_ENTER, &e);
+	ret = ioctl(fd, KORU_IOC_ENTER, &e);
 	dt = now_ms() - t0;
 	check(ret == 0 && e.completed == 0 && dt < 200,
 	      "ENTER(0, min_complete 1) on an idle ring returns at once");
@@ -98,7 +98,7 @@ int main(void)
 	sq[0].len = 1;
 	enter_init(&e, sq, 1, cq, 16);
 	e.min_complete = 1;
-	ret = ioctl(fd, XRING_IOC_ENTER, &e);
+	ret = ioctl(fd, KORU_IOC_ENTER, &e);
 	check(ret == 1 && e.completed == 1 && cq[0].res == -EINVAL,
 	      "DELAY_NS with non-zero len yields res == -EINVAL");
 
@@ -106,7 +106,7 @@ int main(void)
 	sq[0].handle = 9;
 	enter_init(&e, sq, 1, cq, 16);
 	e.min_complete = 1;
-	ret = ioctl(fd, XRING_IOC_ENTER, &e);
+	ret = ioctl(fd, KORU_IOC_ENTER, &e);
 	check(ret == 1 && e.completed == 1 && cq[0].res == -EINVAL,
 	      "DELAY_NS with non-zero handle yields res == -EINVAL");
 
@@ -117,7 +117,7 @@ int main(void)
 		for (j = 0; j < 8; j++)
 			sqe_delay(&sq[j], 0x4000 + total + j, 2000 * MS);
 		enter_init(&e, sq, 8, cq, 0);
-		ret = ioctl(fd, XRING_IOC_ENTER, &e);
+		ret = ioctl(fd, KORU_IOC_ENTER, &e);
 		if (ret < 0) {
 			perror("ENTER");
 			failures++;
@@ -138,9 +138,9 @@ int main(void)
 	}
 	pid_t pid = fork();
 	if (pid == 0) {
-		struct xring_sqe s;
-		struct xring_cqe c;
-		struct xring_enter en;
+		struct koru_sqe s;
+		struct koru_cqe c;
+		struct koru_enter en;
 		int r, cfd = open_ring(SQ_ENTRIES, CQ_ENTRIES, 4096, 32);
 		signal(SIGINT, sigint_noop);
 		if (cfd < 0)
@@ -149,7 +149,7 @@ int main(void)
 		enter_init(&en, &s, 1, &c, 1);
 		en.min_complete = 1;
 		write(pipefd[1], "x", 1);
-		r = ioctl(cfd, XRING_IOC_ENTER, &en);
+		r = ioctl(cfd, KORU_IOC_ENTER, &en);
 		if (r >= 0)
 			_exit(3); /* should have been interrupted */
 		if (errno != EINTR)
@@ -172,9 +172,9 @@ int main(void)
 	/* 8. SIGKILL must actually kill: no unkillable D state. */
 	pid = fork();
 	if (pid == 0) {
-		struct xring_sqe s;
-		struct xring_cqe c;
-		struct xring_enter en;
+		struct koru_sqe s;
+		struct koru_cqe c;
+		struct koru_enter en;
 		int cfd = open_ring(SQ_ENTRIES, CQ_ENTRIES, 4096, 32);
 		if (cfd < 0)
 			_exit(2);
@@ -182,7 +182,7 @@ int main(void)
 		enter_init(&en, &s, 1, &c, 1);
 		en.min_complete = 1;
 		write(pipefd[1], "x", 1);
-		ioctl(cfd, XRING_IOC_ENTER, &en);
+		ioctl(cfd, KORU_IOC_ENTER, &en);
 		_exit(0);
 	}
 	read(pipefd[0], &b, 1);

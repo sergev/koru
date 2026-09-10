@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## State of the repository
 
-**T0–T8 are done.** The module registers `/dev/xring`, configures a ring with `SETUP`, and
+**T0–T8 are done.** The module registers `/dev/koru`, configures a ring with `SETUP`, and
 submits `NOP`, `DELAY_NS` and `CHECKSUM` through `ENTER`, which blocks for completions. The
 arena is mmap'd, with slot exclusivity enforced by the kernel. Teardown is safe and `rmmod`
 is refused while anything is live.
@@ -13,7 +13,7 @@ is refused while anything is live.
   before writing anything. It records *why* several obvious-looking approaches are wrong.
   Completed tasks are marked, with what their done test actually showed.
 - `README.md` — the short explanation of the idea.
-- `kernel/` — the out-of-tree Rust module. `xring_abi.rs` is the canonical wire format.
+- `kernel/` — the out-of-tree Rust module. `koru_abi.rs` is the canonical wire format.
 - `test/` — interim C tests, one per task. See Commands.
 
 Work proceeds in plan order. Task numbers are referenced across both documents; if you
@@ -21,10 +21,10 @@ renumber, fix the cross-references.
 
 ## What this project is
 
-`xring`: an experimental non-POSIX Linux kernel API designed for coroutines. Submission and
+`koru`: an experimental non-POSIX Linux kernel API designed for coroutines. Submission and
 completion are separate events (a queue, not a trap), because a coroutine must yield to its
 executor between the call and the answer. An out-of-tree Rust kernel module provides
-`/dev/xring`; two independent userspace bindings — Rust `Future`s and C++20 awaiters — sit
+`/dev/koru`; two independent userspace bindings — Rust `Future`s and C++20 awaiters — sit
 on the same unchanged ABI.
 
 ## Development environment
@@ -40,7 +40,7 @@ T0 is done. The dev kernel lives outside this repo at `../kernel-dev/`:
   host's running kernel), configured and built. Keep the whole tree: `rust/*.rmeta` is only
   there, and the installed `linux-headers-7.1.12` genuinely has no `rust/` directory, so
   out-of-tree Rust modules cannot be built against it.
-- `../kernel-dev/xring-debug.config` — the debug fragment: KASAN generic+inline+vmalloc,
+- `../kernel-dev/koru-debug.config` — the debug fragment: KASAN generic+inline+vmalloc,
   `PROVE_LOCKING`, `DEBUG_KMEMLEAK`, `DEBUG_OBJECTS`, DWARF5, `SAMPLE_RUST_MINIMAL=m`.
   `MODVERSIONS`, `MODULE_SIG`, `DEBUG_INFO_BTF` and `RANDSTRUCT` are deliberately off.
 - `../kernel-dev/t0-donetest.sh` — the T0 done test, run inside the guest.
@@ -78,7 +78,7 @@ vng --run $KDIR --user root --memory 4G --cpus 4 --exec "<command>"
 vng --run $KDIR --user root --memory 4G --cpus 4 \
     --exec "sh ../kernel-dev/t0-donetest.sh"      # kernel itself
 vng --run $KDIR --user root --memory 4G --cpus 4 \
-    --exec "sh ../kernel-dev/t1-donetest.sh"      # insmod/rmmod xring.ko
+    --exec "sh ../kernel-dev/t1-donetest.sh"      # insmod/rmmod koru.ko
 vng --run $KDIR --user root --memory 4G --cpus 4 \
     --exec "sh ../kernel-dev/t2-donetest.sh"      # 10k open/close, kmemleak
 vng --run $KDIR --user root --memory 4G --cpus 4 \
@@ -98,12 +98,12 @@ vng --run $KDIR --user root --memory 4G --cpus 4 \
 make -C test
 ```
 
-`test/` holds a small C program per task plus a shared harness in `xring_test.h` and
-`xring_test.c`. It is scaffolding: the real suites are the Rust one at T13 and the C++ one at
-T17. The header's first section is a hand-written mirror of `kernel/xring_abi.rs`, so **a
+`test/` holds a small C program per task plus a shared harness in `koru_test.h` and
+`koru_test.c`. It is scaffolding: the real suites are the Rust one at T13 and the C++ one at
+T17. The header's first section is a hand-written mirror of `kernel/koru_abi.rs`, so **a
 change there means a matching change in that one place**, and its `_Static_assert`s are what
 catch you forgetting. T16 deletes that section in favour of including the real
-`user/cpp/include/xring_abi.h`.
+`user/cpp/include/koru_abi.h`.
 
 `ENTER` must never touch a `UserSlice` while holding the ring `SpinLock`: `copy_*_user` can
 fault and therefore sleep. The submit and reap loops are structured around that, and
@@ -160,7 +160,7 @@ shown to fail on a real leak.
 Expected taint with the module loaded is exactly 4096, `TAINT_OOT_MODULE`. Module signing
 is off in this kernel, so bit 13 must never appear; anything other than 4096 is a finding.
 
-Only `xring.rs` is named in `kernel/Kbuild`. The other kernel `.rs` files are submodules of
+Only `koru.rs` is named in `kernel/Kbuild`. The other kernel `.rs` files are submodules of
 that one crate, reached by `mod` declarations, not separate `obj-m` entries. This is
 verified working, including rebuilds triggered by editing a submodule alone.
 
@@ -168,7 +168,7 @@ The rest of `Plan.md`'s Verification sequence does not work yet; the load-bearin
 be:
 
 ```sh
-cargo test -p xring-sys                  # Rust ABI + per-opcode integration tests
+cargo test -p koru-sys                  # Rust ABI + per-opcode integration tests
 cargo run --example read_file            # Rust demo
 ctest --test-dir build                   # C++ tests, under ASan+UBSan
 diff <(./build/abi_dump) <(cargo run -q --bin abi_dump)   # must be empty
@@ -236,7 +236,7 @@ Expect a substantial fraction of the kernel work to be raw `bindings::` + `unsaf
 
 ## Cross-language ABI
 
-`kernel/xring_abi.rs` is canonical; `user/cpp/include/xring_abi.h` mirrors it. They are kept
+`kernel/koru_abi.rs` is canonical; `user/cpp/include/koru_abi.h` mirrors it. They are kept
 identical by a conformance test (T16) that diffs an `abi_dump` emitted by each side. When
 you touch either file, run that diff — and confirm the test actually fails when you perturb
 a field, or it proves nothing.

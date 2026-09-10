@@ -2,7 +2,7 @@
 //
 // Shared harness for the interim C tests.
 
-#include "xring_test.h"
+#include "koru_test.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -60,10 +60,10 @@ void check_errno(int ret, int want, const char *what)
 
 int open_dev(void)
 {
-	int fd = open(XRING_DEV, O_RDWR);
+	int fd = open(KORU_DEV, O_RDWR);
 
 	if (fd < 0) {
-		perror("open " XRING_DEV);
+		perror("open " KORU_DEV);
 		failures++;
 	}
 	return fd;
@@ -72,16 +72,16 @@ int open_dev(void)
 int setup_ring(int fd, uint32_t sq_entries, uint32_t cq_entries, uint32_t slot_size,
 	       uint32_t slot_count)
 {
-	struct xring_params p;
+	struct koru_params p;
 
 	memset(&p, 0, sizeof(p));
-	p.magic = XRING_MAGIC;
-	p.abi_version = XRING_ABI_VERSION;
+	p.magic = KORU_MAGIC;
+	p.abi_version = KORU_ABI_VERSION;
 	p.sq_entries = sq_entries;
 	p.cq_entries = cq_entries;
 	p.slot_size = slot_size;
 	p.slot_count = slot_count;
-	return ioctl(fd, XRING_IOC_SETUP, &p);
+	return ioctl(fd, KORU_IOC_SETUP, &p);
 }
 
 int open_ring(uint32_t sq_entries, uint32_t cq_entries, uint32_t slot_size, uint32_t slot_count)
@@ -99,7 +99,7 @@ int open_ring(uint32_t sq_entries, uint32_t cq_entries, uint32_t slot_size, uint
 	return fd;
 }
 
-void enter_init(struct xring_enter *e, struct xring_sqe *sq, unsigned n, struct xring_cqe *cq,
+void enter_init(struct koru_enter *e, struct koru_sqe *sq, unsigned n, struct koru_cqe *cq,
 		unsigned cq_space)
 {
 	memset(e, 0, sizeof(*e));
@@ -109,23 +109,23 @@ void enter_init(struct xring_enter *e, struct xring_sqe *sq, unsigned n, struct 
 	e->cq_space = cq_space;
 }
 
-int submit(int fd, struct xring_sqe *sq, unsigned n, struct xring_cqe *cq, unsigned cq_space,
+int submit(int fd, struct koru_sqe *sq, unsigned n, struct koru_cqe *cq, unsigned cq_space,
 	   unsigned min_complete, unsigned *completed)
 {
-	struct xring_enter e;
+	struct koru_enter e;
 	int r;
 
 	enter_init(&e, sq, n, cq, cq_space);
 	e.min_complete = min_complete;
-	r = ioctl(fd, XRING_IOC_ENTER, &e);
+	r = ioctl(fd, KORU_IOC_ENTER, &e);
 	if (completed)
 		*completed = e.completed;
 	return r;
 }
 
-int64_t run_one(int fd, struct xring_sqe *s)
+int64_t run_one(int fd, struct koru_sqe *s)
 {
-	struct xring_cqe c;
+	struct koru_cqe c;
 	unsigned completed = 0;
 
 	memset(&c, 0, sizeof(c));
@@ -134,26 +134,26 @@ int64_t run_one(int fd, struct xring_sqe *s)
 	return c.res;
 }
 
-void sqe_nop(struct xring_sqe *s, uint64_t user_data)
+void sqe_nop(struct koru_sqe *s, uint64_t user_data)
 {
 	memset(s, 0, sizeof(*s));
-	s->opcode = XRING_OP_NOP;
+	s->opcode = KORU_OP_NOP;
 	s->user_data = user_data;
 }
 
-void sqe_delay(struct xring_sqe *s, uint64_t user_data, uint64_t ns)
+void sqe_delay(struct koru_sqe *s, uint64_t user_data, uint64_t ns)
 {
 	memset(s, 0, sizeof(*s));
-	s->opcode = XRING_OP_DELAY_NS;
+	s->opcode = KORU_OP_DELAY_NS;
 	s->off = ns;
 	s->user_data = user_data;
 }
 
-void sqe_checksum(struct xring_sqe *s, uint32_t slot, uint64_t off, uint32_t len,
+void sqe_checksum(struct koru_sqe *s, uint32_t slot, uint64_t off, uint32_t len,
 		  uint64_t user_data)
 {
 	memset(s, 0, sizeof(*s));
-	s->opcode = XRING_OP_CHECKSUM;
+	s->opcode = KORU_OP_CHECKSUM;
 	s->slot = slot;
 	s->off = off;
 	s->len = len;

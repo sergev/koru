@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 
-//! xring: an experimental non-POSIX kernel API designed for coroutines.
+//! koru: an experimental non-POSIX kernel API designed for coroutines.
 //!
 //! Submission and completion are separate events, because a coroutine must yield
 //! to its executor between the call and the answer. See `Plan.md` in the
@@ -10,7 +10,7 @@
 //! exclusivity. Buffers are named by slot index and live in pages the kernel
 //! owns, never by userspace address.
 
-mod xring_abi;
+mod koru_abi;
 
 use kernel::{
     bindings,
@@ -27,11 +27,11 @@ use kernel::{
     workqueue::{self, DelayedWork, WorkItem},
 };
 
-use xring_abi::*;
+use koru_abi::*;
 
 module! {
-    type: XringModule,
-    name: "xring",
+    type: KoruModule,
+    name: "koru",
     authors: ["Serge Vakulenko"],
     description: "Coroutine-oriented async syscall interface",
     license: "GPL",
@@ -39,18 +39,18 @@ module! {
 
 /// Module state. `MiscDeviceRegistration` deregisters in `Drop`.
 #[pin_data(PinnedDrop)]
-struct XringModule {
+struct KoruModule {
     #[pin]
     _miscdev: MiscDeviceRegistration<RingCtx>,
 }
 
-impl kernel::InPlaceModule for XringModule {
+impl kernel::InPlaceModule for KoruModule {
     fn init(_module: &'static ThisModule) -> impl PinInit<Self, Error> {
         // `pr_info!` already prefixes the module name, so do not repeat it.
-        pr_info!("init, registering /dev/xring\n");
+        pr_info!("init, registering /dev/koru\n");
 
         // No mode field, so the node is created 0600 root:root, as intended.
-        let options = MiscDeviceOptions { name: c"xring" };
+        let options = MiscDeviceOptions { name: c"koru" };
 
         try_pin_init!(Self {
             _miscdev <- MiscDeviceRegistration::register(options),
@@ -60,7 +60,7 @@ impl kernel::InPlaceModule for XringModule {
 
 // `#[pin_data]` generates its own `Drop`, so the hook goes through `PinnedDrop`.
 #[pinned_drop]
-impl PinnedDrop for XringModule {
+impl PinnedDrop for KoruModule {
     fn drop(self: Pin<&mut Self>) {
         pr_info!("exit\n");
     }
@@ -268,8 +268,8 @@ impl WorkItem for OpWork {
     fn run(this: Arc<OpWork>) {
         let sqe = &this.sqe;
         let (res, slot) = match sqe.opcode {
-            XRING_OP_DELAY_NS => (0, None),
-            XRING_OP_CHECKSUM => (
+            KORU_OP_DELAY_NS => (0, None),
+            KORU_OP_CHECKSUM => (
                 this.ring
                     .checksum(sqe)
                     .unwrap_or_else(|e| i64::from(e.to_errno())),
@@ -375,7 +375,7 @@ impl MiscDevice for RingCtx {
     fn ioctl(me: ArcBorrow<'_, RingCtx>, _file: &File, cmd: u32, arg: usize) -> Result<isize> {
         // Dispatch on type and command number: matching the whole ioctl number
         // would report a version skew as "no such ioctl" and hide it.
-        if _IOC_TYPE(cmd) != XRING_IOC_TYPE {
+        if _IOC_TYPE(cmd) != KORU_IOC_TYPE {
             return Err(ENOTTY);
         }
 
@@ -389,23 +389,23 @@ impl MiscDevice for RingCtx {
                 Err(eproto())
             }
         };
-        let params_size = core::mem::size_of::<XringParams>();
-        let enter_size = core::mem::size_of::<XringEnter>();
+        let params_size = core::mem::size_of::<KoruParams>();
+        let enter_size = core::mem::size_of::<KoruEnter>();
 
         match _IOC_NR(cmd) {
-            XRING_NR_SETUP => {
+            KORU_NR_SETUP => {
                 check_size(params_size)?;
                 let (reader, writer) = UserSlice::new(ptr, params_size).reader_writer();
                 me.setup(reader, writer)?;
                 Ok(0)
             }
-            XRING_NR_GET_PARAMS => {
+            KORU_NR_GET_PARAMS => {
                 check_size(params_size)?;
                 me.get_params(UserSlice::new(ptr, params_size).writer())?;
                 Ok(0)
             }
             // The only ioctl returning a value: SQEs consumed (E1).
-            XRING_NR_ENTER => {
+            KORU_NR_ENTER => {
                 check_size(enter_size)?;
                 RingCtx::enter(me, ptr)
             }
@@ -417,27 +417,27 @@ impl MiscDevice for RingCtx {
 
 impl RingCtx {
     /// Fill what the kernel always owns: caps and ABI identity.
-    fn fill_caps(p: &mut XringParams) {
-        p.magic = XRING_MAGIC;
-        p.abi_version = XRING_ABI_VERSION;
+    fn fill_caps(p: &mut KoruParams) {
+        p.magic = KORU_MAGIC;
+        p.abi_version = KORU_ABI_VERSION;
         p.features = 0;
-        p.max_sq_entries = XRING_MAX_SQ_ENTRIES;
-        p.max_cq_entries = XRING_MAX_CQ_ENTRIES;
-        p.max_slot_size = XRING_MAX_SLOT_SIZE;
-        p.max_slot_count = XRING_MAX_SLOT_COUNT;
-        p.max_arena_bytes = XRING_MAX_ARENA_BYTES;
+        p.max_sq_entries = KORU_MAX_SQ_ENTRIES;
+        p.max_cq_entries = KORU_MAX_CQ_ENTRIES;
+        p.max_slot_size = KORU_MAX_SLOT_SIZE;
+        p.max_slot_count = KORU_MAX_SLOT_COUNT;
+        p.max_arena_bytes = KORU_MAX_ARENA_BYTES;
     }
 
     /// Validate a `SETUP` request. Pure, so a rejected one cannot consume the
     /// one-shot.
-    fn validate(req: &XringParams) -> Result<RingConfig> {
+    fn validate(req: &KoruParams) -> Result<RingConfig> {
         // Identity first: ABI skew should not surface as a field complaint.
-        if req.magic != XRING_MAGIC || req.abi_version != XRING_ABI_VERSION {
+        if req.magic != KORU_MAGIC || req.abi_version != KORU_ABI_VERSION {
             return Err(eproto());
         }
 
         // Reserved-zero and unknown-flag rejection: the extensibility rule.
-        if req.flags & !XRING_SETUP_FLAGS_ALL != 0 {
+        if req.flags & !KORU_SETUP_FLAGS_ALL != 0 {
             return Err(EINVAL);
         }
         if req.reserved.iter().any(|&r| r != 0) {
@@ -445,7 +445,7 @@ impl RingCtx {
         }
 
         let sq_entries = req.sq_entries;
-        if sq_entries == 0 || sq_entries > XRING_MAX_SQ_ENTRIES {
+        if sq_entries == 0 || sq_entries > KORU_MAX_SQ_ENTRIES {
             return Err(EINVAL);
         }
 
@@ -455,7 +455,7 @@ impl RingCtx {
         } else {
             req.cq_entries
         };
-        if cq_entries > XRING_MAX_CQ_ENTRIES {
+        if cq_entries > KORU_MAX_CQ_ENTRIES {
             return Err(EINVAL);
         }
         // A shallower CQ would break the reserve-per-SQE rule.
@@ -465,7 +465,7 @@ impl RingCtx {
 
         let slot_size = req.slot_size;
         let slot_count = req.slot_count;
-        if slot_size == 0 || slot_size > XRING_MAX_SLOT_SIZE {
+        if slot_size == 0 || slot_size > KORU_MAX_SLOT_SIZE {
             return Err(EINVAL);
         }
         // Whole pages per slot: the arena is order-0 pages, and a slot that
@@ -474,7 +474,7 @@ impl RingCtx {
         if slot_size as usize % PAGE_SIZE != 0 {
             return Err(EINVAL);
         }
-        if slot_count == 0 || slot_count > XRING_MAX_SLOT_COUNT {
+        if slot_count == 0 || slot_count > KORU_MAX_SLOT_COUNT {
             return Err(EINVAL);
         }
 
@@ -482,7 +482,7 @@ impl RingCtx {
         let arena_size = u64::from(slot_size)
             .checked_mul(u64::from(slot_count))
             .ok_or(EINVAL)?;
-        if arena_size > XRING_MAX_ARENA_BYTES {
+        if arena_size > KORU_MAX_ARENA_BYTES {
             return Err(EINVAL);
         }
 
@@ -495,9 +495,9 @@ impl RingCtx {
         })
     }
 
-    /// `XRING_IOC_SETUP`: configure the ring exactly once.
+    /// `KORU_IOC_SETUP`: configure the ring exactly once.
     fn setup(&self, mut reader: UserSliceReader, mut writer: UserSliceWriter) -> Result {
-        let req: XringParams = reader.read()?;
+        let req: KoruParams = reader.read()?;
         let cfg = Self::validate(&req)?;
 
         // Allocate before locking, so ENTER never allocates.
@@ -549,15 +549,15 @@ impl RingCtx {
         }
 
         // Built from scratch, not echoed: no unvalidated bytes travel back.
-        let mut out = XringParams::default();
+        let mut out = KoruParams::default();
         Self::fill_caps(&mut out);
         Self::fill_config(&mut out, &cfg);
         writer.write(&out)
     }
 
-    /// `XRING_IOC_GET_PARAMS`: report caps always, effective values if configured.
+    /// `KORU_IOC_GET_PARAMS`: report caps always, effective values if configured.
     fn get_params(&self, mut writer: UserSliceWriter) -> Result {
-        let mut out = XringParams::default();
+        let mut out = KoruParams::default();
         Self::fill_caps(&mut out);
         if let Some(cfg) = *self.config.lock() {
             Self::fill_config(&mut out, &cfg);
@@ -565,16 +565,16 @@ impl RingCtx {
         writer.write(&out)
     }
 
-    /// `XRING_IOC_ENTER`: submit, then reap. Returns SQEs **consumed** (E1);
+    /// `KORU_IOC_ENTER`: submit, then reap. Returns SQEs **consumed** (E1);
     /// completions are counted in `completed`.
     fn enter(me: ArcBorrow<'_, RingCtx>, arg: UserPtr) -> Result<isize> {
         let this = &*me;
-        let size = core::mem::size_of::<XringEnter>();
+        let size = core::mem::size_of::<KoruEnter>();
         let (mut arg_reader, mut arg_writer) = UserSlice::new(arg, size).reader_writer();
-        let mut req: XringEnter = arg_reader.read()?;
+        let mut req: KoruEnter = arg_reader.read()?;
 
         // Protocol failures fail the ioctl; only SQE errors become completions.
-        if req.flags & !XRING_ENTER_FLAGS_ALL != 0 {
+        if req.flags & !KORU_ENTER_FLAGS_ALL != 0 {
             return Err(EINVAL);
         }
         if req.reserved.iter().any(|&r| r != 0) {
@@ -753,26 +753,26 @@ impl RingCtx {
     fn dispatch(me: ArcBorrow<'_, RingCtx>, sqe: &Sqe) -> Option<i64> {
         let einval = i64::from(EINVAL.to_errno());
 
-        if sqe.rsvd0 != 0 || sqe.flags & !XRING_SQE_FLAGS_ALL != 0 {
+        if sqe.rsvd0 != 0 || sqe.flags & !KORU_SQE_FLAGS_ALL != 0 {
             return Some(einval);
         }
 
         match sqe.opcode {
-            XRING_OP_NOP => {
+            KORU_OP_NOP => {
                 // NOP reads no argument fields, so all must be zero.
                 if sqe.len != 0 || sqe.off != 0 || sqe.slot != 0 || sqe.handle != 0 {
                     return Some(einval);
                 }
                 Some(0)
             }
-            XRING_OP_DELAY_NS => {
+            KORU_OP_DELAY_NS => {
                 // DELAY_NS reads only `off`.
                 if sqe.len != 0 || sqe.slot != 0 || sqe.handle != 0 {
                     return Some(einval);
                 }
                 RingCtx::defer(me, sqe, delay_jiffies(sqe.off))
             }
-            XRING_OP_CHECKSUM => {
+            KORU_OP_CHECKSUM => {
                 if sqe.handle != 0 {
                     return Some(einval);
                 }
@@ -887,7 +887,7 @@ impl RingCtx {
         None
     }
 
-    fn fill_config(p: &mut XringParams, cfg: &RingConfig) {
+    fn fill_config(p: &mut KoruParams, cfg: &RingConfig) {
         p.sq_entries = cfg.sq_entries;
         p.cq_entries = cfg.cq_entries;
         p.slot_size = cfg.slot_size;

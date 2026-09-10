@@ -2,7 +2,7 @@
 //
 // T4 done test: ENTER, NOP only.
 
-#include "xring_test.h"
+#include "koru_test.h"
 
 #include <errno.h>
 #include <stdio.h>
@@ -10,16 +10,16 @@
 #include <unistd.h>
 
 /* Reserved in the ABI but not implemented yet; repoint as opcodes land. */
-#define XRING_OP_UNIMPLEMENTED XRING_OP_OPEN /* T9 */
+#define KORU_OP_UNIMPLEMENTED KORU_OP_OPEN /* T9 */
 
 #define SQ_ENTRIES 64
 #define CQ_ENTRIES 128
 
 int main(void)
 {
-	struct xring_sqe sq[16];
-	struct xring_cqe cq[16];
-	struct xring_enter e;
+	struct koru_sqe sq[16];
+	struct koru_cqe cq[16];
+	struct koru_enter e;
 	int fd, ret;
 	unsigned i;
 
@@ -32,7 +32,7 @@ int main(void)
 	for (i = 0; i < 8; i++)
 		sqe_nop(&sq[i], 0x1000 + i);
 	enter_init(&e, sq, 8, cq, 16);
-	ret = ioctl(fd, XRING_IOC_ENTER, &e);
+	ret = ioctl(fd, KORU_IOC_ENTER, &e);
 	check(ret == 8, "ENTER returns 8 SQEs consumed");
 	check(e.completed == 8, "  completed == 8");
 	check(e.submitted == 8, "  submitted == 8");
@@ -50,7 +50,7 @@ int main(void)
 	sqe_nop(&sq[0], 0x2000);
 	sq[0].opcode = 200; /* unknown */
 	enter_init(&e, sq, 1, cq, 16);
-	ret = ioctl(fd, XRING_IOC_ENTER, &e);
+	ret = ioctl(fd, KORU_IOC_ENTER, &e);
 	check(ret == 1, "unknown opcode: ioctl still succeeds, 1 consumed");
 	check(e.completed == 1 && cq[0].user_data == 0x2000 && cq[0].res == -EINVAL,
 	      "  yields a CQE with res == -EINVAL");
@@ -58,28 +58,28 @@ int main(void)
 	sqe_nop(&sq[0], 0x2001);
 	sq[0].flags = 1; /* no flags defined */
 	enter_init(&e, sq, 1, cq, 16);
-	ret = ioctl(fd, XRING_IOC_ENTER, &e);
+	ret = ioctl(fd, KORU_IOC_ENTER, &e);
 	check(ret == 1 && e.completed == 1 && cq[0].res == -EINVAL,
 	      "unknown SQE flag bit yields res == -EINVAL");
 
 	sqe_nop(&sq[0], 0x2002);
 	sq[0].rsvd0 = 7;
 	enter_init(&e, sq, 1, cq, 16);
-	ret = ioctl(fd, XRING_IOC_ENTER, &e);
+	ret = ioctl(fd, KORU_IOC_ENTER, &e);
 	check(ret == 1 && e.completed == 1 && cq[0].res == -EINVAL,
 	      "non-zero SQE rsvd0 yields res == -EINVAL");
 
 	sqe_nop(&sq[0], 0x2003);
 	sq[0].len = 1; /* NOP reads no argument fields */
 	enter_init(&e, sq, 1, cq, 16);
-	ret = ioctl(fd, XRING_IOC_ENTER, &e);
+	ret = ioctl(fd, KORU_IOC_ENTER, &e);
 	check(ret == 1 && e.completed == 1 && cq[0].res == -EINVAL,
 	      "non-zero unused field yields res == -EINVAL");
 
 	sqe_nop(&sq[0], 0x2004);
-	sq[0].opcode = XRING_OP_UNIMPLEMENTED;
+	sq[0].opcode = KORU_OP_UNIMPLEMENTED;
 	enter_init(&e, sq, 1, cq, 16);
-	ret = ioctl(fd, XRING_IOC_ENTER, &e);
+	ret = ioctl(fd, KORU_IOC_ENTER, &e);
 	check(ret == 1 && e.completed == 1 && cq[0].res == -EINVAL,
 	      "unimplemented opcode yields res == -EINVAL");
 
@@ -90,7 +90,7 @@ int main(void)
 			sq[i].opcode = 250;
 	}
 	enter_init(&e, sq, 8, cq, 16);
-	ret = ioctl(fd, XRING_IOC_ENTER, &e);
+	ret = ioctl(fd, KORU_IOC_ENTER, &e);
 	check(ret == 8, "mixed valid/invalid batch: all 8 consumed");
 	check(e.completed == 8, "  all 8 completed (C1)");
 	ok = 1;
@@ -105,13 +105,13 @@ int main(void)
 	for (i = 0; i < 8; i++)
 		sqe_nop(&sq[i], 0x4000 + i);
 	enter_init(&e, sq, 8, cq, 3);
-	ret = ioctl(fd, XRING_IOC_ENTER, &e);
+	ret = ioctl(fd, KORU_IOC_ENTER, &e);
 	check(ret == 8 && e.completed == 3, "cq_space 3 of 8: consumed 8, completed 3");
 	check(cq[0].user_data == 0x4000 && cq[2].user_data == 0x4002, "  first three delivered");
 
 	memset(cq, 0, sizeof(cq));
 	enter_init(&e, NULL, 0, cq, 16);
-	ret = ioctl(fd, XRING_IOC_ENTER, &e);
+	ret = ioctl(fd, KORU_IOC_ENTER, &e);
 	check(ret == 0 && e.completed == 5, "drain with to_submit 0 returns the other 5");
 	ok = 1;
 	for (i = 0; i < 5; i++)
@@ -122,25 +122,25 @@ int main(void)
 	/* 5. Protocol failures that do fail the ioctl. */
 	enter_init(&e, sq, 1, cq, 16);
 	e.flags = 1;
-	check_errno(ioctl(fd, XRING_IOC_ENTER, &e), EINVAL, "unknown ENTER flag returns EINVAL");
+	check_errno(ioctl(fd, KORU_IOC_ENTER, &e), EINVAL, "unknown ENTER flag returns EINVAL");
 
 	enter_init(&e, sq, 1, cq, 16);
 	e.reserved[1] = 1;
-	check_errno(ioctl(fd, XRING_IOC_ENTER, &e), EINVAL,
+	check_errno(ioctl(fd, KORU_IOC_ENTER, &e), EINVAL,
 		    "non-zero ENTER reserved returns EINVAL");
 
 	enter_init(&e, sq, SQ_ENTRIES + 1, cq, 16);
-	check_errno(ioctl(fd, XRING_IOC_ENTER, &e), EINVAL,
+	check_errno(ioctl(fd, KORU_IOC_ENTER, &e), EINVAL,
 		    "to_submit over sq_entries returns EINVAL");
 
 	enter_init(&e, sq, 1, cq, 2);
 	e.min_complete = 3;
-	check_errno(ioctl(fd, XRING_IOC_ENTER, &e), EINVAL,
+	check_errno(ioctl(fd, KORU_IOC_ENTER, &e), EINVAL,
 		    "min_complete over cq_space returns EINVAL");
 
 	enter_init(&e, sq, 1, NULL, 0);
 	e.sq_addr = 0x10; /* unmapped */
-	check_errno(ioctl(fd, XRING_IOC_ENTER, &e), EFAULT, "unmapped sq_addr returns EFAULT");
+	check_errno(ioctl(fd, KORU_IOC_ENTER, &e), EFAULT, "unmapped sq_addr returns EFAULT");
 	close(fd);
 
 	/* 6. ENTER before SETUP. */
@@ -148,7 +148,7 @@ int main(void)
 	if (fd < 0)
 		return 1;
 	enter_init(&e, sq, 0, cq, 16);
-	check_errno(ioctl(fd, XRING_IOC_ENTER, &e), EINVAL, "ENTER before SETUP returns EINVAL");
+	check_errno(ioctl(fd, KORU_IOC_ENTER, &e), EINVAL, "ENTER before SETUP returns EINVAL");
 	close(fd);
 
 	/* 7. Admission control: the CQ cannot overflow. */
@@ -161,7 +161,7 @@ int main(void)
 		for (j = 0; j < 8; j++)
 			sqe_nop(&sq[j], 0x5000 + total + j);
 		enter_init(&e, sq, 8, cq, 0); /* submit, never reap */
-		ret = ioctl(fd, XRING_IOC_ENTER, &e);
+		ret = ioctl(fd, KORU_IOC_ENTER, &e);
 		if (ret < 0) {
 			perror("ENTER");
 			failures++;

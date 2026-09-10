@@ -1,4 +1,4 @@
-# xring
+# koru
 
 An experimental Linux kernel API built for coroutines instead of POSIX.
 
@@ -13,7 +13,7 @@ separate events. That means a queue, not a call.
 
 ## The idea
 
-Open `/dev/xring`. You get a ring: push operations in, pull completions out, and resume
+Open `/dev/koru`. You get a ring: push operations in, pull completions out, and resume
 whichever coroutine each completion belongs to.
 
 ```
@@ -85,7 +85,7 @@ completion resumes a handle directly with no polling and no `Waker`.
 | Kernel module (Rust) | misc device, opcode dispatch, buffer arena, worker offload |
 | `ENTER` ioctl | submits operations and blocks for completions — the only entry point |
 | `mmap` arena | fixed-size slots in kernel-owned pages; the data plane |
-| `user/xring` | Rust binding: `Future` impls + executor |
+| `user/koru` | Rust binding: `Future` impls + executor |
 | `user/cpp` | C++20 binding: awaiters, `task<T>`, executor |
 
 The coroutines are entirely in userspace. Kernel Rust has no async runtime, so the kernel
