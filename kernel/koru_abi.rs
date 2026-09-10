@@ -16,6 +16,16 @@ pub(crate) fn eproto() -> Error {
     Error::from_errno(-(kernel::uapi::EPROTO as i32))
 }
 
+/// `ECANCELED`: the completion a cancelled op gets. Not in `error::code`.
+pub(crate) fn ecanceled() -> Error {
+    Error::from_errno(-(kernel::uapi::ECANCELED as i32))
+}
+
+/// `EALREADY`: the target was found but is already running. Not in `error::code`.
+pub(crate) fn ealready() -> Error {
+    Error::from_errno(-(kernel::uapi::EALREADY as i32))
+}
+
 /// Set by userspace in [`KoruParams::magic`]. Spells "koru" little-endian.
 pub(crate) const KORU_MAGIC: u32 = 0x7572_6f6b;
 
@@ -151,7 +161,10 @@ pub(crate) const KORU_OP_OPEN: u8 = 2; // T9
 pub(crate) const KORU_OP_READ: u8 = 3; // T10
 /// Retire the handle in `handle`. `len`, `off` and `slot` must be zero.
 pub(crate) const KORU_OP_CLOSE: u8 = 4; // T9
-#[expect(dead_code)]
+/// Cancel the in-flight op whose `user_data` is `off`. `len`, `slot` and
+/// `handle` must be zero. `res` is 0 when cancelled, `-ENOENT` when no such op
+/// is in flight, `-EALREADY` when it is already running. The target always gets
+/// its own CQE; the order of the two is unspecified.
 pub(crate) const KORU_OP_CANCEL: u8 = 5; // T11
 /// FNV-1a over `len` bytes at `off` in slot `slot`, returned in `res`.
 /// `handle` must be zero. Scaffolding for the arena; see doc/Notes.md.

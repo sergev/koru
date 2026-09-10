@@ -29,6 +29,7 @@ use kernel::{
 };
 
 use koru_abi::*;
+use koru_ops::OpWork;
 
 module! {
     type: KoruModule,
@@ -167,9 +168,14 @@ impl RingState {
         self.len -= 1;
     }
 
-    /// Nothing queued and nothing that could ever arrive.
-    fn idle(&self) -> bool {
-        self.len == 0 && self.inflight == 0
+    /// No further completion can ever arrive.
+    ///
+    /// Deliberately *not* `len == 0 && inflight == 0`. Completions come only
+    /// from deferred ops, so once `inflight` is zero the queued count can never
+    /// grow, and a waiter asking for more than is already there would sleep for
+    /// ever. T11 hit exactly that.
+    fn quiescent(&self) -> bool {
+        self.inflight == 0
     }
 
     /// Claim a slot. False means another op already owns it.
@@ -314,6 +320,38 @@ pub(crate) struct RingCtx {
     /// Open handles. A leaf lock: never taken while `state` is held.
     #[pin]
     pub(crate) handles: Mutex<HandleTable>,
+
+    /// Deferred ops that have not completed, so `CANCEL` can find them.
+    ///
+    /// Holds a strong `Arc<OpWork>`, and `OpWork` holds an `Arc<RingCtx>`, so
+    /// this is a reference cycle. It is broken by removing the entry on every
+    /// completion path; see doc/Notes.md.
+    ///
+    /// A leaf lock like `handles`: never taken while `state` is held.
+    #[pin]
+    pub(crate) pending: Mutex<KVec<Arc<OpWork>>>,
+}
+
+impl RingCtx {
+    /// Find the first in-flight op with this `user_data`.
+    ///
+    /// A duplicate `user_data` is a userspace bug; which one is found is
+    /// unspecified.
+    pub(crate) fn pending_find(list: &KVec<Arc<OpWork>>, user_data: u64) -> Option<usize> {
+        list.iter().position(|op| op.user_data() == user_data)
+    }
+
+    /// Remove an op by pointer identity, not by `user_data`, so a duplicate
+    /// cannot make `run` unregister somebody else.
+    pub(crate) fn pending_remove(list: &mut KVec<Arc<OpWork>>, op: &OpWork) {
+        if let Some(i) = list
+            .iter()
+            .position(|e| core::ptr::eq(Arc::as_ptr(e), core::ptr::from_ref(op)))
+        {
+            // In bounds: the index came from `position` under this lock.
+            let _ = list.remove(i);
+        }
+    }
 }
 
 /// Kernel-owned buffer pages, plus whether they have been mapped.
@@ -350,6 +388,7 @@ impl MiscDevice for RingCtx {
                     mapped: false,
                 }),
                 handles <- new_mutex!(HandleTable::new()),
+                pending <- new_mutex!(KVec::new()),
             }),
             GFP_KERNEL,
         );
@@ -590,6 +629,10 @@ impl RingCtx {
 
         let handles = HandleTable::alloc(cfg.handle_count as usize)?;
 
+        // Admission control reserves a CQ slot per consumed SQE, so this is a
+        // real bound on in-flight deferred ops and `push` never has to grow.
+        let pending = KVec::with_capacity(cfg.cq_entries as usize, GFP_KERNEL)?;
+
         {
             let mut guard = self.config.lock();
             if guard.is_some() {
@@ -611,6 +654,7 @@ impl RingCtx {
             drop(arena);
 
             self.handles.lock().entries = handles;
+            *self.pending.lock() = pending;
 
             *guard = Some(cfg);
         }
@@ -771,9 +815,9 @@ impl RingCtx {
             if state.len >= min_complete {
                 return false;
             }
-            // Nothing queued and nothing that could ever arrive: returning
-            // beats sleeping forever. io_uring gets this wrong.
-            if state.idle() {
+            // `min_complete` is unreachable and always will be: returning a
+            // short count beats sleeping forever. io_uring gets this wrong.
+            if state.quiescent() {
                 return false;
             }
             match self.cq_wait.wait_interruptible_timeout(&mut state, jiffies) {

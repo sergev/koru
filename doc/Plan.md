@@ -1,15 +1,18 @@
 # koru — remaining tasks
 
 This file lists only work that is still to do. The design, the ABI invariants,
-the accepted gaps and everything T0–T10 established are in
+the accepted gaps and everything T0–T11 established are in
 [Notes.md](Notes.md); read that first.
 
-T0–T10 are done and have been removed from this list. Every opcode except
-`CANCEL` works: the module registers `/dev/koru`, configures a ring with
-`SETUP`, and submits `NOP`, `DELAY_NS`, `CHECKSUM`, `OPEN`, `READ` and `CLOSE`
+T0–T11 are done and have been removed from this list. **Every opcode is
+implemented.** The module registers `/dev/koru`, configures a ring with `SETUP`,
+and submits `NOP`, `DELAY_NS`, `CHECKSUM`, `OPEN`, `READ`, `CLOSE` and `CANCEL`
 through `ENTER`, which blocks for completions. The arena is mmap'd, slot
 exclusivity is enforced by the kernel, open files are held in a generational
-handle table, teardown is safe and `rmmod` is refused while anything is live.
+handle table, a queued op can be genuinely dequeued, teardown is safe and
+`rmmod` is refused while anything is live.
+
+What remains in this phase is T12, which is what validates all of it.
 
 Each task below carries a done test. A task is finished when its done test has
 been run and has passed, and when the test has been shown to fail if the thing
@@ -19,16 +22,6 @@ it checks is broken. Mark it done here, move whatever it taught into
 **[M]** mechanical · **[R]** risky/exploratory
 
 ## Phase 3 — real operations
-
-### T11 [R] — `CANCEL`
-
-`res = 0` when found and cancelled, `-ENOENT` for an unknown target,
-`-EALREADY` when it is already running. The target always gets its own CQE per
-C1; relative ordering of the two completions is unspecified.
-
-Done test: cancel a pending `DELAY_NS` and the target gets `-ECANCELED` while
-the canceller gets `0`. Cancel a running one and the canceller gets
-`-EALREADY` with the target still completing. Both CQEs always arrive.
 
 ### T12 [R] — hostile-userspace fuzz
 

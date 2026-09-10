@@ -13,7 +13,7 @@ use kernel::{
     str::CStrExt,
     sync::{aref::ARef, Arc, ArcBorrow},
     time::{msecs_to_jiffies, Jiffies},
-    workqueue::{self, DelayedWork, WorkItem},
+    workqueue::{self, DelayedWork, HasWork, Work, WorkItem},
 };
 
 use core::ptr::NonNull;
@@ -56,29 +56,58 @@ impl_has_delayed_work! {
     impl HasDelayedWork<Self> for OpWork { self.work }
 }
 
+impl OpWork {
+    pub(crate) fn user_data(&self) -> u64 {
+        self.sqe.user_data
+    }
+
+    /// The slot this op owns while deferred, released when it completes.
+    /// `CANCEL` must free exactly what `run` would have.
+    fn held_slot(sqe: &Sqe) -> Option<u32> {
+        match sqe.opcode {
+            KORU_OP_CHECKSUM | KORU_OP_READ => Some(sqe.slot),
+            _ => None,
+        }
+    }
+
+    /// The `struct delayed_work` inside this op, for `cancel_delayed_work`.
+    fn delayed_work(op: &Arc<OpWork>) -> *mut bindings::delayed_work {
+        let ptr = Arc::as_ptr(op).cast_mut();
+        // SAFETY: `ptr` points at a live `OpWork`, so its `work` field is live.
+        let work = unsafe { <OpWork as HasWork<OpWork>>::raw_get_work(ptr) };
+        // SAFETY: as above.
+        let work = unsafe { Work::raw_get(work) };
+        // SAFETY: `work` is the `work` field of the `DelayedWork` above, which
+        // is `repr(transparent)` over `bindings::delayed_work`.
+        unsafe { kernel::container_of!(work, bindings::delayed_work, work) }
+    }
+}
+
 impl WorkItem for OpWork {
     type Pointer = Arc<OpWork>;
 
     /// Runs in a kworker: no user memory, and the submitting task may be gone.
     fn run(this: Arc<OpWork>) {
         let sqe = &this.sqe;
-        let (res, slot) = match sqe.opcode {
-            KORU_OP_DELAY_NS => (0, None),
-            KORU_OP_CHECKSUM => (
-                this.ring
-                    .checksum(sqe)
-                    .unwrap_or_else(|e| i64::from(e.to_errno())),
-                Some(sqe.slot),
-            ),
-            KORU_OP_READ => (
-                this.ring
-                    .do_read(sqe, this.file.as_deref())
-                    .unwrap_or_else(|e| i64::from(e.to_errno())),
-                Some(sqe.slot),
-            ),
-            _ => (i64::from(EINVAL.to_errno()), None),
+        let res = match sqe.opcode {
+            KORU_OP_DELAY_NS => 0,
+            KORU_OP_CHECKSUM => this
+                .ring
+                .checksum(sqe)
+                .unwrap_or_else(|e| i64::from(e.to_errno())),
+            KORU_OP_READ => this
+                .ring
+                .do_read(sqe, this.file.as_deref())
+                .unwrap_or_else(|e| i64::from(e.to_errno())),
+            _ => i64::from(EINVAL.to_errno()),
         };
-        this.ring.complete(RingCtx::cqe(sqe, res), slot);
+        this.ring
+            .complete(RingCtx::cqe(sqe, res), OpWork::held_slot(sqe));
+
+        // Unregister *after* completing, so a `CANCEL` arriving while this ran
+        // still finds the entry and reports `EALREADY` rather than `ENOENT`.
+        // This also drops the registry's reference, breaking the cycle.
+        RingCtx::pending_remove(&mut this.ring.pending.lock(), &this);
     }
 }
 
@@ -114,6 +143,7 @@ impl RingCtx {
             KORU_OP_OPEN => Some(me.open_op(sqe)),
             KORU_OP_CLOSE => Some(me.close_op(sqe)),
             KORU_OP_READ => RingCtx::read_op(me, sqe),
+            KORU_OP_CANCEL => Some(me.cancel_op(sqe)),
             KORU_OP_CHECKSUM => {
                 if sqe.handle != 0 {
                     return Some(einval);
@@ -436,11 +466,67 @@ impl RingCtx {
 
         // Counted before enqueueing, or `run` could decrement first.
         me.state.lock().inflight += 1;
-        if workqueue::system().enqueue_delayed(op, jiffies).is_err() {
-            me.state.lock().inflight -= 1;
-            return Some(i64::from(EAGAIN.to_errno()));
+
+        // Registered before enqueueing: afterwards `run` may already have
+        // completed and unregistered, and a late insert would never be removed.
+        let registered = me.pending.lock().push(op.clone(), GFP_KERNEL).is_ok();
+
+        match workqueue::system().enqueue_delayed(op, jiffies) {
+            Ok(()) => None,
+            // The queue handed the `Arc` back, so remove by identity: another
+            // submitter may have pushed since.
+            Err(op) => {
+                if registered {
+                    RingCtx::pending_remove(&mut me.pending.lock(), &op);
+                }
+                me.state.lock().inflight -= 1;
+                Some(i64::from(EAGAIN.to_errno()))
+            }
         }
-        None
+    }
+
+    /// `CANCEL`: retire the in-flight op whose `user_data` is `off`.
+    ///
+    /// `cancel_delayed_work` returning true means it took the pending token from
+    /// an armed timer or a worklist entry, so `run` will never be called — which
+    /// is exactly the condition under which nobody else will reclaim the
+    /// reference `enqueue_delayed` leaked. See doc/Notes.md; getting this wrong
+    /// in either direction is a leak or a double free.
+    fn cancel_op(&self, sqe: &Sqe) -> i64 {
+        if sqe.len != 0 || sqe.slot != 0 || sqe.handle != 0 {
+            return i64::from(EINVAL.to_errno());
+        }
+
+        let mut list = self.pending.lock();
+        let Some(i) = RingCtx::pending_find(&list, sqe.off) else {
+            return i64::from(ENOENT.to_errno());
+        };
+        // Cloned so it outlives the removal below and the unlock.
+        let op = list[i].clone();
+
+        // SAFETY: `op` keeps the `OpWork`, and so its `delayed_work`, alive.
+        if !unsafe { bindings::cancel_delayed_work(OpWork::delayed_work(&op)) } {
+            // Already running, or already done. Nothing was pending, so no
+            // reference is orphaned and none may be dropped.
+            return i64::from(ealready().to_errno());
+        }
+
+        // SAFETY: the cancel succeeded, so `run` will never reclaim the
+        // reference `enqueue_delayed` leaked. Adopt it here, exactly once.
+        let leaked = unsafe { Arc::from_raw(Arc::as_ptr(&op)) };
+        // In bounds: the index came from `pending_find` under this lock.
+        let _ = list.remove(i);
+        drop(list);
+        drop(leaked);
+
+        // C1: the target still gets its own completion, releasing whatever it
+        // held. The ring `SpinLock` is taken only after the registry is unlocked.
+        let target = op.sqe;
+        self.complete(
+            RingCtx::cqe(&target, i64::from(ecanceled().to_errno())),
+            OpWork::held_slot(&target),
+        );
+        0
     }
 }
 

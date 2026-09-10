@@ -1,7 +1,7 @@
 # koru — design notes
 
 The global picture: why this API is shaped the way it is, what the ABI
-guarantees, and what building T0–T10 actually taught us. [Plan.md](Plan.md)
+guarantees, and what building T0–T11 actually taught us. [Plan.md](Plan.md)
 holds the remaining tasks and nothing else.
 
 ## Context
@@ -62,8 +62,9 @@ Merged and usable: `kernel::miscdevice` (6.13;
 `open`/`release`/`ioctl`/`mmap`/`read_iter`, **no `poll`**), `kernel::mm::virt`
 (6.16; `VmaNew::set_mixedmap`, `VmaMixedMap::vm_insert_page`),
 `kernel::sync::{CondVar, SpinLock, Mutex, Arc, atomic}`, `kernel::workqueue`
-(`Work`, `DelayedWork`, `enqueue`, `enqueue_delayed` — but **no**
-`cancel_work_sync` or `flush_workqueue`), `kernel::uaccess::UserSlice`.
+(`Work`, `DelayedWork`, `enqueue`, `enqueue_delayed` — but **no** cancel or
+flush *wrapper*; the `bindings` have `cancel_delayed_work` and it is exported,
+which is what T11 uses), `kernel::uaccess::UserSlice`.
 
 Note that `filp_open`, `kernel_read` and `override_creds` have **no** safe Rust
 wrappers. A substantial fraction of this work is raw `bindings::` + `unsafe`,
@@ -157,7 +158,7 @@ line.
 
 Opcodes: `NOP`, `DELAY_NS`, `OPEN`, `READ`, `CLOSE`, `CANCEL`, plus `CHECKSUM`,
 which began as scaffolding for the arena and stayed as the deferred-op test
-vehicle. Everything except `CANCEL` is implemented.
+vehicle. All seven are implemented.
 
 The ioctl type byte is `'k'` and the magic word is `0x7572_6f6b`, spelling
 "koru" little-endian. That type byte is listed as conflicting in the kernel's
@@ -174,9 +175,10 @@ back, so an interrupted call still says what must not be resubmitted.
 `ENTER` must use `CondVar::wait_interruptible_timeout`. Plain `wait()` makes the
 process unkillable in D-state with an unloadable module.
 
-`ENTER(to_submit = 0, min_complete = 1)` with nothing in flight must return
-immediately rather than sleep. io_uring has this deadlock foot-gun; ours is
-closed and has a test.
+`ENTER` must return rather than sleep whenever `min_complete` can never be
+reached, which is precisely when nothing is in flight. That covers the io_uring
+foot-gun of waiting on an empty ring, and also the case T11 found: asking for
+more than is already queued while nothing is running.
 
 ### CQ overflow: admission control, not an overflow list
 
@@ -247,7 +249,7 @@ last one out frees `RingCtx`. `release()` drains the handle table under the
 There is no `dying` flag. Nothing has needed one: `ENTER` cannot be in flight
 once `release` runs, and no deferred op touches the handle table.
 
-## What T0–T10 established
+## What T0–T11 established
 
 The tasks themselves are gone from [Plan.md](Plan.md); what they proved is here.
 
@@ -458,6 +460,57 @@ uninteresting rather than fatal, and the perturbation proves it — capturing th
 file's address at submit time without taking the reference gives an immediate
 KASAN slab-use-after-free.
 
+### Cancellation
+
+`CANCEL` names its target by `user_data` in `off`. A duplicate `user_data`
+cancels one of them, unspecified which; both bindings key their op slabs by a
+unique `(index, generation)`, so a duplicate is a userspace bug.
+
+Cancellation is **real, not advisory**, which contradicts the earlier reading of
+the workqueue API. The Rust wrapper exposes no cancel or flush at all, but
+`cancel_delayed_work` is generated in the bindings and is a plain
+`EXPORT_SYMBOL`, so an out-of-tree module can call it. Its return value is
+exactly the fact needed: `true` means this call took the pending token from an
+armed timer or a worklist entry, so the work function will never run.
+
+**The refcount rule, which is the whole risk.** `enqueue_delayed` returning `Ok`
+leaks one `Arc` strong reference, and the `run()` trampoline is the only thing
+that ever reclaims it. A successful cancel therefore orphans that reference and
+the canceller must drop exactly one, via `Arc::from_raw` on the pointer
+`Arc::as_ptr` yields. A `false` return means nothing was pending and **nothing
+may be dropped**. Both directions were tested by breaking them: omitting the
+reclaim leaks the op, which leaks its `ARef<File>` and makes `rmmod` fail
+because `PinnedDrop` never runs its `module_put`; reclaiming unconditionally is
+an immediate KASAN slab-use-after-free.
+
+In-flight deferred ops live in `Mutex<KVec<Arc<OpWork>>>` on `RingCtx`. That is
+a reference cycle, since `OpWork` holds an `Arc<RingCtx>`, and it is broken by
+removing the entry on every completion path. `run()` removes its entry **after**
+calling `complete()`, not before, which is what makes a cancel arriving during
+execution report `-EALREADY` rather than `-ENOENT`.
+
+**`-EALREADY` is reachable by construction but was never observed** in 9,000
+attempts across three race loops, including one against a `CHECKSUM` over a
+whole slot, the longest-running op there is. The window is the span between the
+worker clearing the pending bit and `run()` unregistering; a cancel either
+arrives while the op is still queued, or after it has fully completed. So the
+unregister-after-complete ordering is reasoned, not tested. Treat it as
+unverified until something exercises it.
+
+### `ENTER` could still sleep forever
+
+T11 found a liveness bug T5 thought it had closed. The wait loop returned early
+only when the ring was completely idle, `len == 0 && inflight == 0`. But a
+caller asking for more completions than are queued, with nothing in flight, is
+equally unsatisfiable — and slept until its watchdog fired. A cancel makes this
+easy to reach: it leaves one CQE queued and nothing running.
+
+The condition is now just `inflight == 0`. Completions come only from deferred
+ops, so once nothing is in flight the queued count can never grow and any
+unreached `min_complete` is unreachable for ever. The general lesson is that
+"nothing can arrive" is a statement about `inflight` alone; bringing `len` into
+it turns a short count into a hang.
+
 ### The done tests were only advisory
 
 The dmesg check at the end of every done-test script printed splats without
@@ -589,11 +642,13 @@ common logic across them.
   *blocking* `delete_module` could proceed as one returns. Default `rmmod` is
   non-blocking and fails fast on a non-zero count. The real fix is upstream:
   `MiscDeviceOptions` has no way to set `fops.owner`.
-- **Cancellation is best-effort.** `DELAY_NS` via `enqueue_delayed` is genuinely
-  cancellable. `OPEN`/`READ` already executing are not — no equivalent of
-  io_uring setting `TIF_NOTIFY_SIGNAL` on a blocked worker. `CANCEL` returns
-  `-EALREADY`. A per-op `cancel_requested: AtomicBool` checked at the top of
-  `run()` covers not-yet-started work.
+- **Cancellation is real up to the point of execution, and nothing beyond.** A
+  queued or timer-armed op is genuinely dequeued. An op a worker has already
+  picked up cannot be stopped — there is no equivalent of io_uring setting
+  `TIF_NOTIFY_SIGNAL` on a blocked worker — and `CANCEL` returns `-EALREADY`.
+  The `cancel_requested: AtomicBool` this note used to propose is gone:
+  `cancel_delayed_work` already handles every case the flag would have, and two
+  mechanisms for one job is worse than one.
 - **No `poll`, so no epoll/tokio integration.** A self-contained runtime does
   not need it — `park()` *is* `ENTER(min_complete=1)`, exactly as a
   pure-io_uring runtime works. If tokio integration is later required, the

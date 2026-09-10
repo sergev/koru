@@ -215,6 +215,14 @@ void sqe_read(struct koru_sqe *s, uint32_t handle, uint32_t slot, uint64_t off, 
     s->user_data = user_data;
 }
 
+void sqe_cancel(struct koru_sqe *s, uint64_t target, uint64_t user_data)
+{
+    memset(s, 0, sizeof(*s));
+    s->opcode    = KORU_OP_CANCEL;
+    s->off       = target;
+    s->user_data = user_data;
+}
+
 uint8_t pattern_byte(size_t i)
 {
     return (uint8_t)(i * 31 + (i >> 8) * 7 + 11);

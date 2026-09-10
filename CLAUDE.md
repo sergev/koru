@@ -5,15 +5,16 @@ code in this repository.
 
 ## State of the repository
 
-**T0–T10 are done.** Every opcode except `CANCEL` works: the module registers
+**T0–T11 are done, and every opcode is implemented.** The module registers
 `/dev/koru`, configures a ring with `SETUP`, and submits `NOP`, `DELAY_NS`,
-`CHECKSUM`, `OPEN`, `READ` and `CLOSE` through `ENTER`, which blocks for
-completions. The arena is mmap'd, with slot exclusivity enforced by the kernel.
-Open files live in a generational handle table. Teardown is safe and `rmmod` is
-refused while anything is live.
+`CHECKSUM`, `OPEN`, `READ`, `CLOSE` and `CANCEL` through `ENTER`, which blocks
+for completions. The arena is mmap'd, with slot exclusivity enforced by the
+kernel. Open files live in a generational handle table. A queued op can be
+genuinely dequeued. Teardown is safe and `rmmod` is refused while anything is
+live. T12, the hostile-userspace fuzz, is what validates all of it.
 
 - `doc/Notes.md` — the global picture: design, ABI invariants, research
-  findings, accepted gaps, and what T0–T10 established. It records *why* several
+  findings, accepted gaps, and what T0–T11 established. It records *why* several
   obvious-looking approaches are wrong. Read it before writing anything.
 - `doc/Plan.md` — the remaining tasks only, each with a "done" test. Completed
   tasks are deleted from it, not marked.
@@ -76,7 +77,7 @@ GCC ≥ 11 or Clang ≥ 14, `-std=c++20`, built with `-fsanitize=address,undefin
 
 ## Commands
 
-These work today (T0 through T10):
+These work today (T0 through T11):
 
 ```sh
 KDIR=../kernel-dev/linux-source-7.1
@@ -117,6 +118,8 @@ vng --run $KDIR --user root --memory 4G --cpus 4 \
     --exec "sh ../kernel-dev/t9-donetest.sh"      # OPEN/CLOSE, handles, creds
 vng --run $KDIR --user root --memory 4G --cpus 4 \
     --exec "sh ../kernel-dev/t10-donetest.sh"     # READ into a slot
+vng --run $KDIR --user root --memory 4G --cpus 4 \
+    --exec "sh ../kernel-dev/t11-donetest.sh"     # CANCEL
 
 # Interim userspace tests, built on the host and run in the guest.
 make -C test
@@ -134,6 +137,10 @@ that section in favour of including the real `user/cpp/include/koru_abi.h`.
 structured around that, and `DEBUG_ATOMIC_SLEEP` plus lockdep in the dev kernel
 is what catches a slip. The submitter `Mutex` is likewise dropped around the
 `CondVar` wait, or one waiter blocks every submitter.
+
+`ENTER` must not sleep when `min_complete` is unreachable, and unreachable means
+`inflight == 0` — not `len == 0 && inflight == 0`. A caller asking for more than
+is queued with nothing running slept for ever until T11 found it.
 
 Wait semantics: `min_complete` decides whether `ENTER` waits at all,
 `timeout_ns` only caps the wait and 0 means no cap. `ENTER` returns SQEs
@@ -175,6 +182,18 @@ blocking read in a kworker cannot be interrupted, so a FIFO or socket would
 consume a workqueue thread permanently. `check_readable` also rejects a file
 whose `f_op` has `read` set or `read_iter` unset, which is what keeps
 `kernel read not supported for file` out of the log.
+
+**`CANCEL`'s refcount rule is the sharpest edge in the module.**
+`enqueue_delayed` returning `Ok` leaks one `Arc` reference that only `run()`
+reclaims. So drop exactly one reference **if and only if**
+`cancel_delayed_work` returned `true`: skipping it leaks the op and wedges
+`rmmod`, and doing it on a `false` return is an immediate use-after-free. Both
+were demonstrated by breaking them.
+
+In-flight deferred ops live in `RingCtx::pending`, a `Mutex<KVec<Arc<OpWork>>>`.
+That is a reference cycle broken by unregistering on every completion path, and
+`run()` unregisters **after** `complete()` so a cancel during execution reports
+`-EALREADY` rather than `-ENOENT`.
 
 **A deferred op owns everything it needs**, resolved at submit time: the `Sqe`
 by value, an `Arc<RingCtx>`, and an `ARef<File>`. Never an index into a table

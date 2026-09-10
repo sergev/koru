@@ -145,6 +145,8 @@ void sqe_open(struct koru_sqe *s, uint32_t slot, uint64_t off, uint32_t len, uin
 void sqe_close(struct koru_sqe *s, uint32_t handle, uint64_t user_data);
 void sqe_read(struct koru_sqe *s, uint32_t handle, uint32_t slot, uint64_t off, uint32_t len,
               uint64_t user_data);
+/* `target` is the user_data of the op to cancel. */
+void sqe_cancel(struct koru_sqe *s, uint64_t target, uint64_t user_data);
 
 /* Write `n` bytes of a position-dependent pattern to `path`. Returns 0 on
  * success. The pattern is what a READ of that file must reproduce. */
