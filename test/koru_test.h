@@ -143,6 +143,13 @@ void sqe_checksum(struct koru_sqe *s, uint32_t slot, uint64_t off, uint32_t len,
 void sqe_open(struct koru_sqe *s, uint32_t slot, uint64_t off, uint32_t len, uint32_t flags,
               uint64_t user_data);
 void sqe_close(struct koru_sqe *s, uint32_t handle, uint64_t user_data);
+void sqe_read(struct koru_sqe *s, uint32_t handle, uint32_t slot, uint64_t off, uint32_t len,
+              uint64_t user_data);
+
+/* Write `n` bytes of a position-dependent pattern to `path`. Returns 0 on
+ * success. The pattern is what a READ of that file must reproduce. */
+int make_pattern_file(const char *path, size_t n);
+uint8_t pattern_byte(size_t i);
 
 /* Copy a path into a slot, without its NUL. Returns its length. */
 uint32_t put_path(uint8_t *arena, uint32_t slot_size, uint32_t slot, const char *path);

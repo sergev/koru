@@ -145,7 +145,9 @@ pub(crate) const KORU_OP_DELAY_NS: u8 = 1; // T5
 /// Open the path held in `len` bytes at `off` in slot `slot`. `handle` carries
 /// the open flags. On success `res` is the new handle, always positive.
 pub(crate) const KORU_OP_OPEN: u8 = 2; // T9
-#[expect(dead_code)]
+/// Read `len` bytes from file offset `off` of `handle` into slot `slot`, at
+/// slot offset 0. `res` is the count actually read: short at EOF, 0 at or past
+/// it. Regular files only.
 pub(crate) const KORU_OP_READ: u8 = 3; // T10
 /// Retire the handle in `handle`. `len`, `off` and `slot` must be zero.
 pub(crate) const KORU_OP_CLOSE: u8 = 4; // T9

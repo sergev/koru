@@ -40,6 +40,9 @@ pub(crate) struct OpWork {
     work: DelayedWork<OpWork>,
     ring: Arc<RingCtx>,
     sqe: Sqe,
+    /// Resolved at submit time, so a `CLOSE` racing this op cannot free it.
+    /// Dropped with the work item, whether it ran or not.
+    file: Option<ARef<File>>,
 }
 
 #[pinned_drop]
@@ -64,6 +67,12 @@ impl WorkItem for OpWork {
             KORU_OP_CHECKSUM => (
                 this.ring
                     .checksum(sqe)
+                    .unwrap_or_else(|e| i64::from(e.to_errno())),
+                Some(sqe.slot),
+            ),
+            KORU_OP_READ => (
+                this.ring
+                    .do_read(sqe, this.file.as_deref())
                     .unwrap_or_else(|e| i64::from(e.to_errno())),
                 Some(sqe.slot),
             ),
@@ -97,13 +106,14 @@ impl RingCtx {
                 if sqe.len != 0 || sqe.slot != 0 || sqe.handle != 0 {
                     return Some(einval);
                 }
-                RingCtx::defer(me, sqe, delay_jiffies(sqe.off))
+                RingCtx::defer(me, sqe, delay_jiffies(sqe.off), None)
             }
             // Inline, in the submitting task's context: a kworker would resolve
             // and permission-check as root. Both must return `Some`, and
             // neither may call `complete`, which belongs to the deferred path.
             KORU_OP_OPEN => Some(me.open_op(sqe)),
             KORU_OP_CLOSE => Some(me.close_op(sqe)),
+            KORU_OP_READ => RingCtx::read_op(me, sqe),
             KORU_OP_CHECKSUM => {
                 if sqe.handle != 0 {
                     return Some(einval);
@@ -118,13 +128,7 @@ impl RingCtx {
                 // Deferred, so the slot is genuinely held across a window. That
                 // window is what makes exclusivity observable, and it is the
                 // same shape READ takes in T10.
-                match RingCtx::defer(me, sqe, 0) {
-                    None => None,
-                    Some(res) => {
-                        me.state.lock().slot_release(sqe.slot);
-                        Some(res)
-                    }
-                }
+                RingCtx::defer_holding_slot(me, sqe, None)
             }
             // Unknown, or defined but not yet implemented.
             _ => Some(einval),
@@ -260,6 +264,13 @@ impl RingCtx {
         // SAFETY: `filp_open` returned a reference and we take ownership of it.
         let file = unsafe { ARef::from_raw(ptr) };
 
+        // Nothing else is useful yet, and a FIFO or a device would block a
+        // later READ in a kworker with no way out. Dropped on the way past.
+        let ty = file_type(&file);
+        if ty != bindings::S_IFREG && ty != bindings::S_IFDIR {
+            return Err(EINVAL);
+        }
+
         // Bound first: a guard in the scrutinee would live across the arms, so
         // the fput below would run with the table locked.
         let inserted = self.handles.lock().insert(file);
@@ -270,6 +281,98 @@ impl RingCtx {
                 Err(EMFILE)
             }
         }
+    }
+
+    /// `READ`: deferred, with the file resolved and the slot claimed here, in
+    /// ioctl context. `None` once the work item owns both.
+    fn read_op(me: ArcBorrow<'_, RingCtx>, sqe: &Sqe) -> Option<i64> {
+        let file = match RingCtx::read_validate(&me, sqe) {
+            Ok(file) => file,
+            Err(e) => return Some(i64::from(e.to_errno())),
+        };
+        if !me.state.lock().slot_try_acquire(sqe.slot) {
+            return Some(i64::from(EBUSY.to_errno()));
+        }
+        RingCtx::defer_holding_slot(me, sqe, Some(file))
+    }
+
+    /// Everything `READ` can reject before it costs a work item.
+    fn read_validate(&self, sqe: &Sqe) -> Result<ARef<File>> {
+        let Some(cfg) = *self.config.lock() else {
+            return Err(EINVAL);
+        };
+        if sqe.slot >= cfg.slot_count {
+            return Err(EINVAL);
+        }
+        // Reads land at slot offset 0, so `len` alone has to fit.
+        if sqe.len == 0 || sqe.len > cfg.slot_size {
+            return Err(EINVAL);
+        }
+        // `loff_t` is signed; a negative offset is not a position.
+        if sqe.off > i64::MAX as u64 {
+            return Err(EINVAL);
+        }
+
+        // Bound first: a guard in the scrutinee would live across the arms.
+        let file = self.handles.lock().resolve(sqe.handle)?;
+        check_readable(&file)?;
+        Ok(file)
+    }
+
+    /// Runs in a kworker. Bounces through one page-sized buffer: `Page` exposes
+    /// no lasting kernel address, and holding a `kmap_local_page` across a
+    /// blocking read would inhibit migration for the whole I/O.
+    fn do_read(&self, sqe: &Sqe, file: Option<&File>) -> Result<i64> {
+        let file = file.ok_or(EINVAL)?;
+        let Some(cfg) = *self.config.lock() else {
+            return Err(EINVAL);
+        };
+
+        // Slots are whole pages, so this is page-aligned and a chunk never
+        // straddles two pages.
+        let base = u64::from(sqe.slot)
+            .checked_mul(u64::from(cfg.slot_size))
+            .ok_or(EINVAL)?;
+        let mut pos = usize::try_from(base).map_err(|_| EINVAL)?;
+        let mut fpos = sqe.off as i64;
+        let len = sqe.len as usize;
+        let mut done = 0usize;
+
+        let mut bounce = KVec::with_capacity(PAGE_SIZE, GFP_KERNEL)?;
+        bounce.resize(PAGE_SIZE, 0u8, GFP_KERNEL)?;
+
+        while done < len {
+            let in_page = pos % PAGE_SIZE;
+            let want = core::cmp::min(len - done, PAGE_SIZE - in_page);
+
+            // The arena lock must NOT be held here. `mmap` takes it under
+            // `mmap_lock`, and a filesystem read takes `mmap_lock` under the
+            // inode rwsem that `kernel_read` acquires — so holding it across
+            // this call closes a genuine deadlock cycle. Lockdep found it.
+            let n = match read_at(file, &mut bounce[..want], &mut fpos) {
+                Ok(n) => n,
+                // A partial read is a result, not a failure. Same convention as
+                // the submit loop's short count.
+                Err(e) => return if done == 0 { Err(e) } else { Ok(done as i64) },
+            };
+            if n == 0 {
+                break; // EOF.
+            }
+
+            {
+                let arena = self.arena.lock();
+                let page = arena.pages.get(pos / PAGE_SIZE).ok_or(EINVAL)?;
+                // SAFETY: `bounce` is valid for `n` bytes and `in_page + n <=
+                // PAGE_SIZE`. The slot is claimed for the life of this op, so
+                // nothing else touches the page.
+                unsafe { page.write_raw(bounce.as_ptr(), in_page, n)? };
+            }
+
+            pos += n;
+            done += n;
+        }
+
+        Ok(done as i64)
     }
 
     /// `CLOSE`: retire `handle`. `len`, `off` and `slot` must be zero.
@@ -288,8 +391,28 @@ impl RingCtx {
         }
     }
 
+    /// Queue an op that holds its slot, unwinding the claim if it never queues.
+    fn defer_holding_slot(
+        me: ArcBorrow<'_, RingCtx>,
+        sqe: &Sqe,
+        file: Option<ARef<File>>,
+    ) -> Option<i64> {
+        match RingCtx::defer(me, sqe, 0, file) {
+            None => None,
+            Some(res) => {
+                me.state.lock().slot_release(sqe.slot);
+                Some(res)
+            }
+        }
+    }
+
     /// Queue an op on the workqueue. `None` once it owns the reservation.
-    fn defer(me: ArcBorrow<'_, RingCtx>, sqe: &Sqe, jiffies: Jiffies) -> Option<i64> {
+    fn defer(
+        me: ArcBorrow<'_, RingCtx>,
+        sqe: &Sqe,
+        jiffies: Jiffies,
+        file: Option<ARef<File>>,
+    ) -> Option<i64> {
         // Paired with `PinnedDrop for OpWork`. Taken before the allocation so
         // the drop impl always has a reference to release.
         module_get_live();
@@ -299,6 +422,7 @@ impl RingCtx {
                 work <- new_delayed_work!("OpWork::work"),
                 ring: Arc::from(me),
                 sqe: *sqe,
+                file: file,
             }),
             GFP_KERNEL,
         ) {
@@ -318,6 +442,62 @@ impl RingCtx {
         }
         None
     }
+}
+
+// Not in the bindings: bindgen cannot evaluate their `__force` casts. From
+// include/linux/fs.h.
+const FMODE_READ: u32 = 1 << 0;
+const FMODE_CAN_READ: u32 = 1 << 17;
+
+/// `i_mode & S_IFMT` for an open file.
+fn file_type(file: &File) -> u32 {
+    // SAFETY: an `ARef<File>` holds a reference, so the file and the inode it
+    // pins are both live. `f_inode` is set at open and never changes.
+    let i_mode = unsafe { (*(*file.as_ptr()).f_inode).i_mode };
+    u32::from(i_mode) & bindings::S_IFMT
+}
+
+/// Reject a file `kernel_read` cannot read, before it warns about it.
+///
+/// `__kernel_read` answers all three of these with `-EINVAL` *and* a
+/// `WARN_ON_ONCE` splat, so checking here is what keeps the log clean.
+fn check_readable(file: &File) -> Result<()> {
+    // SAFETY: as above. `f_mode` is immutable after open, so an unsynchronised
+    // read is correct.
+    let (f_mode, f_op) = unsafe { ((*file.as_ptr()).f_mode, (*file.as_ptr()).f_op) };
+
+    if f_mode & (FMODE_READ | FMODE_CAN_READ) != FMODE_READ | FMODE_CAN_READ {
+        return Err(EBADF);
+    }
+    // Blocking reads live in a kworker with no way to interrupt them, so a FIFO
+    // or a socket would wedge a worker for good. See doc/Notes.md.
+    if file_type(file) != bindings::S_IFREG {
+        return Err(EINVAL);
+    }
+    // SAFETY: a live file always has a valid `f_op`.
+    let (read, read_iter) = unsafe { ((*f_op).read, (*f_op).read_iter) };
+    if read.is_some() || read_iter.is_none() {
+        return Err(EINVAL);
+    }
+    Ok(())
+}
+
+/// One `kernel_read`, advancing `fpos`. `Ok(0)` is EOF.
+fn read_at(file: &File, buf: &mut [u8], fpos: &mut i64) -> Result<usize> {
+    // SAFETY: `file` is live, `buf` is valid for writing its own length, and
+    // `fpos` points at a live `loff_t`.
+    let ret = unsafe {
+        bindings::kernel_read(
+            file.as_ptr(),
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+            core::ptr::from_mut(fpos),
+        )
+    };
+    if ret < 0 {
+        return Err(Error::from_errno(ret as core::ffi::c_int));
+    }
+    Ok(ret as usize)
 }
 
 /// Translate koru's open flags to the host's. Rejects unknown bits and the

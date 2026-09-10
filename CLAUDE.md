@@ -5,14 +5,15 @@ code in this repository.
 
 ## State of the repository
 
-**T0–T9 are done.** The module registers `/dev/koru`, configures a ring with
-`SETUP`, and submits `NOP`, `DELAY_NS`, `CHECKSUM`, `OPEN` and `CLOSE` through
-`ENTER`, which blocks for completions. The arena is mmap'd, with slot
-exclusivity enforced by the kernel. Open files live in a generational handle
-table. Teardown is safe and `rmmod` is refused while anything is live.
+**T0–T10 are done.** Every opcode except `CANCEL` works: the module registers
+`/dev/koru`, configures a ring with `SETUP`, and submits `NOP`, `DELAY_NS`,
+`CHECKSUM`, `OPEN`, `READ` and `CLOSE` through `ENTER`, which blocks for
+completions. The arena is mmap'd, with slot exclusivity enforced by the kernel.
+Open files live in a generational handle table. Teardown is safe and `rmmod` is
+refused while anything is live.
 
 - `doc/Notes.md` — the global picture: design, ABI invariants, research
-  findings, accepted gaps, and what T0–T8 established. It records *why* several
+  findings, accepted gaps, and what T0–T10 established. It records *why* several
   obvious-looking approaches are wrong. Read it before writing anything.
 - `doc/Plan.md` — the remaining tasks only, each with a "done" test. Completed
   tasks are deleted from it, not marked.
@@ -75,7 +76,7 @@ GCC ≥ 11 or Clang ≥ 14, `-std=c++20`, built with `-fsanitize=address,undefin
 
 ## Commands
 
-These work today (T0 through T9):
+These work today (T0 through T10):
 
 ```sh
 KDIR=../kernel-dev/linux-source-7.1
@@ -114,6 +115,8 @@ vng --run $KDIR --user root --memory 4G --cpus 4 \
     --exec "sh ../kernel-dev/t8-donetest.sh"      # slot exclusivity
 vng --run $KDIR --user root --memory 4G --cpus 4 \
     --exec "sh ../kernel-dev/t9-donetest.sh"      # OPEN/CLOSE, handles, creds
+vng --run $KDIR --user root --memory 4G --cpus 4 \
+    --exec "sh ../kernel-dev/t10-donetest.sh"     # READ into a slot
 
 # Interim userspace tests, built on the host and run in the guest.
 make -C test
@@ -161,6 +164,22 @@ workqueue**, not run inline: an inline op holds its slot only inside the submit
 loop, so a collision could never happen and the rule would be untestable. `READ`
 takes the same shape at T10.
 
+**READ locking.** The arena `Mutex` is taken inside `mmap`, which the VFS calls
+under `mmap_lock`, and a filesystem read takes `mmap_lock` under the inode
+rwsem. So **nothing may hold the arena mutex across a call that can reach the
+VFS** — `do_read` holds it only around each `write_raw`. Holding it across
+`kernel_read` is a real deadlock and lockdep catches it.
+
+`READ` and `OPEN` accept regular files only (`OPEN` also takes directories). A
+blocking read in a kworker cannot be interrupted, so a FIFO or socket would
+consume a workqueue thread permanently. `check_readable` also rejects a file
+whose `f_op` has `read` set or `read_iter` unset, which is what keeps
+`kernel read not supported for file` out of the log.
+
+**A deferred op owns everything it needs**, resolved at submit time: the `Sqe`
+by value, an `Arc<RingCtx>`, and an `ARef<File>`. Never an index into a table
+that can be reindexed, and never a pointer into the arena.
+
 **Handles.** A handle is `(index: u16, generation: u16)`, index low, generation
 starting at 1 and skipping 0 on wrap — so a valid handle is never 0 and every
 other opcode can keep demanding a zero `handle` field. `CLOSE` bumps the
@@ -189,6 +208,12 @@ new path that outlives an `ENTER` needs the same treatment, and a missing
 A test that can hang must arm an alarm and be line-buffered. `_exit` from the
 handler drops a full stdout buffer, which turns a diagnosable hang into a silent
 one.
+
+**A done test must fail on a kernel splat, not just print it.** Every script
+captures its dmesg grep into `$splat` and gates the pass line on it being empty.
+T10's lockdep deadlock first reported `PASS` with the cycle printed right above
+the pass line, because the check was advisory. The pattern list also matches
+`not supported for file`, a `pr_warn_ratelimited` rather than a `WARN_ON`.
 
 Assert the exact errno, never just that a call failed. The T3 dispatcher
 returned `EPROTO` where it owed `ENOTTY`, and only an exact-errno assertion

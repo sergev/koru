@@ -237,12 +237,31 @@ impl HandleTable {
         Err(file)
     }
 
-    /// Retire a handle, returning the file for the caller to drop unlocked.
-    pub(crate) fn close(&mut self, handle: u32) -> Result<ARef<File>> {
+    /// Take an owning reference to a handle's file.
+    ///
+    /// Deferred ops resolve here at submit time, so a `CLOSE` racing the op
+    /// cannot free the file out from under it.
+    pub(crate) fn resolve(&self, handle: u32) -> Result<ARef<File>> {
+        let (index, generation) = Self::split(handle)?;
+        let e = self.entries.get(index as usize).ok_or(EBADF)?;
+        if e.generation != generation {
+            return Err(EBADF);
+        }
+        e.file.clone().ok_or(EBADF)
+    }
+
+    /// Split a handle into `(index, generation)`. Generation 0 is never valid.
+    fn split(handle: u32) -> Result<(u32, u16)> {
         let (index, generation) = (handle & 0xffff, (handle >> 16) as u16);
         if generation == 0 {
             return Err(EBADF);
         }
+        Ok((index, generation))
+    }
+
+    /// Retire a handle, returning the file for the caller to drop unlocked.
+    pub(crate) fn close(&mut self, handle: u32) -> Result<ARef<File>> {
+        let (index, generation) = Self::split(handle)?;
         let e = self.entries.get_mut(index as usize).ok_or(EBADF)?;
         if e.generation != generation {
             return Err(EBADF);

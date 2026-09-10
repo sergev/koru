@@ -1,8 +1,8 @@
 # koru — design notes
 
 The global picture: why this API is shaped the way it is, what the ABI
-guarantees, and what building T0–T9 actually taught us. [Plan.md](Plan.md) holds
-the remaining tasks and nothing else.
+guarantees, and what building T0–T10 actually taught us. [Plan.md](Plan.md)
+holds the remaining tasks and nothing else.
 
 ## Context
 
@@ -157,7 +157,7 @@ line.
 
 Opcodes: `NOP`, `DELAY_NS`, `OPEN`, `READ`, `CLOSE`, `CANCEL`, plus `CHECKSUM`,
 which began as scaffolding for the arena and stayed as the deferred-op test
-vehicle. Everything except `READ` and `CANCEL` is implemented.
+vehicle. Everything except `CANCEL` is implemented.
 
 The ioctl type byte is `'k'` and the magic word is `0x7572_6f6b`, spelling
 "koru" little-endian. That type byte is listed as conflicting in the kernel's
@@ -247,7 +247,7 @@ last one out frees `RingCtx`. `release()` drains the handle table under the
 There is no `dying` flag. Nothing has needed one: `ENTER` cannot be in flight
 once `release` runs, and no deferred op touches the handle table.
 
-## What T0–T9 established
+## What T0–T10 established
 
 The tasks themselves are gone from [Plan.md](Plan.md); what they proved is here.
 
@@ -400,6 +400,78 @@ away from uid 0 — before submitting on the fd the parent already opened.
 `VM_DONTCOPY`, so the child cannot inherit the mapping and has to `mmap` the
 ring itself after the fork.
 
+### Reads
+
+`READ` names the file by handle, the destination by slot, and the source by an
+explicit file offset in `off`. The offset lives in the SQE rather than in
+`f_pos`, because two concurrent reads on one handle would otherwise race on a
+shared position; `kernel_read` with a caller-owned `loff_t` never touches
+`f_pos`. There is no destination offset within the slot — the SQE has no field
+for one — so a read always lands at slot offset 0.
+
+`res` is the count actually transferred. A short read at EOF is a result, not an
+error, and a read at or past EOF is 0. The rest of the slot keeps whatever was
+there before; that is the caller's own data, never the kernel's, so there is
+nothing to scrub and `res` is what says which bytes are valid.
+
+**A `Page` cannot be read into directly.** `Page`'s mapping helpers are private
+and closure-scoped, and `page_address` has no binding, so there is no lasting
+kernel address to hand `kernel_read`. Doing the `kmap_local_page` by hand would
+work but would inhibit migration for the whole blocking read, and the highmem
+documentation is explicit that these are short-term mappings. So the read
+bounces through one page-sized buffer per op. Slots are whole pages, so a chunk
+never straddles a page and the destination offset is just `pos % PAGE_SIZE`.
+
+`vfs_read` is the wrong call and would not even link: its buffer is `__user`, it
+runs `access_ok`, and it is not exported. The old `set_fs(KERNEL_DS)` escape was
+removed tree-wide by 5.18. `kernel_read` exists precisely to replace it.
+
+**The lockdep deadlock.** The first version held the arena `Mutex` across
+`kernel_read`, and lockdep rejected it with a three-link cycle: `mmap` takes the
+arena mutex under `mmap_lock`, a filesystem read takes `mmap_lock` under the
+inode rwsem (to pin the user pages of a direct read), and `kernel_read` takes
+that rwsem. So `arena → i_rwsem → mmap_lock → arena`. The fix is to hold the
+arena lock only around each `write_raw`, never across the read. This generalises
+the rule the ring spinlock already had: **the arena mutex is taken under
+`mmap_lock`, so nothing may hold it across a call that can reach the VFS.**
+
+**Two readability guards, and each earns its place.** `check_readable` rejects a
+non-`S_IFREG` file and separately rejects a file whose `f_op` has `read` set or
+`read_iter` unset. Deleting either one alone fails no test, because both catch
+the directory case; deleting both lets the read reach `__kernel_read`, which
+answers `-EINVAL` and logs `kernel read not supported for file`. They are kept
+apart because they protect different things: only the `S_IFREG` check gives the
+blocking-file-type property, since a FIFO uses `read_iter` and would sail
+through the other one.
+
+**Reads are restricted to regular files**, and `OPEN` to regular files and
+directories. A blocking read inside a kworker cannot be interrupted — `CANCEL`
+is best-effort and cannot touch work that has already started — so a read on a
+FIFO, socket or tty would consume a system workqueue thread for good. This is a
+deliberate limit; lifting it needs a non-blocking path that does not exist.
+
+**A deferred op resolves every resource it needs at submit time** and then owns
+it outright: `OpWork` carries the `Sqe` by value, an `Arc<RingCtx>`, and an
+`ARef<File>`. It holds no index into anything that could be reindexed and no
+pointer into the arena. That is what makes a `CLOSE` racing an in-flight `READ`
+uninteresting rather than fatal, and the perturbation proves it — capturing the
+file's address at submit time without taking the reference gives an immediate
+KASAN slab-use-after-free.
+
+### The done tests were only advisory
+
+The dmesg check at the end of every done-test script printed splats without
+failing the run. T10's lockdep deadlock therefore reported `PASS` on its first
+green run, with the cycle sitting in the output above the pass line. Every
+script now captures that grep into a variable and gates the pass on it being
+empty, and the pattern list includes `kernel read not supported for file`,
+which is a `pr_warn_ratelimited` rather than a `WARN_ON` and so matched nothing
+before.
+
+The lesson generalises past this bug: an assertion suite that passes proves the
+code does what the test expects, and says nothing about what the kernel thinks
+of it. On a debug kernel the kernel's own opinion has to be a hard gate.
+
 ### How a done test earns trust
 
 Assert the exact errno, never just that a call failed. The T3 dispatcher
@@ -539,7 +611,9 @@ common logic across them.
   `submit_lock` for the rest of its batch and every other submitter waits behind
   a slow path lookup. That is the direct price of resolving in the submitting
   task's context, and there is no version of this that both runs inline and does
-  not block.
+  not block. The file-type restriction does not close this: `filp_open` on a
+  FIFO blocks *before* we ever see the file, so the check cannot run. Closing it
+  properly means passing `O_NONBLOCK`, which changes what a later `READ` does.
 - **Handles are per-ring**, so two rings in one process cannot share an open
   file. Nothing needs it yet.
 

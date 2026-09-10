@@ -203,6 +203,49 @@ void sqe_close(struct koru_sqe *s, uint32_t handle, uint64_t user_data)
     s->user_data = user_data;
 }
 
+void sqe_read(struct koru_sqe *s, uint32_t handle, uint32_t slot, uint64_t off, uint32_t len,
+              uint64_t user_data)
+{
+    memset(s, 0, sizeof(*s));
+    s->opcode    = KORU_OP_READ;
+    s->handle    = handle;
+    s->slot      = slot;
+    s->off       = off;
+    s->len       = len;
+    s->user_data = user_data;
+}
+
+uint8_t pattern_byte(size_t i)
+{
+    return (uint8_t)(i * 31 + (i >> 8) * 7 + 11);
+}
+
+int make_pattern_file(const char *path, size_t n)
+{
+    uint8_t buf[1024];
+    size_t done = 0;
+    int fd      = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+
+    if (fd < 0) {
+        perror(path);
+        return -1;
+    }
+    while (done < n) {
+        size_t i, chunk = n - done < sizeof(buf) ? n - done : sizeof(buf);
+
+        for (i = 0; i < chunk; i++)
+            buf[i] = pattern_byte(done + i);
+        if (write(fd, buf, chunk) != (ssize_t)chunk) {
+            perror("write");
+            close(fd);
+            return -1;
+        }
+        done += chunk;
+    }
+    close(fd);
+    return 0;
+}
+
 uint32_t put_path(uint8_t *arena, uint32_t slot_size, uint32_t slot, const char *path)
 {
     size_t n = strlen(path);
