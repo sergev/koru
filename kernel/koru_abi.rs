@@ -68,6 +68,11 @@ pub(crate) const KORU_MAX_CQ_ENTRIES: u32 = 8192;
 pub(crate) const KORU_MAX_SLOT_SIZE: u32 = 1 << 20;
 pub(crate) const KORU_MAX_SLOT_COUNT: u32 = 4096;
 pub(crate) const KORU_MAX_ARENA_BYTES: u64 = 64 << 20;
+/// Bounded by the handle encoding: the index is 16 bits.
+pub(crate) const KORU_MAX_HANDLES: u32 = 4096;
+
+/// What `handle_count == 0` means at `SETUP`.
+pub(crate) const KORU_DEFAULT_HANDLES: u32 = 64;
 
 /// Ring configuration, for `SETUP` and `GET_PARAMS`. Field order gives natural
 /// alignment with no padding: eight `u32`, then the `u64`s at offset 32.
@@ -103,14 +108,23 @@ pub(crate) struct KoruParams {
     pub(crate) max_slot_count: u32,
     /// out: cap on `arena_size`.
     pub(crate) max_arena_bytes: u64,
+    /// in/out: handle table size; 0 means [`KORU_DEFAULT_HANDLES`]. Carved out
+    /// of the old `reserved[3]` with `max_handles`.
+    pub(crate) handle_count: u32,
+    /// out: cap on `handle_count`.
+    pub(crate) max_handles: u32,
     /// in: must be zero.
-    pub(crate) reserved: [u64; 4],
+    pub(crate) reserved: [u64; 3],
 }
 
 // 104 = eight u32 at 0..32, then u64-aligned fields; a multiple of 8, so no
 // trailing padding.
 kernel::static_assert!(core::mem::size_of::<KoruParams>() == 104);
 kernel::static_assert!(core::mem::align_of::<KoruParams>() == 8);
+// The two fields carved out of the old `reserved[3]`, and where that leaves it.
+kernel::static_assert!(core::mem::offset_of!(KoruParams, handle_count) == 72);
+kernel::static_assert!(core::mem::offset_of!(KoruParams, max_handles) == 76);
+kernel::static_assert!(core::mem::offset_of!(KoruParams, reserved) == 80);
 
 // SAFETY: `repr(C)`, unsigned integers only, so every bit pattern is valid. No
 // interior mutability.
@@ -128,11 +142,12 @@ unsafe impl AsBytes for KoruParams {}
 pub(crate) const KORU_OP_NOP: u8 = 0; // T4
 /// Delay for `off` nanoseconds. `len`, `slot` and `handle` must be zero.
 pub(crate) const KORU_OP_DELAY_NS: u8 = 1; // T5
-#[expect(dead_code)]
+/// Open the path held in `len` bytes at `off` in slot `slot`. `handle` carries
+/// the open flags. On success `res` is the new handle, always positive.
 pub(crate) const KORU_OP_OPEN: u8 = 2; // T9
 #[expect(dead_code)]
 pub(crate) const KORU_OP_READ: u8 = 3; // T10
-#[expect(dead_code)]
+/// Retire the handle in `handle`. `len`, `off` and `slot` must be zero.
 pub(crate) const KORU_OP_CLOSE: u8 = 4; // T9
 #[expect(dead_code)]
 pub(crate) const KORU_OP_CANCEL: u8 = 5; // T11
@@ -142,6 +157,27 @@ pub(crate) const KORU_OP_CHECKSUM: u8 = 6; // T7
 
 /// Any bit set is rejected.
 pub(crate) const KORU_SQE_FLAGS_ALL: u8 = 0;
+
+// Open flags, carried in an `OPEN` SQE's `handle` field. koru's own bit values,
+// not the host `O_*` constants, which vary by architecture. The kernel
+// translates.
+
+/// Access mode: the low two bits. Mode 3 is invalid.
+pub(crate) const KORU_O_ACCMODE: u32 = 0x3;
+#[expect(dead_code)]
+pub(crate) const KORU_O_RDONLY: u32 = 0;
+pub(crate) const KORU_O_WRONLY: u32 = 1;
+pub(crate) const KORU_O_RDWR: u32 = 2;
+
+/// Fail with `ELOOP` rather than following a final symlink.
+pub(crate) const KORU_O_NOFOLLOW: u32 = 1 << 2;
+/// Fail with `ENOTDIR` unless the path names a directory.
+pub(crate) const KORU_O_DIRECTORY: u32 = 1 << 3;
+
+/// Any bit outside this completes with `EINVAL`. No `O_CREAT`: there is no
+/// field for a creation mode.
+pub(crate) const KORU_OPEN_FLAGS_ALL: u32 =
+    KORU_O_ACCMODE | KORU_O_NOFOLLOW | KORU_O_DIRECTORY;
 
 /// Multishot bit, reserved and never set: admission control forecloses multishot.
 #[expect(dead_code)]
@@ -167,6 +203,9 @@ pub(crate) struct Sqe {
     /// Arena slot index. Buffers are named by index, never by address.
     pub(crate) slot: u32,
     /// Handle from `OPEN`: index in the low half, generation in the high half.
+    /// A generation is never 0, so a valid handle is never 0.
+    ///
+    /// On an `OPEN` SQE this carries the `KORU_O_*` flags instead.
     pub(crate) handle: u32,
 }
 

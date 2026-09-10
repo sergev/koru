@@ -1,7 +1,7 @@
 # koru — design notes
 
 The global picture: why this API is shaped the way it is, what the ABI
-guarantees, and what building T0–T8 actually taught us. [Plan.md](Plan.md) holds
+guarantees, and what building T0–T9 actually taught us. [Plan.md](Plan.md) holds
 the remaining tasks and nothing else.
 
 ## Context
@@ -157,7 +157,7 @@ line.
 
 Opcodes: `NOP`, `DELAY_NS`, `OPEN`, `READ`, `CLOSE`, `CANCEL`, plus `CHECKSUM`,
 which began as scaffolding for the arena and stayed as the deferred-op test
-vehicle. `NOP`, `DELAY_NS` and `CHECKSUM` are implemented.
+vehicle. Everything except `READ` and `CANCEL` is implemented.
 
 The ioctl type byte is `'k'` and the magic word is `0x7572_6f6b`, spelling
 "koru" little-endian. That type byte is listed as conflicting in the kernel's
@@ -228,11 +228,10 @@ constraint; `CQE_F_MORE` reserves the bit for a future that solves it properly.
 
 ```
 Arc<RingCtx>                        (= MiscDevice::Ptr)
- ├─ arena:   KVec<Page>
- ├─ f_cred:  ARef<Credential>        captured at open()
- ├─ state:   SpinLock<RingState>     { cached_sq_head, cqes, slot_busy,
- │                                     inflight, dying }
- ├─ handles: Mutex<KVec<Option<..>>> Mutex not SpinLock — fput() sleeps
+ ├─ config:  Mutex<Option<RingConfig>>
+ ├─ arena:   Mutex<Arena>            KVec<Page> plus the one-shot mmap flag
+ ├─ state:   SpinLock<RingState>     { cqes, slot_busy, reserved, inflight }
+ ├─ handles: Mutex<HandleTable>      Mutex not SpinLock — fput() sleeps
  └─ cq_wait: CondVar
 
 KBox<OpWork>  ├─ work: Work<OpWork>  ├─ ring: Arc<RingCtx>
@@ -240,13 +239,15 @@ KBox<OpWork>  ├─ work: Work<OpWork>  ├─ ring: Arc<RingCtx>
 ```
 
 `release()` takes the `Arc` by value; in-flight `OpWork`s hold their own, so the
-last one out frees `RingCtx`. `release()` sets `dying`, notifies the CondVar,
-and drains the handle table under the `Mutex`. It must **not** call
-`zap_vma_range` (no `->fault` handler through `miscdevice`, so zapped PTEs mean
-SIGBUS) and must **not** touch user memory (`release` can run from `____fput` on
-a kworker).
+last one out frees `RingCtx`. `release()` drains the handle table under the
+`Mutex` and drops the files outside it. It must **not** call `zap_vma_range` (no
+`->fault` handler through `miscdevice`, so zapped PTEs mean SIGBUS) and must
+**not** touch user memory (`release` can run from `____fput` on a kworker).
 
-## What T0–T8 established
+There is no `dying` flag. Nothing has needed one: `ENTER` cannot be in flight
+once `release` runs, and no deferred op touches the handle table.
+
+## What T0–T9 established
 
 The tasks themselves are gone from [Plan.md](Plan.md); what they proved is here.
 
@@ -340,6 +341,64 @@ must not release the slot the winner holds.
 slot only inside the submit loop, so a collision could never happen and the
 exclusivity rule would be untestable. That also pre-exercises the shape `READ`
 needs.
+
+### Handles
+
+A handle is `(index: u16, generation: u16)`, index low. Generations start at 1
+and skip 0 on wrap, so a valid handle is never 0 — which is what lets every
+other opcode keep demanding that the `handle` field be zero when it does not
+read it. `CLOSE` bumps the generation, so a stale handle and a double close both
+land on `-EBADF`.
+
+The generation is what actually protects reuse, and the perturbation test showed
+which check does which job. Deleting the generation comparison left the
+stale-handle *rejection* passing, because the entry's file was already `None` at
+that point; what broke was the reuse case, where a retired handle closed the
+file that had taken its index. The `None` check catches the easy half. Only the
+generation catches the half that matters.
+
+The table is fixed-size and allocated at `SETUP`, from a new `handle_count`
+parameter. That parameter and its `max_handles` cap were carved out of
+`KoruParams::reserved`, which shrank from `[u64; 4]` to `[u64; 3]` with the
+struct staying 104 bytes. This is the first real exercise of the
+reserved-must-be-zero rule, and it worked exactly as intended: an old caller
+zeroes the word, and zero is the encoding for "give me the default". No version
+bump, no size change, no change to any existing test.
+
+`OPEN` carries its flags in the SQE's `handle` field, which it has no other use
+for. They are koru's own bit values, not the host `O_*` constants, which differ
+between architectures; the kernel whitelists and translates. There is no
+`O_CREAT`, because no field can carry a creation mode.
+
+`OPEN` claims the slot it reads its path from, then releases it the moment the
+copy is done — before `filp_open`, which can block on disk. So the claim window
+is short, but it is not decorative: without it a concurrent `CHECKSUM` or `READ`
+can write the page mid-copy, which is precisely what `read_raw`'s
+no-concurrent-access precondition forbids. Deleting the claim makes the test's
+`-EBUSY` case fail.
+
+`release()` drains the table explicitly rather than letting the `Arc` drop do
+it. That is not belt-and-braces: an in-flight `OpWork` holds its own
+`Arc<RingCtx>`, so with a two-second `DELAY_NS` queued, dropping the `Arc` frees
+nothing and the open files survive for those two seconds. The done test queues
+exactly that delay and watches the count fall at `close`, not later.
+
+**kmemleak cannot see a leaked handle**, and this was confirmed by deliberately
+leaking one: `mem::forget` on the `ARef` in `CLOSE`, run 2,000 times, produced a
+completely clean kmemleak scan. The leaked `struct file` is still *referenced*,
+by our own table, so it is not a leak in kmemleak's sense at all. The instrument
+that does see it is field 1 of `/proc/sys/fs/file-nr`, the count of allocated
+`struct file`. `/proc/<pid>/fd` sees nothing either way, because `filp_open`
+installs no descriptor.
+
+Testing the creds rule needs the privilege drop to happen *between* opening the
+device and submitting, since the device node is `0600 root:root` and an
+unprivileged process cannot open it at all. The test forks, and the child calls
+`setresuid` to `nobody` — which clears the capability sets on the transition
+away from uid 0 — before submitting on the fd the parent already opened.
+`/etc/shadow` gives `-EACCES` and `/etc/hostname` still succeeds. The arena is
+`VM_DONTCOPY`, so the child cannot inherit the mapping and has to `mmap` the
+ring itself after the fork.
 
 ### How a done test earns trust
 
@@ -472,6 +531,17 @@ common logic across them.
   takes jiffies). Documented, not hidden. Clock is MONOTONIC, timeout relative.
 - **Arena memory is unaccounted.** Unreclaimable, unswappable, not charged to
   any memcg, not counted against `RLIMIT_MEMLOCK`. Capped in `SETUP`.
+- **`CLOSE` does `fput`, not `filp_close`,** so `->flush` never runs. It has to
+  be `fput`: `ARef<File>` is what will let a T10 `READ` outlive a `CLOSE`, and
+  you cannot `filp_close` a file another reference still holds. Invisible for
+  regular files, which have no `->flush`; visible on NFS and FUSE.
+- **A blocking `OPEN` stalls the whole ring.** It runs inline, so it holds
+  `submit_lock` for the rest of its batch and every other submitter waits behind
+  a slow path lookup. That is the direct price of resolving in the submitting
+  task's context, and there is no version of this that both runs inline and does
+  not block.
+- **Handles are per-ring**, so two rings in one process cannot share an open
+  file. Nothing needs it yet.
 
 ## Files
 
@@ -484,9 +554,10 @@ arrive with their tasks.
 - `kernel/koru.rs` — `MiscDevice` impl, the `Arc<RingCtx>` graph, admission
   control. *exists*
 - `kernel/koru_ops.rs` — opcode dispatch, SQE validation, `OpWork`, and the raw
-  `bindings::` calls for `filp_open`/`kernel_read`.
+  `bindings::` calls for `filp_open`/`kernel_read`. *exists*
 - `kernel/koru_arena.rs` — `KVec<Page>`, the `mmap` validation matrix, the
-  `vm_insert_page` loop, slot busy tracking.
+  `vm_insert_page` loop, slot busy tracking. The arena code is still in
+  `koru.rs`; split it out when it grows enough to be worth the churn.
 - `user/koru/src/lib.rs` — op slab, `OpState` owning `BufSlot`, `Future` impls,
   executor.
 - `user/cpp/include/koru_abi.h` — the C mirror of `koru_abi.rs`, kept

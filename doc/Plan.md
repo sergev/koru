@@ -1,14 +1,15 @@
 # koru — remaining tasks
 
 This file lists only work that is still to do. The design, the ABI invariants,
-the accepted gaps and everything T0–T8 established are in
+the accepted gaps and everything T0–T9 established are in
 [Notes.md](Notes.md); read that first.
 
-T0–T8 are done and have been removed from this list. As of now the module
+T0–T9 are done and have been removed from this list. As of now the module
 registers `/dev/koru`, configures a ring with `SETUP`, and submits `NOP`,
-`DELAY_NS` and `CHECKSUM` through `ENTER`, which blocks for completions. The
-arena is mmap'd, slot exclusivity is enforced by the kernel, teardown is safe
-and `rmmod` is refused while anything is live.
+`DELAY_NS`, `CHECKSUM`, `OPEN` and `CLOSE` through `ENTER`, which blocks for
+completions. The arena is mmap'd, slot exclusivity is enforced by the kernel,
+open files are held in a generational handle table, teardown is safe and
+`rmmod` is refused while anything is live.
 
 Each task below carries a done test. A task is finished when its done test has
 been run and has passed, and when the test has been shown to fail if the thing
@@ -18,18 +19,6 @@ it checks is broken. Mark it done here, move whatever it taught into
 **[M]** mechanical · **[R]** risky/exploratory
 
 ## Phase 3 — real operations
-
-### T9 [R] — `OPEN` and `CLOSE`
-
-Both run inline in `ENTER`, so the creds are the submitting task's. Generational
-handle table under a `Mutex`. The path is copied out, NUL-scanned and turned
-into a `CString`. `CLOSE` bumps the generation and drops the `ARef<File>`
-outside the spinlock.
-
-Done test: open `/etc/hostname`, get a handle, close it, with no fd leak in
-`/proc/<pid>/fd`. A double close and a stale generation both give `-EBADF`. An
-embedded NUL gives `-EINVAL`. As an unprivileged user, opening `/etc/shadow`
-must fail `-EACCES` — write that creds regression test before writing the code.
 
 ### T10 [M] — `READ` into a slot
 

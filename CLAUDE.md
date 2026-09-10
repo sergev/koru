@@ -5,10 +5,11 @@ code in this repository.
 
 ## State of the repository
 
-**T0–T8 are done.** The module registers `/dev/koru`, configures a ring with
-`SETUP`, and submits `NOP`, `DELAY_NS` and `CHECKSUM` through `ENTER`, which
-blocks for completions. The arena is mmap'd, with slot exclusivity enforced by
-the kernel. Teardown is safe and `rmmod` is refused while anything is live.
+**T0–T9 are done.** The module registers `/dev/koru`, configures a ring with
+`SETUP`, and submits `NOP`, `DELAY_NS`, `CHECKSUM`, `OPEN` and `CLOSE` through
+`ENTER`, which blocks for completions. The arena is mmap'd, with slot
+exclusivity enforced by the kernel. Open files live in a generational handle
+table. Teardown is safe and `rmmod` is refused while anything is live.
 
 - `doc/Notes.md` — the global picture: design, ABI invariants, research
   findings, accepted gaps, and what T0–T8 established. It records *why* several
@@ -17,7 +18,8 @@ the kernel. Teardown is safe and `rmmod` is refused while anything is live.
   tasks are deleted from it, not marked.
 - `README.md` — the short explanation of the idea.
 - `kernel/` — the out-of-tree Rust module. `koru_abi.rs` is the canonical wire
-  format.
+  format; `koru.rs` holds the device, the ring state and the `ENTER` path, and
+  `koru_ops.rs` holds opcode dispatch, the op implementations and `OpWork`.
 - `test/` — interim C tests, one per task. See Commands.
 
 Work proceeds in plan order. Task numbers are referenced across all three
@@ -73,7 +75,7 @@ GCC ≥ 11 or Clang ≥ 14, `-std=c++20`, built with `-fsanitize=address,undefin
 
 ## Commands
 
-These work today (T0 through T8):
+These work today (T0 through T9):
 
 ```sh
 KDIR=../kernel-dev/linux-source-7.1
@@ -110,6 +112,8 @@ vng --run $KDIR --user root --memory 4G --cpus 4 \
     --exec "sh ../kernel-dev/t7-donetest.sh"      # arena mmap, CHECKSUM
 vng --run $KDIR --user root --memory 4G --cpus 4 \
     --exec "sh ../kernel-dev/t8-donetest.sh"      # slot exclusivity
+vng --run $KDIR --user root --memory 4G --cpus 4 \
+    --exec "sh ../kernel-dev/t9-donetest.sh"      # OPEN/CLOSE, handles, creds
 
 # Interim userspace tests, built on the host and run in the guest.
 make -C test
@@ -157,6 +161,24 @@ workqueue**, not run inline: an inline op holds its slot only inside the submit
 loop, so a collision could never happen and the rule would be untestable. `READ`
 takes the same shape at T10.
 
+**Handles.** A handle is `(index: u16, generation: u16)`, index low, generation
+starting at 1 and skipping 0 on wrap — so a valid handle is never 0 and every
+other opcode can keep demanding a zero `handle` field. `CLOSE` bumps the
+generation, which is what makes a reused index reject the retired handle. The
+table is fixed-size, sized at `SETUP` from `handle_count`, and guarded by a
+`Mutex`, never a `SpinLock`, because `fput` sleeps. `release` drains it
+explicitly: an in-flight `OpWork` holds its own `Arc<RingCtx>`, so dropping the
+`Arc` alone would not free anything.
+
+`OPEN` carries its flags in the SQE's `handle` field, using koru's own
+`KORU_O_*` bit values rather than the host `O_*` constants. Add a flag by
+whitelisting it in `KORU_OPEN_FLAGS_ALL` and translating it; an unlisted bit
+must stay `-EINVAL`.
+
+**kmemleak cannot see a leaked handle** — the file stays referenced by our own
+table. Use field 1 of `/proc/sys/fs/file-nr`. `/proc/<pid>/fd` sees nothing
+either way, since `filp_open` installs no descriptor.
+
 **The module pins itself.** `kernel::miscdevice` leaves `fops.owner` NULL, so
 neither an open fd nor a queued work item pins the module on its own.
 `open`/`release` and the deferred op path take and drop explicit references,
@@ -189,7 +211,8 @@ other than 4096 is a finding.
 Only `koru.rs` is named in `kernel/Kbuild`. The other kernel `.rs` files are
 submodules of that one crate, reached by `mod` declarations, not separate
 `obj-m` entries. This is verified working, including rebuilds triggered by
-editing a submodule alone.
+editing a submodule alone. Inherent `impl RingCtx` blocks live in `koru_ops.rs`
+too, which is why `RingCtx` and its fields are `pub(crate)` rather than private.
 
 The rest of `doc/Plan.md`'s Verification sequence does not work yet; the
 load-bearing ones will be:

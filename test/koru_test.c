@@ -57,6 +57,16 @@ void check_errno(int ret, int want, const char *what)
     }
 }
 
+void check_res(int64_t got, int64_t want, const char *what)
+{
+    if (got == want) {
+        printf("%-58s PASS\n", what);
+    } else {
+        printf("%-58s FAIL (res %lld, want %lld)\n", what, (long long)got, (long long)want);
+        failures++;
+    }
+}
+
 int open_dev(void)
 {
     int fd = open(KORU_DEV, O_RDWR);
@@ -85,11 +95,26 @@ int setup_ring(int fd, uint32_t sq_entries, uint32_t cq_entries, uint32_t slot_s
 
 int open_ring(uint32_t sq_entries, uint32_t cq_entries, uint32_t slot_size, uint32_t slot_count)
 {
+    return open_ring_handles(sq_entries, cq_entries, slot_size, slot_count, 0);
+}
+
+int open_ring_handles(uint32_t sq_entries, uint32_t cq_entries, uint32_t slot_size,
+                      uint32_t slot_count, uint32_t handle_count)
+{
+    struct koru_params p;
     int fd = open_dev();
 
     if (fd < 0)
         return -1;
-    if (setup_ring(fd, sq_entries, cq_entries, slot_size, slot_count) != 0) {
+    memset(&p, 0, sizeof(p));
+    p.magic        = KORU_MAGIC;
+    p.abi_version  = KORU_ABI_VERSION;
+    p.sq_entries   = sq_entries;
+    p.cq_entries   = cq_entries;
+    p.slot_size    = slot_size;
+    p.slot_count   = slot_count;
+    p.handle_count = handle_count;
+    if (ioctl(fd, KORU_IOC_SETUP, &p) != 0) {
         perror("SETUP");
         failures++;
         close(fd);
@@ -156,6 +181,35 @@ void sqe_checksum(struct koru_sqe *s, uint32_t slot, uint64_t off, uint32_t len,
     s->off       = off;
     s->len       = len;
     s->user_data = user_data;
+}
+
+void sqe_open(struct koru_sqe *s, uint32_t slot, uint64_t off, uint32_t len, uint32_t flags,
+              uint64_t user_data)
+{
+    memset(s, 0, sizeof(*s));
+    s->opcode    = KORU_OP_OPEN;
+    s->slot      = slot;
+    s->off       = off;
+    s->len       = len;
+    s->handle    = flags;
+    s->user_data = user_data;
+}
+
+void sqe_close(struct koru_sqe *s, uint32_t handle, uint64_t user_data)
+{
+    memset(s, 0, sizeof(*s));
+    s->opcode    = KORU_OP_CLOSE;
+    s->handle    = handle;
+    s->user_data = user_data;
+}
+
+uint32_t put_path(uint8_t *arena, uint32_t slot_size, uint32_t slot, const char *path)
+{
+    size_t n = strlen(path);
+
+    memset(arena + (size_t)slot * slot_size, 0, slot_size);
+    memcpy(arena + (size_t)slot * slot_size, path, n);
+    return (uint32_t)n;
 }
 
 uint64_t now_ms(void)

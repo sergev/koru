@@ -6,11 +6,13 @@
 //! to its executor between the call and the answer. See `doc/Notes.md` for
 //! the design.
 //!
-//! T8: the control plane, the mmap'd arena, and kernel-enforced slot
-//! exclusivity. Buffers are named by slot index and live in pages the kernel
-//! owns, never by userspace address.
+//! T9: the control plane, the mmap'd arena, kernel-enforced slot exclusivity,
+//! and the generational handle table. Buffers are named by slot index and live
+//! in pages the kernel owns, never by userspace address; open files are named
+//! by handle, never by fd.
 
 mod koru_abi;
+mod koru_ops;
 
 use kernel::{
     bindings,
@@ -19,12 +21,11 @@ use kernel::{
     miscdevice::{MiscDevice, MiscDeviceOptions, MiscDeviceRegistration},
     mm::virt::{flags as vmflags, VmaNew},
     page::{Page, PAGE_SIZE},
-    impl_has_delayed_work, new_condvar, new_delayed_work, new_mutex, new_spinlock,
+    new_condvar, new_mutex, new_spinlock,
     prelude::*,
-    sync::{Arc, ArcBorrow, CondVar, CondVarTimeoutResult, Mutex, SpinLock},
+    sync::{aref::ARef, Arc, ArcBorrow, CondVar, CondVarTimeoutResult, Mutex, SpinLock},
     time::{msecs_to_jiffies, Jiffies},
     uaccess::{UserPtr, UserSlice, UserSliceReader, UserSliceWriter},
-    workqueue::{self, DelayedWork, WorkItem},
 };
 
 use koru_abi::*;
@@ -66,11 +67,6 @@ impl PinnedDrop for KoruModule {
     }
 }
 
-/// Nanoseconds to jiffies, rounded up so a sub-millisecond delay still waits.
-fn delay_jiffies(ns: u64) -> Jiffies {
-    msecs_to_jiffies(ns.div_ceil(1_000_000).try_into().unwrap_or(u32::MAX))
-}
-
 /// Pin the module. `false` means it is already going away.
 ///
 /// The Rust `miscdevice` abstraction builds its `file_operations` with
@@ -82,7 +78,7 @@ fn module_get() -> bool {
 }
 
 /// Pin the module when a reference is already held, so it cannot fail.
-fn module_get_live() {
+pub(crate) fn module_get_live() {
     // SAFETY: the caller holds a reference via the open fd, so the refcount is
     // non-zero and this cannot race the module going away.
     unsafe { bindings::__module_get(THIS_MODULE.as_ptr()) }
@@ -95,7 +91,7 @@ fn module_get_live() {
 /// fails on a non-zero count, so the window needs a blocking unload racing the
 /// last close. The real fix is upstream: `MiscDeviceOptions` has no way to set
 /// `fops.owner`, which is what makes the VFS drop the reference from core text.
-fn module_put() {
+pub(crate) fn module_put() {
     // SAFETY: balanced against a get taken on this path.
     unsafe { bindings::module_put(THIS_MODULE.as_ptr()) }
 }
@@ -103,12 +99,13 @@ fn module_put() {
 /// What `SETUP` established. Kept separately from the wire struct so the kernel
 /// never reads back values it copied from userspace.
 #[derive(Copy, Clone)]
-struct RingConfig {
+pub(crate) struct RingConfig {
     sq_entries: u32,
     cq_entries: u32,
-    slot_size: u32,
-    slot_count: u32,
+    pub(crate) slot_size: u32,
+    pub(crate) slot_count: u32,
     arena_size: u64,
+    handle_count: u32,
 }
 
 /// Fixed-capacity completion FIFO, allocated at `SETUP` so `ENTER` never
@@ -117,12 +114,12 @@ struct RingConfig {
 /// `reserved` counts slots claimed by a consumed SQE that has not completed yet;
 /// `inflight` counts deferred ops among them. Reserving before consuming is what
 /// makes CQ overflow unrepresentable.
-struct RingState {
+pub(crate) struct RingState {
     cq: KVec<Cqe>,
     head: usize,
     len: usize,
     reserved: usize,
-    inflight: usize,
+    pub(crate) inflight: usize,
     /// One bit per arena slot, set while an op owns it.
     ///
     /// `index < slot_count` is not sufficient validation: nothing stops
@@ -176,7 +173,7 @@ impl RingState {
     }
 
     /// Claim a slot. False means another op already owns it.
-    fn slot_try_acquire(&mut self, slot: u32) -> bool {
+    pub(crate) fn slot_try_acquire(&mut self, slot: u32) -> bool {
         let (w, b) = (slot as usize / 64, slot as usize % 64);
         if self.slot_busy[w] & (1u64 << b) != 0 {
             return false;
@@ -185,19 +182,88 @@ impl RingState {
         true
     }
 
-    fn slot_release(&mut self, slot: u32) {
+    pub(crate) fn slot_release(&mut self, slot: u32) {
         let (w, b) = (slot as usize / 64, slot as usize % 64);
         self.slot_busy[w] &= !(1u64 << b);
+    }
+}
+
+/// One handle table entry. `generation` is bumped on every close, so a stale
+/// handle can never name the file that replaced it.
+pub(crate) struct HandleEntry {
+    file: Option<ARef<File>>,
+    generation: u16,
+}
+
+/// Fixed-size open-file table, sized at `SETUP`.
+///
+/// Guarded by a `Mutex`, never a `SpinLock`: `fput` sleeps.
+pub(crate) struct HandleTable {
+    entries: KVec<HandleEntry>,
+}
+
+impl HandleTable {
+    pub(crate) fn new() -> Self {
+        Self {
+            entries: KVec::new(),
+        }
+    }
+
+    /// Allocate `n` free entries. Generations start at 1, so handle 0 is never
+    /// valid and stays available as "field unused".
+    pub(crate) fn alloc(n: usize) -> Result<KVec<HandleEntry>> {
+        let mut entries = KVec::with_capacity(n, GFP_KERNEL)?;
+        for _ in 0..n {
+            entries.push(
+                HandleEntry {
+                    file: None,
+                    generation: 1,
+                },
+                GFP_KERNEL,
+            )?;
+        }
+        Ok(entries)
+    }
+
+    /// Take the first free entry. `Err(EMFILE)` hands the file back so the
+    /// caller can drop it outside the lock.
+    pub(crate) fn insert(&mut self, file: ARef<File>) -> core::result::Result<u32, ARef<File>> {
+        for (i, e) in self.entries.iter_mut().enumerate() {
+            if e.file.is_none() {
+                e.file = Some(file);
+                return Ok((i as u32) | (u32::from(e.generation) << 16));
+            }
+        }
+        Err(file)
+    }
+
+    /// Retire a handle, returning the file for the caller to drop unlocked.
+    pub(crate) fn close(&mut self, handle: u32) -> Result<ARef<File>> {
+        let (index, generation) = (handle & 0xffff, (handle >> 16) as u16);
+        if generation == 0 {
+            return Err(EBADF);
+        }
+        let e = self.entries.get_mut(index as usize).ok_or(EBADF)?;
+        if e.generation != generation {
+            return Err(EBADF);
+        }
+        let file = e.file.take().ok_or(EBADF)?;
+        // Skip 0 on wrap, or the next handle from this index would be 0.
+        e.generation = match e.generation.wrapping_add(1) {
+            0 => 1,
+            g => g,
+        };
+        Ok(file)
     }
 }
 
 /// Per-fd ring context, root of the object graph. doc/Notes.md's Lifetimes
 /// section lists what lands here next.
 #[pin_data]
-struct RingCtx {
+pub(crate) struct RingCtx {
     /// `Mutex`, not `SpinLock`: nothing on this path is atomic context.
     #[pin]
-    config: Mutex<Option<RingConfig>>,
+    pub(crate) config: Mutex<Option<RingConfig>>,
 
     /// Serialises all of `ENTER`: the consumer must be single-threaded, and it
     /// keeps a second reaper out of the peek-then-pop window.
@@ -211,7 +277,7 @@ struct RingCtx {
     ///
     /// **No `UserSlice` access while held** — `copy_*_user` can fault and sleep.
     #[pin]
-    state: SpinLock<RingState>,
+    pub(crate) state: SpinLock<RingState>,
 
     /// Waits on `state`. Notified by every completion, inline or deferred.
     #[pin]
@@ -224,61 +290,18 @@ struct RingCtx {
     /// safe. Guarded by `config`'s lock, which is only taken outside atomic
     /// context.
     #[pin]
-    arena: Mutex<Arena>,
+    pub(crate) arena: Mutex<Arena>,
+
+    /// Open handles. A leaf lock: never taken while `state` is held.
+    #[pin]
+    pub(crate) handles: Mutex<HandleTable>,
 }
 
 /// Kernel-owned buffer pages, plus whether they have been mapped.
-struct Arena {
-    pages: KVec<Page>,
+pub(crate) struct Arena {
+    pub(crate) pages: KVec<Page>,
     /// `mmap` is one-shot: a second call gets `EBUSY`.
     mapped: bool,
-}
-
-/// A deferred operation. doc/Notes.md's Lifetimes diagram is the shape.
-///
-/// Holds its own `Arc<RingCtx>`, so the ring outlives `close(fd)` while work is
-/// still queued and the last one out frees it.
-///
-/// Also holds a module reference for its whole life, including the delay before
-/// it runs: a queued work item points at `run` in module text, and nothing else
-/// keeps that text alive once the fd is closed.
-#[pin_data(PinnedDrop)]
-struct OpWork {
-    #[pin]
-    work: DelayedWork<OpWork>,
-    ring: Arc<RingCtx>,
-    sqe: Sqe,
-}
-
-#[pinned_drop]
-impl PinnedDrop for OpWork {
-    fn drop(self: Pin<&mut Self>) {
-        module_put();
-    }
-}
-
-impl_has_delayed_work! {
-    impl HasDelayedWork<Self> for OpWork { self.work }
-}
-
-impl WorkItem for OpWork {
-    type Pointer = Arc<OpWork>;
-
-    /// Runs in a kworker: no user memory, and the submitting task may be gone.
-    fn run(this: Arc<OpWork>) {
-        let sqe = &this.sqe;
-        let (res, slot) = match sqe.opcode {
-            KORU_OP_DELAY_NS => (0, None),
-            KORU_OP_CHECKSUM => (
-                this.ring
-                    .checksum(sqe)
-                    .unwrap_or_else(|e| i64::from(e.to_errno())),
-                Some(sqe.slot),
-            ),
-            _ => (i64::from(EINVAL.to_errno()), None),
-        };
-        this.ring.complete(RingCtx::cqe(sqe, res), slot);
-    }
 }
 
 #[vtable]
@@ -307,6 +330,7 @@ impl MiscDevice for RingCtx {
                     pages: KVec::new(),
                     mapped: false,
                 }),
+                handles <- new_mutex!(HandleTable::new()),
             }),
             GFP_KERNEL,
         );
@@ -366,8 +390,16 @@ impl MiscDevice for RingCtx {
         Ok(())
     }
 
-    /// Drops the `Arc`, then the module reference `open` took.
+    /// Drains the handle table, drops the `Arc`, then the module reference
+    /// `open` took.
+    ///
+    /// The drain is not redundant: an in-flight `OpWork` holds its own `Arc`,
+    /// so without it the open files would survive until that work item
+    /// finished. `KVec::new()` does not allocate, so the swap cannot fail, and
+    /// every `fput` runs after the lock is dropped.
     fn release(device: Arc<Self>, _file: &File) {
+        let drained = core::mem::replace(&mut device.handles.lock().entries, KVec::new());
+        drop(drained);
         drop(device);
         module_put();
     }
@@ -426,6 +458,7 @@ impl RingCtx {
         p.max_slot_size = KORU_MAX_SLOT_SIZE;
         p.max_slot_count = KORU_MAX_SLOT_COUNT;
         p.max_arena_bytes = KORU_MAX_ARENA_BYTES;
+        p.max_handles = KORU_MAX_HANDLES;
     }
 
     /// Validate a `SETUP` request. Pure, so a rejected one cannot consume the
@@ -486,12 +519,23 @@ impl RingCtx {
             return Err(EINVAL);
         }
 
+        // 0 is what an old binary sends in what used to be a reserved word.
+        let handle_count = if req.handle_count == 0 {
+            KORU_DEFAULT_HANDLES
+        } else {
+            req.handle_count
+        };
+        if handle_count > KORU_MAX_HANDLES {
+            return Err(EINVAL);
+        }
+
         Ok(RingConfig {
             sq_entries,
             cq_entries,
             slot_size,
             slot_count,
             arena_size,
+            handle_count,
         })
     }
 
@@ -525,6 +569,8 @@ impl RingCtx {
             slot_busy.push(0u64, GFP_KERNEL)?;
         }
 
+        let handles = HandleTable::alloc(cfg.handle_count as usize)?;
+
         {
             let mut guard = self.config.lock();
             if guard.is_some() {
@@ -544,6 +590,8 @@ impl RingCtx {
             arena.pages = pages;
             arena.mapped = false;
             drop(arena);
+
+            self.handles.lock().entries = handles;
 
             *guard = Some(cfg);
         }
@@ -673,7 +721,7 @@ impl RingCtx {
     ///
     /// The slot is released in the same critical section that posts the CQE, so
     /// it is free exactly when userspace can see the completion, never before.
-    fn complete(&self, cqe: Cqe, free_slot: Option<u32>) {
+    pub(crate) fn complete(&self, cqe: Cqe, free_slot: Option<u32>) {
         {
             let mut state = self.state.lock();
             state.inflight -= 1;
@@ -737,7 +785,7 @@ impl RingCtx {
         completed
     }
 
-    fn cqe(sqe: &Sqe, res: i64) -> Cqe {
+    pub(crate) fn cqe(sqe: &Sqe, res: i64) -> Cqe {
         Cqe {
             user_data: sqe.user_data,
             res,
@@ -747,145 +795,6 @@ impl RingCtx {
         }
     }
 
-    /// Opcode dispatch. `Some(res)` completed inline, `None` was deferred and
-    /// will post its own completion. Never fails the ioctl: per E1 a bad SQE is
-    /// a completion.
-    fn dispatch(me: ArcBorrow<'_, RingCtx>, sqe: &Sqe) -> Option<i64> {
-        let einval = i64::from(EINVAL.to_errno());
-
-        if sqe.rsvd0 != 0 || sqe.flags & !KORU_SQE_FLAGS_ALL != 0 {
-            return Some(einval);
-        }
-
-        match sqe.opcode {
-            KORU_OP_NOP => {
-                // NOP reads no argument fields, so all must be zero.
-                if sqe.len != 0 || sqe.off != 0 || sqe.slot != 0 || sqe.handle != 0 {
-                    return Some(einval);
-                }
-                Some(0)
-            }
-            KORU_OP_DELAY_NS => {
-                // DELAY_NS reads only `off`.
-                if sqe.len != 0 || sqe.slot != 0 || sqe.handle != 0 {
-                    return Some(einval);
-                }
-                RingCtx::defer(me, sqe, delay_jiffies(sqe.off))
-            }
-            KORU_OP_CHECKSUM => {
-                if sqe.handle != 0 {
-                    return Some(einval);
-                }
-                // Validate in ioctl context, before claiming anything.
-                if let Err(e) = RingCtx::check_range(&me, sqe) {
-                    return Some(i64::from(e.to_errno()));
-                }
-                if !me.state.lock().slot_try_acquire(sqe.slot) {
-                    return Some(i64::from(EBUSY.to_errno()));
-                }
-                // Deferred, so the slot is genuinely held across a window. That
-                // window is what makes exclusivity observable, and it is the
-                // same shape READ takes in T10.
-                match RingCtx::defer(me, sqe, 0) {
-                    None => None,
-                    Some(res) => {
-                        me.state.lock().slot_release(sqe.slot);
-                        Some(res)
-                    }
-                }
-            }
-            // Unknown, or defined but not yet implemented.
-            _ => Some(einval),
-        }
-    }
-
-    /// FNV-1a over `len` bytes at `off` in slot `slot`.
-    ///
-    /// Masked to 63 bits so the result is never mistaken for an errno.
-    fn check_range(&self, sqe: &Sqe) -> Result<()> {
-        let Some(cfg) = *self.config.lock() else {
-            return Err(EINVAL);
-        };
-        if sqe.slot >= cfg.slot_count {
-            return Err(EINVAL);
-        }
-        // All user-controlled: check in u64 before deriving any page index.
-        let end = u64::from(sqe.len).checked_add(sqe.off).ok_or(EINVAL)?;
-        if end > u64::from(cfg.slot_size) {
-            return Err(EINVAL);
-        }
-        Ok(())
-    }
-
-    fn checksum(&self, sqe: &Sqe) -> Result<i64> {
-        self.check_range(sqe)?;
-        let Some(cfg) = *self.config.lock() else {
-            return Err(EINVAL);
-        };
-
-        let base = u64::from(sqe.slot)
-            .checked_mul(u64::from(cfg.slot_size))
-            .ok_or(EINVAL)?
-            .checked_add(sqe.off)
-            .ok_or(EINVAL)?;
-        let mut pos = usize::try_from(base).map_err(|_| EINVAL)?;
-        let mut left = sqe.len as usize;
-
-        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-        let mut buf = [0u8; 256];
-        let arena = self.arena.lock();
-
-        while left > 0 {
-            let page = arena.pages.get(pos / PAGE_SIZE).ok_or(EINVAL)?;
-            let in_page = pos % PAGE_SIZE;
-            let n = core::cmp::min(core::cmp::min(left, PAGE_SIZE - in_page), buf.len());
-
-            // SAFETY: `buf` is valid for `n` bytes and `in_page + n <= PAGE_SIZE`.
-            // Slot exclusivity, which is what rules out a concurrent writer, is
-            // T8; until then nothing else touches a slot under test.
-            unsafe { page.read_raw(buf.as_mut_ptr(), in_page, n)? };
-
-            for &b in &buf[..n] {
-                hash ^= u64::from(b);
-                hash = hash.wrapping_mul(0x100_0000_01b3);
-            }
-            pos += n;
-            left -= n;
-        }
-
-        Ok((hash & 0x7fff_ffff_ffff_ffff) as i64)
-    }
-
-    /// Queue an op on the workqueue. `None` once it owns the reservation.
-    fn defer(me: ArcBorrow<'_, RingCtx>, sqe: &Sqe, jiffies: Jiffies) -> Option<i64> {
-        // Paired with `PinnedDrop for OpWork`. Taken before the allocation so
-        // the drop impl always has a reference to release.
-        module_get_live();
-
-        let op = match Arc::pin_init(
-            pin_init!(OpWork {
-                work <- new_delayed_work!("OpWork::work"),
-                ring: Arc::from(me),
-                sqe: *sqe,
-            }),
-            GFP_KERNEL,
-        ) {
-            Ok(op) => op,
-            // C1 still holds: a failed op is a completion, not an ioctl error.
-            Err(e) => {
-                module_put();
-                return Some(i64::from(e.to_errno()));
-            }
-        };
-
-        // Counted before enqueueing, or `run` could decrement first.
-        me.state.lock().inflight += 1;
-        if workqueue::system().enqueue_delayed(op, jiffies).is_err() {
-            me.state.lock().inflight -= 1;
-            return Some(i64::from(EAGAIN.to_errno()));
-        }
-        None
-    }
 
     fn fill_config(p: &mut KoruParams, cfg: &RingConfig) {
         p.sq_entries = cfg.sq_entries;
@@ -893,6 +802,7 @@ impl RingCtx {
         p.slot_size = cfg.slot_size;
         p.slot_count = cfg.slot_count;
         p.arena_size = cfg.arena_size;
+        p.handle_count = cfg.handle_count;
         p.configured = 1;
     }
 }
