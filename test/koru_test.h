@@ -15,47 +15,47 @@
  * catch you forgetting.
  * ------------------------------------------------------------------------ */
 
-#define KORU_DEV "/dev/koru"
-#define KORU_MAGIC 0x75726f6bu /* "koru" */
+#define KORU_DEV         "/dev/koru"
+#define KORU_MAGIC       0x75726f6bu /* "koru" */
 #define KORU_ABI_VERSION 1u
 
 struct koru_params {
-	/* in */
-	uint32_t magic, abi_version, flags;
-	/* in/out */
-	uint32_t sq_entries, cq_entries, slot_size, slot_count;
-	/* out */
-	uint32_t configured;
-	uint64_t features, arena_size;
-	uint32_t max_sq_entries, max_cq_entries, max_slot_size, max_slot_count;
-	uint64_t max_arena_bytes;
-	/* in: must be zero */
-	uint64_t reserved[4];
+    /* in */
+    uint32_t magic, abi_version, flags;
+    /* in/out */
+    uint32_t sq_entries, cq_entries, slot_size, slot_count;
+    /* out */
+    uint32_t configured;
+    uint64_t features, arena_size;
+    uint32_t max_sq_entries, max_cq_entries, max_slot_size, max_slot_count;
+    uint64_t max_arena_bytes;
+    /* in: must be zero */
+    uint64_t reserved[4];
 };
 
 struct koru_sqe {
-	uint8_t opcode, flags;
-	uint16_t rsvd0;
-	uint32_t len;
-	uint64_t off;
-	uint64_t user_data;
-	uint32_t slot, handle;
+    uint8_t opcode, flags;
+    uint16_t rsvd0;
+    uint32_t len;
+    uint64_t off;
+    uint64_t user_data;
+    uint32_t slot, handle;
 };
 
 struct koru_cqe {
-	uint64_t user_data;
-	int64_t res;
-	uint32_t flags, rsvd0;
-	uint64_t extra;
+    uint64_t user_data;
+    int64_t res;
+    uint32_t flags, rsvd0;
+    uint64_t extra;
 };
 
 struct koru_enter {
-	uint64_t sq_addr, cq_addr, timeout_ns;
-	uint32_t to_submit, cq_space, min_complete, flags;
-	/* out */
-	uint32_t completed, submitted;
-	/* in: must be zero */
-	uint64_t reserved[2];
+    uint64_t sq_addr, cq_addr, timeout_ns;
+    uint32_t to_submit, cq_space, min_complete, flags;
+    /* out */
+    uint32_t completed, submitted;
+    /* in: must be zero */
+    uint64_t reserved[2];
 };
 
 _Static_assert(sizeof(struct koru_params) == 104, "params size");
@@ -71,16 +71,16 @@ _Static_assert(offsetof(struct koru_enter, to_submit) == 24, "enter.to_submit");
 _Static_assert(offsetof(struct koru_enter, completed) == 40, "enter.completed");
 _Static_assert(offsetof(struct koru_enter, submitted) == 44, "enter.submitted");
 
-#define KORU_IOC_SETUP _IOWR('k', 0x00, struct koru_params)
+#define KORU_IOC_SETUP      _IOWR('k', 0x00, struct koru_params)
 #define KORU_IOC_GET_PARAMS _IOR('k', 0x01, struct koru_params)
-#define KORU_IOC_ENTER _IOWR('k', 0x02, struct koru_enter)
+#define KORU_IOC_ENTER      _IOWR('k', 0x02, struct koru_enter)
 
-#define KORU_OP_NOP 0
+#define KORU_OP_NOP      0
 #define KORU_OP_DELAY_NS 1
-#define KORU_OP_OPEN 2
-#define KORU_OP_READ 3
-#define KORU_OP_CLOSE 4
-#define KORU_OP_CANCEL 5
+#define KORU_OP_OPEN     2
+#define KORU_OP_READ     3
+#define KORU_OP_CLOSE    4
+#define KORU_OP_CANCEL   5
 #define KORU_OP_CHECKSUM 6
 
 /* ---------------------------------------------------------------------------
@@ -102,21 +102,20 @@ void check_errno(int ret, int want, const char *what);
 
 int open_dev(void);
 int setup_ring(int fd, uint32_t sq_entries, uint32_t cq_entries, uint32_t slot_size,
-	       uint32_t slot_count);
-int open_ring(uint32_t sq_entries, uint32_t cq_entries, uint32_t slot_size,
-	      uint32_t slot_count);
+               uint32_t slot_count);
+int open_ring(uint32_t sq_entries, uint32_t cq_entries, uint32_t slot_size, uint32_t slot_count);
 
 void enter_init(struct koru_enter *e, struct koru_sqe *sq, unsigned n, struct koru_cqe *cq,
-		unsigned cq_space);
+                unsigned cq_space);
 int submit(int fd, struct koru_sqe *sq, unsigned n, struct koru_cqe *cq, unsigned cq_space,
-	   unsigned min_complete, unsigned *completed);
+           unsigned min_complete, unsigned *completed);
 /* One SQE to completion. Returns its res, or INT64_MIN if it never completed. */
 int64_t run_one(int fd, struct koru_sqe *s);
 
 void sqe_nop(struct koru_sqe *s, uint64_t user_data);
 void sqe_delay(struct koru_sqe *s, uint64_t user_data, uint64_t ns);
 void sqe_checksum(struct koru_sqe *s, uint32_t slot, uint64_t off, uint32_t len,
-		  uint64_t user_data);
+                  uint64_t user_data);
 
 uint64_t now_ms(void);
 /* Must match the kernel's FNV-1a, masked to 63 bits. */
