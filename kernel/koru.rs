@@ -3,8 +3,8 @@
 //! koru: an experimental non-POSIX kernel API designed for coroutines.
 //!
 //! Submission and completion are separate events, because a coroutine must yield
-//! to its executor between the call and the answer. See `Plan.md` in the
-//! repository root for the design.
+//! to its executor between the call and the answer. See `doc/Notes.md` for
+//! the design.
 //!
 //! T8: the control plane, the mmap'd arena, and kernel-enforced slot
 //! exclusivity. Buffers are named by slot index and live in pages the kernel
@@ -191,8 +191,8 @@ impl RingState {
     }
 }
 
-/// Per-fd ring context, root of the object graph. Plan.md's Lifetimes section
-/// lists what lands here next.
+/// Per-fd ring context, root of the object graph. doc/Notes.md's Lifetimes
+/// section lists what lands here next.
 #[pin_data]
 struct RingCtx {
     /// `Mutex`, not `SpinLock`: nothing on this path is atomic context.
@@ -234,7 +234,7 @@ struct Arena {
     mapped: bool,
 }
 
-/// A deferred operation. Plan.md's Lifetimes diagram is the shape.
+/// A deferred operation. doc/Notes.md's Lifetimes diagram is the shape.
 ///
 /// Holds its own `Arc<RingCtx>`, so the ring outlives `close(fd)` while work is
 /// still queued and the last one out frees it.
@@ -337,8 +337,8 @@ impl MiscDevice for RingCtx {
         }
 
         // MAP_PRIVATE would silently give copy-on-write, so userspace writes
-        // would land in a private copy the kernel never sees. Plan.md calls
-        // this the single most likely day-loser.
+        // would land in a private copy the kernel never sees. doc/Notes.md
+        // calls this the single most likely day-loser.
         if vma.flags() & vmflags::SHARED == 0 {
             return Err(EINVAL);
         }

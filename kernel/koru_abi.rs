@@ -137,7 +137,7 @@ pub(crate) const KORU_OP_CLOSE: u8 = 4; // T9
 #[expect(dead_code)]
 pub(crate) const KORU_OP_CANCEL: u8 = 5; // T11
 /// FNV-1a over `len` bytes at `off` in slot `slot`, returned in `res`.
-/// `handle` must be zero. Scaffolding for the arena; see Plan.md.
+/// `handle` must be zero. Scaffolding for the arena; see doc/Notes.md.
 pub(crate) const KORU_OP_CHECKSUM: u8 = 6; // T7
 
 /// Any bit set is rejected.

@@ -82,13 +82,14 @@ and no `Waker`.
 
 ## How it's put together
 
-| Piece | What it does |
-|---|---|
-| Kernel module (Rust) | misc device, opcode dispatch, arena, workers |
-| `ENTER` ioctl | submits ops, blocks for completions; the only entry point |
-| `mmap` arena | fixed-size slots in kernel-owned pages; the data plane |
-| `user/koru` | Rust binding: `Future` impls + executor |
-| `user/cpp` | C++20 binding: awaiters, `task<T>`, executor |
+- **Kernel module, in Rust** — the misc device, opcode dispatch, the buffer
+  arena and the worker offload.
+- **The `ENTER` ioctl** — submits operations and blocks for completions. It is
+  the only entry point.
+- **The `mmap`'d arena** — fixed-size slots in kernel-owned pages. This is the
+  data plane.
+- **`user/koru`** — the Rust binding: `Future` impls plus an executor.
+- **`user/cpp`** — the C++20 binding: awaiters, `task<T>` and an executor.
 
 The coroutines are entirely in userspace. Kernel Rust has no async runtime, so
 the kernel side is a dispatch table plus a worker pool — the same split io_uring
@@ -96,8 +97,12 @@ makes with `io-wq`.
 
 ## Status
 
-**Design only. No code yet.** [Plan.md](Plan.md) has the full design and a task
-list (T0–T23) with a test for each step.
+**The kernel module works; the bindings are not written yet.** It registers
+`/dev/koru`, configures a ring, and runs `NOP`, `DELAY_NS` and `CHECKSUM`
+through `ENTER`, with the arena mapped and slot exclusivity enforced.
+
+[doc/Notes.md](doc/Notes.md) has the design and the reasoning behind it.
+[doc/Plan.md](doc/Plan.md) has the remaining tasks, each with a test.
 
 Requires a Linux box running a kernel ≥6.16 built with `CONFIG_RUST=y` — and the
 full build tree, since distro `linux-headers` packages omit the Rust artifacts.

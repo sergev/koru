@@ -10,21 +10,28 @@ code in this repository.
 blocks for completions. The arena is mmap'd, with slot exclusivity enforced by
 the kernel. Teardown is safe and `rmmod` is refused while anything is live.
 
-- `Plan.md` — canonical design plus a task list T0–T23, each with a "done" test.
-  Read it before writing anything. It records *why* several obvious-looking
-  approaches are wrong. Completed tasks are marked, with what their done test
-  actually showed.
+- `doc/Notes.md` — the global picture: design, ABI invariants, research
+  findings, accepted gaps, and what T0–T8 established. It records *why* several
+  obvious-looking approaches are wrong. Read it before writing anything.
+- `doc/Plan.md` — the remaining tasks only, each with a "done" test. Completed
+  tasks are deleted from it, not marked.
 - `README.md` — the short explanation of the idea.
 - `kernel/` — the out-of-tree Rust module. `koru_abi.rs` is the canonical wire
   format.
 - `test/` — interim C tests, one per task. See Commands.
 
-Work proceeds in plan order. Task numbers are referenced across both documents;
-if you renumber, fix the cross-references.
+Work proceeds in plan order. Task numbers are referenced across all three
+documents; if you renumber, fix the cross-references.
 
-Every `*.md` file in this repo wraps at 80 columns. Reflow the whole paragraph
-when you edit one, rather than letting a line run long. Table rows are the one
-exception: GFM cannot wrap them.
+Two documentation rules, both load-bearing:
+
+- Every `*.md` file in this repo wraps at 80 columns and uses **no tables**.
+  Reflow the whole paragraph when you edit one, rather than letting a line run
+  long. A table forces long lines, so use headed sections or lists instead.
+- When a task is finished, **delete it from `doc/Plan.md`**. Anything it taught
+  that outlives it — a corrected assumption, an ABI change, a trap worth not
+  falling into twice — moves into `doc/Notes.md` first. `Plan.md` is future
+  work only; `Notes.md` is the accumulated global picture.
 
 ## What this project is
 
@@ -132,7 +139,7 @@ whole number of pages and nothing straddles a page boundary. Pages are allocated
 and zeroed at `SETUP`, not at `mmap`, so `mmap` never allocates and `SETUP`
 cannot promise memory it has not got. `mmap` is one-shot and demands
 `MAP_SHARED`, `vm_pgoff == 0` and a length exactly equal to `arena_size`;
-`MAP_PRIVATE` would silently give copy-on-write and is the failure Plan.md
+`MAP_PRIVATE` would silently give copy-on-write and is the failure doc/Notes.md
 singles out.
 
 `VM_IO` is deliberately **not** set. The `set_dontcopy` doc says `VM_DONTCOPY`
@@ -184,7 +191,7 @@ submodules of that one crate, reached by `mod` declarations, not separate
 `obj-m` entries. This is verified working, including rebuilds triggered by
 editing a submodule alone.
 
-The rest of `Plan.md`'s Verification sequence does not work yet; the
+The rest of `doc/Plan.md`'s Verification sequence does not work yet; the
 load-bearing ones will be:
 
 ```sh
@@ -236,8 +243,8 @@ not a style question.
 
 ## Things that look right and are not
 
-Recorded so they don't get re-proposed. `Plan.md` has the full reasoning and
-citations.
+Recorded so they don't get re-proposed. `doc/Notes.md` has the full reasoning
+and citations.
 
 - **Do not reach for `uring_cmd`.** It has no Rust abstraction in mainline —
   only an unmerged RFC with open soundness bugs.
