@@ -17,7 +17,7 @@ mod koru_ops;
 use kernel::{
     bindings,
     fs::File,
-    ioctl::{_IOC_NR, _IOC_SIZE, _IOC_TYPE},
+    ioctl::{_IOC_DIR, _IOC_NR, _IOC_SIZE, _IOC_TYPE},
     miscdevice::{MiscDevice, MiscDeviceOptions, MiscDeviceRegistration},
     mm::virt::{flags as vmflags, VmaNew},
     page::{Page, PAGE_SIZE},
@@ -458,6 +458,7 @@ impl MiscDevice for RingCtx {
     fn release(device: Arc<Self>, _file: &File) {
         let drained = core::mem::replace(&mut device.handles.lock().entries, KVec::new());
         drop(drained);
+        device.cancel_all();
         drop(device);
         module_put();
     }
@@ -471,9 +472,11 @@ impl MiscDevice for RingCtx {
 
         let ptr = UserPtr::from_addr(arg);
 
-        // Only for a recognised command: a mismatch means ABI skew.
-        let check_size = |expected: usize| {
-            if _IOC_SIZE(cmd) == expected {
+        // Only for a recognised command: a mismatch means ABI skew. Direction
+        // as well as size, or a read-only encoding of a bidirectional command
+        // would be accepted.
+        let check = |expected: usize, dir: u32| {
+            if _IOC_SIZE(cmd) == expected && _IOC_DIR(cmd) == dir {
                 Ok(())
             } else {
                 Err(eproto())
@@ -481,22 +484,23 @@ impl MiscDevice for RingCtx {
         };
         let params_size = core::mem::size_of::<KoruParams>();
         let enter_size = core::mem::size_of::<KoruEnter>();
+        let (r, rw) = (kernel::uapi::_IOC_READ, kernel::uapi::_IOC_READ | kernel::uapi::_IOC_WRITE);
 
         match _IOC_NR(cmd) {
             KORU_NR_SETUP => {
-                check_size(params_size)?;
+                check(params_size, rw)?;
                 let (reader, writer) = UserSlice::new(ptr, params_size).reader_writer();
                 me.setup(reader, writer)?;
                 Ok(0)
             }
             KORU_NR_GET_PARAMS => {
-                check_size(params_size)?;
+                check(params_size, r)?;
                 me.get_params(UserSlice::new(ptr, params_size).writer())?;
                 Ok(0)
             }
             // The only ioctl returning a value: SQEs consumed (E1).
             KORU_NR_ENTER => {
-                check_size(enter_size)?;
+                check(enter_size, rw)?;
                 RingCtx::enter(me, ptr)
             }
             _ => Err(ENOTTY),
@@ -517,6 +521,7 @@ impl RingCtx {
         p.max_slot_count = KORU_MAX_SLOT_COUNT;
         p.max_arena_bytes = KORU_MAX_ARENA_BYTES;
         p.max_handles = KORU_MAX_HANDLES;
+        p.max_delay_ns = KORU_MAX_DELAY_NS;
     }
 
     /// Validate a `SETUP` request. Pure, so a rejected one cannot consume the
@@ -697,6 +702,11 @@ impl RingCtx {
             return Err(EINVAL);
         };
         if req.to_submit > cfg.sq_entries {
+            return Err(EINVAL);
+        }
+        // Reaping more than the queue can hold is meaningless, and unbounded it
+        // would size a `UserSlice` in the hundreds of gigabytes.
+        if req.cq_space > cfg.cq_entries {
             return Err(EINVAL);
         }
         // Unsatisfiable by construction.

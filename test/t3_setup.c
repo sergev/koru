@@ -48,7 +48,7 @@ static void bad_flags(struct koru_params *p)
 }
 static void bad_reserved(struct koru_params *p)
 {
-    p->reserved[2] = 1;
+    p->reserved[1] = 1;
 }
 static void zero_sq(struct koru_params *p)
 {

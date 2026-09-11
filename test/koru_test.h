@@ -33,8 +33,9 @@ struct koru_params {
     uint32_t handle_count;
     /* out */
     uint32_t max_handles;
+    uint64_t max_delay_ns;
     /* in: must be zero */
-    uint64_t reserved[3];
+    uint64_t reserved[2];
 };
 
 struct koru_sqe {
@@ -76,7 +77,8 @@ _Static_assert(offsetof(struct koru_enter, completed) == 40, "enter.completed");
 _Static_assert(offsetof(struct koru_enter, submitted) == 44, "enter.submitted");
 _Static_assert(offsetof(struct koru_params, handle_count) == 72, "params.handle_count");
 _Static_assert(offsetof(struct koru_params, max_handles) == 76, "params.max_handles");
-_Static_assert(offsetof(struct koru_params, reserved) == 80, "params.reserved");
+_Static_assert(offsetof(struct koru_params, max_delay_ns) == 80, "params.max_delay_ns");
+_Static_assert(offsetof(struct koru_params, reserved) == 88, "params.reserved");
 
 #define KORU_IOC_SETUP      _IOWR('k', 0x00, struct koru_params)
 #define KORU_IOC_GET_PARAMS _IOR('k', 0x01, struct koru_params)

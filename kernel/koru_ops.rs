@@ -135,6 +135,10 @@ impl RingCtx {
                 if sqe.len != 0 || sqe.slot != 0 || sqe.handle != 0 {
                     return Some(einval);
                 }
+                // A delay pins a CQ reservation for its whole duration.
+                if sqe.off > KORU_MAX_DELAY_NS {
+                    return Some(einval);
+                }
                 RingCtx::defer(me, sqe, delay_jiffies(sqe.off), None)
             }
             // Inline, in the submitting task's context: a kworker would resolve
@@ -483,6 +487,31 @@ impl RingCtx {
                 Some(i64::from(EAGAIN.to_errno()))
             }
         }
+    }
+
+    /// Cancel every queued op, for `release`.
+    ///
+    /// No completions are posted: the ring is being destroyed, and no ioctl can
+    /// be in progress because the VFS holds a reference for the duration of
+    /// one, so nothing is left to read a CQE or observe `inflight`. An op a
+    /// worker already picked up cannot be cancelled and keeps the ring alive
+    /// until it finishes, exactly as before.
+    pub(crate) fn cancel_all(&self) {
+        {
+            let list = self.pending.lock();
+            for op in list.iter() {
+                // SAFETY: the registry entry keeps the `OpWork` alive.
+                if unsafe { bindings::cancel_delayed_work(OpWork::delayed_work(op)) } {
+                    // SAFETY: `run` will never reclaim what `enqueue_delayed`
+                    // leaked, so adopt it. `op` still holds a reference, so
+                    // this drop can never be the last.
+                    drop(unsafe { Arc::from_raw(Arc::as_ptr(op)) });
+                }
+            }
+        }
+        // Outside the lock: this is where `fput` and `module_put` run.
+        let drained = core::mem::replace(&mut *self.pending.lock(), KVec::new());
+        drop(drained);
     }
 
     /// `CANCEL`: retire the in-flight op whose `user_data` is `off`.

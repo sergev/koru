@@ -1,18 +1,18 @@
 # koru — remaining tasks
 
 This file lists only work that is still to do. The design, the ABI invariants,
-the accepted gaps and everything T0–T11 established are in
+the accepted gaps and everything T0–T12 established are in
 [Notes.md](Notes.md); read that first.
 
-T0–T11 are done and have been removed from this list. **Every opcode is
-implemented.** The module registers `/dev/koru`, configures a ring with `SETUP`,
-and submits `NOP`, `DELAY_NS`, `CHECKSUM`, `OPEN`, `READ`, `CLOSE` and `CANCEL`
-through `ENTER`, which blocks for completions. The arena is mmap'd, slot
-exclusivity is enforced by the kernel, open files are held in a generational
-handle table, a queued op can be genuinely dequeued, teardown is safe and
-`rmmod` is refused while anything is live.
+T0–T12 are done and have been removed from this list. **The kernel side is
+finished.** Every opcode is implemented, and the whole validation surface has
+been fuzzed for ten minutes under KASAN, lockdep and kmemleak with zero kernel
+messages. The arena is mmap'd, slot exclusivity is enforced by the kernel, open
+files are held in a generational handle table, a queued op can be genuinely
+dequeued, and closing the fd cancels whatever is still queued.
 
-What remains in this phase is T12, which is what validates all of it.
+Everything from here is userspace. The kernel changes only if a binding finds an
+ABI ambiguity worth fixing.
 
 Each task below carries a done test. A task is finished when its done test has
 been run and has passed, and when the test has been shown to fail if the thing
@@ -20,17 +20,6 @@ it checks is broken. Mark it done here, move whatever it taught into
 [Notes.md](Notes.md), then delete it from this file.
 
 **[M]** mechanical · **[R]** risky/exploratory
-
-## Phase 3 — real operations
-
-### T12 [R] — hostile-userspace fuzz
-
-Random SQE bytes, random slot, handle, len and off, garbage reserved fields,
-eight concurrent `ENTER` threads, concurrent `munmap`, random `kill -9`.
-
-Done test: ten minutes under KASAN, lockdep and kmemleak with zero kernel
-messages. **Do not skip this** — it is the only thing that validates the TOCTOU
-and validation rules.
 
 ## Phase 4 — Rust userspace
 

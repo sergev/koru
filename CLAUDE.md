@@ -5,16 +5,17 @@ code in this repository.
 
 ## State of the repository
 
-**T0–T11 are done, and every opcode is implemented.** The module registers
+**T0–T12 are done: the kernel side is finished.** The module registers
 `/dev/koru`, configures a ring with `SETUP`, and submits `NOP`, `DELAY_NS`,
 `CHECKSUM`, `OPEN`, `READ`, `CLOSE` and `CANCEL` through `ENTER`, which blocks
 for completions. The arena is mmap'd, with slot exclusivity enforced by the
 kernel. Open files live in a generational handle table. A queued op can be
-genuinely dequeued. Teardown is safe and `rmmod` is refused while anything is
-live. T12, the hostile-userspace fuzz, is what validates all of it.
+genuinely dequeued, and `close(fd)` cancels whatever is still queued. The whole
+validation surface has been fuzzed under KASAN, lockdep and kmemleak. Everything
+from here is userspace.
 
 - `doc/Notes.md` — the global picture: design, ABI invariants, research
-  findings, accepted gaps, and what T0–T11 established. It records *why* several
+  findings, accepted gaps, and what T0–T12 established. It records *why* several
   obvious-looking approaches are wrong. Read it before writing anything.
 - `doc/Plan.md` — the remaining tasks only, each with a "done" test. Completed
   tasks are deleted from it, not marked.
@@ -77,7 +78,7 @@ GCC ≥ 11 or Clang ≥ 14, `-std=c++20`, built with `-fsanitize=address,undefin
 
 ## Commands
 
-These work today (T0 through T11):
+These work today (T0 through T12):
 
 ```sh
 KDIR=../kernel-dev/linux-source-7.1
@@ -120,6 +121,8 @@ vng --run $KDIR --user root --memory 4G --cpus 4 \
     --exec "sh ../kernel-dev/t10-donetest.sh"     # READ into a slot
 vng --run $KDIR --user root --memory 4G --cpus 4 \
     --exec "sh ../kernel-dev/t11-donetest.sh"     # CANCEL
+vng --run $KDIR --user root --memory 4G --cpus 4 \
+    --exec "sh ../kernel-dev/t12-donetest.sh 600" # hostile-userspace fuzz
 
 # Interim userspace tests, built on the host and run in the guest.
 make -C test
@@ -182,6 +185,17 @@ blocking read in a kworker cannot be interrupted, so a FIFO or socket would
 consume a workqueue thread permanently. `check_readable` also rejects a file
 whose `f_op` has `read` set or `read_iter` unset, which is what keeps
 `kernel read not supported for file` out of the log.
+
+**`release` cancels queued work**, so `close(fd)` frees the ring instead of
+leaving it pinned for the length of the longest delay. It uses the same refcount
+rule as `CANCEL` and posts no completions, because nothing can still be reading
+the CQ. T6's done test asserts the timing, not just the outcome.
+
+**`slot_try_acquire` does not bounds-check its own index.** Every caller must
+validate `slot < slot_count` first; forgetting it is a Rust bounds panic and a
+kernel Oops, reachable from userspace. The bitmap is whole 64-bit words, so a
+small `slot_count` leaves spare bits and `slot_count + 1` stays in bounds, so
+probe past 64 when testing this.
 
 **`CANCEL`'s refcount rule is the sharpest edge in the module.**
 `enqueue_delayed` returning `Ok` leaks one `Arc` reference that only `run()`

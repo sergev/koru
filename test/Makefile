@@ -5,9 +5,10 @@
 #
 # The real test suites arrive with the bindings: Rust at T13, C++ at T17.
 
-CFLAGS := -std=c11 -O1 -g -Wall -Wextra -Werror -D_GNU_SOURCE
+CFLAGS := -std=c11 -O1 -g -Wall -Wextra -Werror -D_GNU_SOURCE -pthread
 
-TESTS := t3_setup t4_enter t5_delay t6_teardown t7_arena t8_slots t9_handles t10_read t11_cancel
+TESTS := t3_setup t4_enter t5_delay t6_teardown t7_arena t8_slots t9_handles t10_read \
+         t11_cancel t12_fuzz
 COMMON := koru_test.c koru_test.h
 
 all: $(TESTS)

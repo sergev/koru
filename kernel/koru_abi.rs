@@ -84,6 +84,10 @@ pub(crate) const KORU_MAX_HANDLES: u32 = 4096;
 /// What `handle_count == 0` means at `SETUP`.
 pub(crate) const KORU_DEFAULT_HANDLES: u32 = 64;
 
+/// Cap on a `DELAY_NS` delay: one hour. Unbounded, a delay pins a CQ
+/// reservation for as long as it lasts.
+pub(crate) const KORU_MAX_DELAY_NS: u64 = 3_600_000_000_000;
+
 /// Ring configuration, for `SETUP` and `GET_PARAMS`. Field order gives natural
 /// alignment with no padding: eight `u32`, then the `u64`s at offset 32.
 #[repr(C)]
@@ -123,8 +127,10 @@ pub(crate) struct KoruParams {
     pub(crate) handle_count: u32,
     /// out: cap on `handle_count`.
     pub(crate) max_handles: u32,
+    /// out: cap on a `DELAY_NS` delay, in nanoseconds.
+    pub(crate) max_delay_ns: u64,
     /// in: must be zero.
-    pub(crate) reserved: [u64; 3],
+    pub(crate) reserved: [u64; 2],
 }
 
 // 104 = eight u32 at 0..32, then u64-aligned fields; a multiple of 8, so no
@@ -134,7 +140,8 @@ kernel::static_assert!(core::mem::align_of::<KoruParams>() == 8);
 // The two fields carved out of the old `reserved[3]`, and where that leaves it.
 kernel::static_assert!(core::mem::offset_of!(KoruParams, handle_count) == 72);
 kernel::static_assert!(core::mem::offset_of!(KoruParams, max_handles) == 76);
-kernel::static_assert!(core::mem::offset_of!(KoruParams, reserved) == 80);
+kernel::static_assert!(core::mem::offset_of!(KoruParams, max_delay_ns) == 80);
+kernel::static_assert!(core::mem::offset_of!(KoruParams, reserved) == 88);
 
 // SAFETY: `repr(C)`, unsigned integers only, so every bit pattern is valid. No
 // interior mutability.

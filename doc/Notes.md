@@ -1,7 +1,7 @@
 # koru — design notes
 
 The global picture: why this API is shaped the way it is, what the ABI
-guarantees, and what building T0–T11 actually taught us. [Plan.md](Plan.md)
+guarantees, and what building T0–T12 actually taught us. [Plan.md](Plan.md)
 holds the remaining tasks and nothing else.
 
 ## Context
@@ -116,9 +116,9 @@ The generation counter is load-bearing: without it a recycled slab index lets a
 late completion from a cancelled op wake the wrong future.
 
 `mem::forget` on a `BufSlot` leaks one slot of N — safe, since the index is
-never reused. Dropping the whole ring mid-flight leaks the fd and arena until
-the last work item finishes — also safe, because in-flight `OpWork`s hold their
-own `Arc<RingCtx>`.
+never reused. Dropping the whole ring mid-flight is also safe: `release`
+cancels everything still queued, and an op a worker has already picked up holds
+its own `Arc<RingCtx>` and keeps the ring alive until it finishes.
 
 ### ABI invariants
 
@@ -249,7 +249,7 @@ last one out frees `RingCtx`. `release()` drains the handle table under the
 There is no `dying` flag. Nothing has needed one: `ENTER` cannot be in flight
 once `release` runs, and no deferred op touches the handle table.
 
-## What T0–T11 established
+## What T0–T12 established
 
 The tasks themselves are gone from [Plan.md](Plan.md); what they proved is here.
 
@@ -511,6 +511,117 @@ unreached `min_complete` is unreachable for ever. The general lesson is that
 "nothing can arrive" is a statement about `inflight` alone; bringing `len` into
 it turns a short count into a hang.
 
+### What ten minutes of hostile userspace actually proves
+
+Eight million SQEs consumed across two million `ENTER` calls, from eight threads
+on one ring, with faulting submission and completion buffers, malformed ioctl
+numbers, rival `SETUP`s and `mmap`s, `munmap` under in-flight work, `SIGUSR1`
+storms to force `-EINTR`, and a stream of forked children taking `SIGKILL` at
+random points. Zero kernel
+messages, no kmemleak objects, a clean `rmmod`, and taint exactly
+`TAINT_OOT_MODULE`.
+
+The load-bearing assertion is C1: consumed SQEs equalled reaped CQEs exactly,
+every time. That is the invariant the whole ABI rests on, and the one a
+userspace binding cannot recover from if it is ever false.
+
+Every opcode both succeeded and failed, which is the part worth checking before
+believing any of it. The counts are wildly uneven: `NOP`, `DELAY_NS` and
+`CHECKSUM` succeed hundreds of thousands of times, while `OPEN` manages about a
+thousand and `READ` a couple of hundred. The handle table saturates and stays
+saturated, so most `OPEN`s answer `-EMFILE` and most `READ`s never get a live
+handle. Those paths are genuinely exercised, but by hundreds of operations
+rather than millions, and a shorter run gives a better ratio than a longer one.
+
+**A legitimate long delay is a self-inflicted denial of service**, and the
+fuzzer found it by hanging. `DELAY_NS` at the cap is accepted and then holds a
+CQ reservation for an hour; a few thousand of those fill the queue and every
+later submit returns a short count, while any `ENTER` waiting with no timeout
+blocks until one fires. The cap bounds it and `release` clears it at `close`,
+but inside a live ring it is still reachable. So the random phase now probes
+only the *rejected* side of the cap, and the accepted side is covered once in
+the deterministic phase, where it is cancelled immediately. A fuzzer must not
+generate workloads that brick the thing it is fuzzing.
+
+### What the fuzz changed before it ran
+
+Surveying the module against a hostile-input checklist turned up four things
+that were not crashes, and all four were fixed rather than recorded.
+
+**`release` now cancels whatever is still queued.** A queued `DELAY_NS` used to
+survive `close(fd)`, holding a module reference and the ring with it, and since
+`off` was an unbounded nanosecond count, roughly 49 days was reachable. Any
+process able to open the device could block `rmmod` indefinitely. `release`
+walks the pending registry under its lock, cancels, and adopts the orphaned
+reference for each cancel that succeeds; the registry vector is then swapped out
+and dropped outside the lock, which is where the `fput`s and `module_put`s
+happen. No completions are posted: the ring is being destroyed and no ioctl can
+be in progress, because the VFS holds a reference for the duration of one.
+
+**This inverted a T6 assertion.** `t6-donetest.sh` asserted that `rmmod` was
+refused with work pending after the fd closed. It now asserts the opposite, and
+checks the timing: `rmmod` must succeed within a second or two, because taking
+five seconds would mean the delays were waited out rather than cancelled. That
+is a stronger property than the one it replaced. `rmmod` with an fd still open
+stays refused.
+
+The other three: `cq_space` is now bounded by `cq_entries`, where it was
+unbounded and `0xffffffff` sized a 137 GB `UserSlice`; `DELAY_NS` is capped by a
+new `max_delay_ns`, carved out of `reserved[2]` the way T9 carved
+`handle_count`; and the ioctl **direction** bits are checked, where dispatch
+previously used only type, number and size, so a read-only encoding of `SETUP`
+was accepted.
+
+### A fuzzer's oracle is the hard part, not its randomness
+
+The first version checked that every `res` was in its opcode's allowed set, that
+every CQE had zero `flags`, `rsvd0` and `extra`, and that consumed SQEs equalled
+reaped CQEs. Deleting the `rsvd0` rejection from `dispatch` did not fail it: the
+op simply executed and succeeded, and success is in the allowed set. **A
+value-range oracle cannot see a check that was removed.** The extensibility
+rules are exactly the ones randomness is worst at, so they are now asserted
+directly, in a deterministic phase that runs before the random one: for every
+opcode, a non-zero `rsvd0` and an unknown flag bit must both be `-EINVAL`.
+
+**Coverage counters mattered more than the assertions.** Printing per-opcode
+completed-versus-succeeded totals showed `OPEN` succeeding 26 times in 7,192 and
+`READ` 12 times in 6,187 — the fuzz was passing while barely touching the paths
+it existed to test. Four separate causes, each invisible without the counters:
+the path length did not match the path written, so half of all `OPEN`s tripped
+the embedded-NUL rejection; eight threads shared one arena slot, so one thread's
+`put_path` zeroed another's path mid-flight; the handle table filled and stayed
+full because nothing tracked live handles to close; and the chaos thread was
+reaping completions into its own buffer, swallowing `OPEN` handles that were
+then orphaned. A fuzzer that reports no coverage is indistinguishable from one
+that is not running.
+
+### The slot bitmap is a live audit item
+
+`RingState::slot_try_acquire` indexes `slot_busy` with no bounds check of its
+own. That is sound today because every caller validates `slot < slot_count`
+first, but it is one forgotten check away from being reachable. Deleting
+`READ`'s slot check and issuing a single read with a large slot gives:
+
+```
+rust_kernel: panicked at koru.rs:184:26:
+index out of bounds: the len is 1 but the index is 16384
+kernel BUG at rust/helpers/bug.c:7!
+Oops: invalid opcode: 0000 [#1] SMP KASAN NOPTI
+```
+
+Single-threaded, the panic kills the calling task with `SIGSEGV`. Under the
+fuzzer's eight threads it wedges the guest outright, with no console output,
+because the panic is taken while holding the ring spinlock. So the fuzzer does
+catch it — but only as a dead machine, not a diagnosis. **Any new opcode that
+calls `slot_try_acquire` must validate the slot first**, and making the bitmap
+bounds-check itself would turn that class of mistake from an Oops into a failed
+operation.
+
+Note also that the bitmap is a whole number of 64-bit words, so with a small
+`slot_count` there are spare bits: `slot_count + 1` stays in bounds and hides a
+missing check. Probing past the word boundary is what makes the hole visible,
+which is why the fuzzer generates slots past 64 and near `u32::MAX`.
+
 ### The done tests were only advisory
 
 The dmesg check at the end of every done-test script printed splats without
@@ -643,9 +754,10 @@ common logic across them.
   non-blocking and fails fast on a non-zero count. The real fix is upstream:
   `MiscDeviceOptions` has no way to set `fops.owner`.
 - **Cancellation is real up to the point of execution, and nothing beyond.** A
-  queued or timer-armed op is genuinely dequeued. An op a worker has already
-  picked up cannot be stopped — there is no equivalent of io_uring setting
-  `TIF_NOTIFY_SIGNAL` on a blocked worker — and `CANCEL` returns `-EALREADY`.
+  queued or timer-armed op is genuinely dequeued, by `CANCEL` or by `release`.
+  An op a worker has already picked up cannot be stopped — there is no
+  equivalent of io_uring setting `TIF_NOTIFY_SIGNAL` on a blocked worker — and
+  `CANCEL` returns `-EALREADY`.
   The `cancel_requested: AtomicBool` this note used to propose is gone:
   `cancel_delayed_work` already handles every case the flag would have, and two
   mechanisms for one job is worse than one.
@@ -669,6 +781,9 @@ common logic across them.
   not block. The file-type restriction does not close this: `filp_open` on a
   FIFO blocks *before* we ever see the file, so the check cannot run. Closing it
   properly means passing `O_NONBLOCK`, which changes what a later `READ` does.
+- **The arena is per fd and unaccounted**, so N open fds is N × the arena cap of
+  unreclaimable memory. The device node is `0600 root:root`, which is the only
+  thing bounding it.
 - **Handles are per-ring**, so two rings in one process cannot share an open
   file. Nothing needs it yet.
 
