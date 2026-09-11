@@ -57,26 +57,42 @@ Use-after-free isn't prevented here. It's unrepresentable.
 
 ## What it looks like
 
+The userspace API is [Braam](https://github.com/braamix/core)'s. Braam is a
+browser-hosted operating system whose programs are wasm modules with no libc and
+no stack switching, so its syscalls are a submit import plus a completion export
+and every blocking call is a C++20 coroutine. Different substrate, the same
+structural bet — and unlike a freshly invented API, that one already has more
+than fifty programs written against it.
+
 Rust:
 
 ```rust
-let h = ring.open("/etc/hostname").await?;
-let (n, buf) = ring.read(h, buf).await?;   // buf moves in, comes back out
-println!("{}", str::from_utf8(&buf[..n])?);
-ring.close(h).await?;
+let h = open_read("/etc/hostname").await?;
+let text = read_chunk(h).await?;
+write_all(STDOUT, &text).await?;
+close_fd(h).await;
 ```
 
 C++20:
 
 ```cpp
-auto h = co_await ring.open("/etc/hostname");
-auto [n, buf] = co_await ring.read(h, std::move(buf));
-std::cout << std::string_view{buf.data(), n};
-co_await ring.close(h);
+auto h    = CO_TRY(co_await open_read("/etc/hostname"));
+auto text = CO_TRY(co_await read_chunk(h));
+co_await write_all(STDOUT, text);
+co_await close_fd(h);
 ```
 
-Same ABI underneath, no kernel code in common with either binding. C++20
-coroutines actually fit it slightly better than Rust futures: they're
+Same ABI underneath, no code in common between the two bindings. The slot index
+does not appear here: at this layer a read returns bytes you own, and the
+binding does the copy. The point is that the *kernel* never saw a pointer, and
+that stays true no matter what the surface looks like.
+
+It also buys something back. `write_all` borrows its buffer across the
+suspension, which on raw io_uring is unsound in Rust and is the whole reason
+owned-buffer runtimes exist. Here the bytes are copied into a slot before the
+operation is submitted, so the borrow ends before the await begins.
+
+C++20 coroutines fit the ring slightly better than Rust futures: they're
 continuation-based, so a completion resumes a handle directly with no polling
 and no `Waker`.
 
@@ -88,7 +104,8 @@ and no `Waker`.
   the only entry point.
 - **The `mmap`'d arena** — fixed-size slots in kernel-owned pages. This is the
   data plane.
-- **`user/koru`** — the Rust binding: `Future` impls plus an executor.
+- **`user/koru-sys`, `user/koru`** — the Rust binding: ABI structs and ioctl
+  wrappers, then `Future` impls, an executor and the Braam surface.
 - **`user/cpp`** — the C++20 binding: awaiters, `task<T>` and an executor.
 
 The coroutines are entirely in userspace. Kernel Rust has no async runtime, so
@@ -98,8 +115,22 @@ makes with `io-wq`.
 ## Status
 
 **The kernel module works; the bindings are not written yet.** It registers
-`/dev/koru`, configures a ring, and runs `NOP`, `DELAY_NS` and `CHECKSUM`
-through `ENTER`, with the arena mapped and slot exclusivity enforced.
+`/dev/koru` and runs `NOP`, `DELAY_NS`, `CHECKSUM`, `OPEN`, `READ`, `CLOSE` and
+`CANCEL` through `ENTER`. The arena is mapped and slot exclusivity is enforced
+by the kernel, open files live in a generational handle table, a queued
+operation can be genuinely dequeued, and closing the ring cancels whatever is
+still queued. The whole validation surface has been fuzzed for ten minutes under
+KASAN, lockdep and kmemleak with no kernel messages.
+
+One binary, `test/koru_check`, is the entire test suite for the module.
+`scripts/run.sh` boots a VM, runs it and prints one verdict line in about half a
+minute.
+
+Next is userspace, and the Braam decision reopens the kernel for one phase:
+there is no `WRITE` opcode yet, and `OPEN` refuses anything but regular files
+and directories on purpose, because a blocking read in a worker thread cannot be
+interrupted. So today a koru program cannot write to a terminal or a pipe at
+all, which the target API rather depends on.
 
 [doc/Notes.md](doc/Notes.md) has the design and the reasoning behind it.
 [doc/Plan.md](doc/Plan.md) has the remaining tasks, each with a test.
