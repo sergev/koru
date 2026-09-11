@@ -86,7 +86,7 @@ not composition of safe abstractions. Budget accordingly.
 
 Since `ENTER` is the only entry point, a shared SQ would save zero syscalls. A
 shared CQ would save syscalls on reaping — a real but deferrable optimization
-(T22).
+(T43).
 
 ### The central invariant
 
@@ -786,7 +786,7 @@ unmapped descriptor, and the credentials test maps after forking.
 ### `koru_abi.h` split out
 
 The ABI mirror moved out of `test/koru_test.h` into `test/koru_abi.h` on its
-own. T16 creates `user/cpp/include/koru_abi.h` with exactly that content, so it
+own. T14 creates `user/cpp/include/koru_abi.h` with exactly that content, so it
 becomes an include swap rather than surgery inside a header that also carries
 harness declarations, and the "change it in one place" rule now points at a file
 containing only the mirror.
@@ -882,11 +882,11 @@ mid-flight" and gets the same treatment:
 - **Symmetric transfer is mandatory.** `final_suspend()` must return an awaiter
   whose `await_suspend` *returns* the continuation handle rather than calling
   `.resume()` on it. Without it, a chain of N awaits consumes N stack frames.
-  T19's done test is exactly this.
+  T35's done test is exactly this.
 - **`await_suspend` must not touch `this` after publishing the handle.** Once
   the handle is visible to the reactor, the coroutine may already have been
   resumed and its frame destroyed. Harmless under the single-threaded executor,
-  fatal the moment a waiter thread appears (T23) — so write the rule down now,
+  fatal the moment a waiter thread appears (T44) — so write the rule down now,
   not then.
 - **No `std::expected` in C++20** (that is C++23). Define `koru::result<T>`
   holding either a value or an `errno`. Errors travel as values: an exception
@@ -967,7 +967,7 @@ arrive with their tasks.
 - `user/koru/src/lib.rs` — op slab, `OpState` owning `BufSlot`, `Future` impls,
   executor.
 - `user/cpp/include/koru_abi.h` — the C mirror of `koru_abi.rs`, kept
-  byte-identical by the T16 conformance test.
+  byte-identical by the T14 conformance test.
 - `user/cpp/include/koru.hpp` — `Ring`, `BufPool`, move-only `BufSlot`,
   `result<T>`.
 - `user/cpp/include/koru/task.hpp` — `task<T>` promise type, symmetric transfer,
@@ -977,10 +977,10 @@ arrive with their tasks.
 - `user/cpp/examples/read_file.cpp` — the C++20 demo.
 
 `test/` holds interim C programs, one per task, plus a shared harness. They are
-scaffolding: the real suites are the Rust one at T13 and the C++ one at T17. The
+scaffolding: the real suites are the Rust one at T13 and the C++ one at T33. The
 harness header's first section is a hand-written mirror of `kernel/koru_abi.rs`,
 so a change there means a matching change in that one place, and its
-`_Static_assert`s are what catch you forgetting. T16 deletes that section in
+`_Static_assert`s are what catch you forgetting. T14 deletes that section in
 favour of the real `user/cpp/include/koru_abi.h`.
 
 ## Why the tasks are ordered this way

@@ -110,9 +110,9 @@ KORU_SEED=12345 scripts/run.sh    # replay a fuzz failure
 shared ring, one process, plus the two `rmmod` races that need a second one.
 `test/koru_abi.h` is a hand-written mirror of `kernel/koru_abi.rs`, so **a
 change there means a matching change in that one place**, and its
-`_Static_assert`s are what catch you forgetting. T16 replaces that file with the
+`_Static_assert`s are what catch you forgetting. T14 replaces that file with the
 real `user/cpp/include/koru_abi.h`. The binding suites come later: Rust at T13,
-C++ at T17.
+C++ at T33.
 
 **Section order in `koru_check` is load-bearing.** Everything that allocates in
 bulk runs first and is marked `heavy` in the table in `koru_check.c`; the binary
@@ -327,7 +327,7 @@ and citations.
   (`read_raw`, `write_raw`) are `memcpy` with a documented "no concurrent
   access" precondition that a ring shared with untrusted userspace violates by
   definition, and there is no way to place an `Atomic<u32>` over a shared word.
-  This is why the control plane is an ioctl. Revisiting it is T22, and it
+  This is why the control plane is an ioctl. Revisiting it is T43, and it
   requires solving that problem first.
 - **Do not defer `OPEN` to a workqueue.** In a kworker, `current_cred()` is
   `&init_cred` and `current->fs` is the init root, so `filp_open` would resolve
@@ -349,7 +349,7 @@ wrappers.
 ## Cross-language ABI
 
 `kernel/koru_abi.rs` is canonical; `user/cpp/include/koru_abi.h` mirrors it.
-They are kept identical by a conformance test (T16) that diffs an `abi_dump`
+They are kept identical by a conformance test (T14) that diffs an `abi_dump`
 emitted by each side. When you touch either file, run that diff — and confirm
 the test actually fails when you perturb a field, or it proves nothing.
 
