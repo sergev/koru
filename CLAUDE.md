@@ -23,9 +23,9 @@ from here is userspace.
 - `kernel/` — the out-of-tree Rust module. `koru_abi.rs` is the canonical wire
   format; `koru.rs` holds the device, the ring state and the `ENTER` path, and
   `koru_ops.rs` holds opcode dispatch, the op implementations and `OpWork`.
-- `test/` — interim C tests, one per task. See Commands.
-- `donetest/` — the per-task done tests, which run inside the VM, plus the
-  host-side runner and the dev kernel's config fragment. It has its own README.
+- `test/` — `koru_check`, the one integrated test for the module. See Commands.
+- `scripts/` — the guest-side check and the host-side runner that boots the VM,
+  plus the dev kernel's config fragment. It has its own README.
 
 Work proceeds in plan order. Task numbers are referenced across all three
 documents; if you renumber, fix the cross-references.
@@ -64,9 +64,8 @@ T0 is done. The dev kernel lives outside this repo at `../kernel-dev/`:
   built against it.
 
 Only the tree lives there. The config fragment that built it is
-`donetest/koru-debug.config`, and the done tests are `donetest/`, both under
-version control: an earlier copy outside the repo drifted unnoticed for four
-commits after a rename.
+`scripts/koru-debug.config`, under version control with the scripts: an earlier
+copy outside the repo drifted unnoticed for four commits after a rename.
 
 The base config comes from `vng --kconfig`, so it is a small VM-only kernel; a
 full build takes about 9 minutes and the tree is ~5.4 GB. After any config
@@ -98,21 +97,28 @@ make -C $KDIR M=$PWD LLVM=1
 # guest. Drop --exec for an interactive shell.
 vng --run $KDIR --user root --memory 4G --cpus 4 --exec "<command>"
 
-# Done tests. One verdict line per task; no arguments runs all of them.
-donetest/run.sh
-donetest/run.sh 9 10 11          # just those
-DT_ARGS="30 999" donetest/run.sh 12   # a short fuzz while iterating
-
-# Interim userspace tests, built on the host and run in the guest.
+# The test binary, built on the host and run in the guest.
 make -C test
+
+# The whole check: one VM boot, about 27 seconds, one verdict line.
+scripts/run.sh
+scripts/run.sh open read cancel   # just those sections
+KORU_SEED=12345 scripts/run.sh    # replay a fuzz failure
 ```
 
-`test/` holds a small C program per task plus a shared harness in `koru_test.h`
-and `koru_test.c`. It is scaffolding: the real suites are the Rust one at T13
-and the C++ one at T17. The header's first section is a hand-written mirror of
-`kernel/koru_abi.rs`, so **a change there means a matching change in that one
-place**, and its `_Static_assert`s are what catch you forgetting. T16 deletes
-that section in favour of including the real `user/cpp/include/koru_abi.h`.
+`test/koru_check` is the entire test suite for the module: one binary, one
+shared ring, one process, plus the two `rmmod` races that need a second one.
+`test/koru_abi.h` is a hand-written mirror of `kernel/koru_abi.rs`, so **a
+change there means a matching change in that one place**, and its
+`_Static_assert`s are what catch you forgetting. T16 replaces that file with the
+real `user/cpp/include/koru_abi.h`. The binding suites come later: Rust at T13,
+C++ at T17.
+
+**Section order in `koru_check` is load-bearing.** Everything that allocates in
+bulk runs first and is marked `heavy` in the table in `koru_check.c`; the binary
+stamps `KORU-HEAVY-END-MS` and the script sleeps only the shortfall below
+kmemleak's five-second minimum object age. A bulk-allocating loop added to the
+tail is invisible to the one leak scan, and nothing will say so.
 
 `ENTER` must never touch a `UserSlice` while holding the ring `SpinLock`:
 `copy_*_user` can fault and therefore sleep. The submit and reap loops are
@@ -168,7 +174,7 @@ whose `f_op` has `read` set or `read_iter` unset, which is what keeps
 **`release` cancels queued work**, so `close(fd)` frees the ring instead of
 leaving it pinned for the length of the longest delay. It uses the same refcount
 rule as `CANCEL` and posts no completions, because nothing can still be reading
-the CQ. T6's done test asserts the timing, not just the outcome.
+the CQ. The check asserts the timing, not just the outcome.
 
 **`slot_try_acquire` does not bounds-check its own index.** Every caller must
 validate `slot < slot_count` first; forgetting it is a Rust bounds panic and a
@@ -186,7 +192,9 @@ were demonstrated by breaking them.
 In-flight deferred ops live in `RingCtx::pending`, a `Mutex<KVec<Arc<OpWork>>>`.
 That is a reference cycle broken by unregistering on every completion path, and
 `run()` unregisters **after** `complete()` so a cancel during execution reports
-`-EALREADY` rather than `-ENOENT`.
+`-EALREADY` rather than `-ENOENT`. That window is narrow but real: the check's
+64 KB whole-slot `CHECKSUM` reaches it one to three times per thousand rounds,
+which is what makes the cancel refcount rule testable in both directions.
 
 **A deferred op owns everything it needs**, resolved at submit time: the `Sqe`
 by value, an `Arc<RingCtx>`, and an `ARef<File>`. Never an index into a table
@@ -221,15 +229,16 @@ A test that can hang must arm an alarm and be line-buffered. `_exit` from the
 handler drops a full stdout buffer, which turns a diagnosable hang into a silent
 one.
 
-**A done test must fail on a kernel splat, not just print it.** `dt_splat` in
-`donetest/common.sh` captures the dmesg grep and the verdict gates on it being
-empty. T10's lockdep deadlock first reported `PASS` with the cycle printed right
-above the pass line, because the check was advisory. The pattern also matches
-`not supported for file`, a `pr_warn_ratelimited` rather than a `WARN_ON`.
+**The check must fail on a kernel splat, not just print it.** The dmesg scan in
+`scripts/check.sh` captures its grep into a variable and the verdict gates on
+that being empty. T10's lockdep deadlock first reported `PASS` with the cycle
+printed right above the pass line, because the check was advisory. The pattern
+also matches `not supported for file`, a `pr_warn_ratelimited` rather than a
+`WARN_ON`. It excludes the script's own `/dev/kmsg` fences, which otherwise
+match their own pattern.
 
-The shared parts of every done test live in `donetest/common.sh`, so that rule
-and the kmemleak sleep are written once. Keep that file small: a bug in it
-weakens all thirteen pass conditions at once.
+`scripts/check.sh` carries every pass condition there is. Keep it small and
+obvious: a bug in it weakens the whole verdict at once.
 
 Assert the exact errno, never just that a call failed. The T3 dispatcher
 returned `EPROTO` where it owed `ENOTTY`, and only an exact-errno assertion
@@ -238,12 +247,14 @@ corresponding kernel check and watching that one test, and only that one, fail.
 
 **kmemleak reports nothing about an object younger than five seconds**
 (`MSECS_MIN_AGE` in `mm/kmemleak.c`). Scanning right after a test loop reports a
-clean result no matter how badly the code leaks. Every leak check must sleep
-past that age first; `t2-donetest.sh` sleeps 8 seconds, then scans twice,
-because the first pass after heavy allocation is not settled. This was caught by
-deliberately leaking an `Arc` per open and finding the check silent, so treat
-any new leak test as untrustworthy until it has been shown to fail on a real
-leak.
+clean result no matter how badly the code leaks. `koru_check` runs its
+bulk-allocating sections first and stamps the time; `scripts/check.sh` measures
+the age of that stamp and sleeps only the shortfall, then scans twice, because
+the first pass after heavy allocation is not settled. Treat any new leak test as
+untrustworthy until it has been shown to fail on a real leak: an `Arc` leaked
+per open is invisible here, because our own table still references the file.
+Use `/proc/sys/fs/file-nr` for that, and an unreachable allocation to test the
+scan itself.
 
 Expected taint with the module loaded is exactly 4096, `TAINT_OOT_MODULE`.
 Module signing is off in this kernel, so bit 13 must never appear; anything

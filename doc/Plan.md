@@ -146,27 +146,23 @@ theoretical.
 Every task above gates on its own done test. The overall end-to-end sequence,
 once everything lands:
 
-1. `make -C <kernel-tree> M=$PWD LLVM=1 && insmod koru.ko`
+1. `make -C test && scripts/run.sh` — the kernel module's own check, in a VM.
+   This already covers the ten-minute items the earlier version of this list
+   spelled out separately: the fuzz, the kmemleak scan past its minimum object
+   age, the unprivileged creds case, and a clean `rmmod`.
 2. `cargo test -p koru-sys` — ABI round-trip and per-opcode integration tests
    (T13).
 3. `cargo run --example read_file` — the T14 demo: opens and reads a real file
    through coroutines while timers complete out of order.
-4. `cargo run --example fuzz --release` for ten minutes (T12), with `dmesg -w`
-   in another terminal. Zero kernel messages is the pass condition.
-5. `cmake -B build -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined"`, then
+4. `cmake -B build -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined"`, then
    `cmake --build build`.
-6. `diff <(./build/abi_dump) <(cargo run -q --bin abi_dump)` — empty (T16).
-7. `ctest --test-dir build` — the C++ test matrix (T17), abandonment path
+5. `diff <(./build/abi_dump) <(cargo run -q --bin abi_dump)` — empty (T16).
+6. `ctest --test-dir build` — the C++ test matrix (T17), abandonment path
    (T18), symmetric transfer (T19) and drop-safety loop (T21), all under ASan
    and UBSan.
-8. `./build/examples/read_file` — the C++20 demo (T20). Output must match step
+7. `./build/examples/read_file` — the C++20 demo (T20). Output must match step
    3 byte for byte.
-9. Run steps 3 and 8 **concurrently** (T21). Both must still be correct.
-10. `echo scan > /sys/kernel/debug/kmemleak; cat /sys/kernel/debug/kmemleak` —
-    empty. Sleep past kmemleak's five-second minimum age first, or the scan is
-    meaningless.
-11. The unprivileged-user creds test from T9 — must fail `-EACCES`.
-12. `rmmod koru` cleanly at the end.
+8. Run steps 3 and 7 **concurrently** (T21). Both must still be correct.
 
 The dev kernel must have KASAN, `PROVE_LOCKING` and `DEBUG_KMEMLEAK` on from day
 one; they pay for themselves in the first week.

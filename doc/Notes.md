@@ -382,7 +382,7 @@ no-concurrent-access precondition forbids. Deleting the claim makes the test's
 `release()` drains the table explicitly rather than letting the `Arc` drop do
 it. That is not belt-and-braces: an in-flight `OpWork` holds its own
 `Arc<RingCtx>`, so with a two-second `DELAY_NS` queued, dropping the `Arc` frees
-nothing and the open files survive for those two seconds. The done test queues
+nothing and the open files survive for those two seconds. The check queues
 exactly that delay and watches the count fall at `close`, not later.
 
 **kmemleak cannot see a leaked handle**, and this was confirmed by deliberately
@@ -489,13 +489,20 @@ removing the entry on every completion path. `run()` removes its entry **after**
 calling `complete()`, not before, which is what makes a cancel arriving during
 execution report `-EALREADY` rather than `-ENOENT`.
 
-**`-EALREADY` is reachable by construction but was never observed** in 9,000
+**`-EALREADY` is reachable, and is now reached.** It went unobserved in 9,000
 attempts across three race loops, including one against a `CHECKSUM` over a
-whole slot, the longest-running op there is. The window is the span between the
-worker clearing the pending bit and `run()` unregistering; a cancel either
-arrives while the op is still queued, or after it has fully completed. So the
-unregister-after-complete ordering is reasoned, not tested. Treat it as
-unverified until something exercises it.
+whole slot, which was the longest-running op there was. The window is the span
+between the worker clearing the pending bit and `run()` unregistering; a cancel
+otherwise either arrives while the op is still queued, or after it has fully
+completed.
+
+What changed is the slot size. The integrated check's shared ring uses 64 KB
+slots rather than 4 KB, so a whole-slot `CHECKSUM` runs sixteen times longer and
+the window opens wide enough to hit: one to three times per thousand rounds,
+reliably enough that a thousand rounds find it on essentially every run. The
+unregister-after-complete ordering is therefore tested rather than merely
+reasoned, and so is the half of the refcount rule that depends on it. See the
+consolidation section below for the breakage that confirms it.
 
 ### `ENTER` could still sleep forever
 
@@ -558,7 +565,7 @@ and dropped outside the lock, which is where the `fput`s and `module_put`s
 happen. No completions are posted: the ring is being destroyed and no ioctl can
 be in progress, because the VFS holds a reference for the duration of one.
 
-**This inverted a T6 assertion.** T6's done test asserted that `rmmod` was
+**This inverted a T6 assertion.** T6 had asserted that `rmmod` was
 refused with work pending after the fd closed. It now asserts the opposite, and
 checks the timing: `rmmod` must succeed within a second or two, because taking
 five seconds would mean the delays were waited out rather than cancelled. That
@@ -622,33 +629,33 @@ Note also that the bitmap is a whole number of 64-bit words, so with a small
 missing check. Probing past the word boundary is what makes the hole visible,
 which is why the fuzzer generates slots past 64 and near `u32::MAX`.
 
-### The done tests live in the repo now
+### The tests live in the repo now
 
 They used to sit next to the kernel tree, outside version control, which is how
 all thirteen came to reference a path that no longer existed after the project
 was renamed and stayed broken for four commits with nobody noticing. They are
-`donetest/` now, they derive the repo root from their own location, and the
-boilerplate they all shared is one `common.sh`. `donetest/README.md` explains
-each one.
+under version control now and derive the repo root from their own location. A
+directory rename is exactly the event that punishes an absolute path, and this
+project has now been renamed twice.
 
-Neighbouring scripts had differed in six lines out of fifty-four, and that tail
-had already needed three separate fix-everywhere edits.
+### The tests were only advisory
 
-### The done tests were only advisory
-
-The dmesg check at the end of every done-test script printed splats without
-failing the run. T10's lockdep deadlock therefore reported `PASS` on its first
-green run, with the cycle sitting in the output above the pass line. Every
-script now captures that grep into a variable and gates the pass on it being
-empty, and the pattern list includes `kernel read not supported for file`,
-which is a `pr_warn_ratelimited` rather than a `WARN_ON` and so matched nothing
-before.
+The dmesg check at the end of every script printed splats without failing the
+run. T10's lockdep deadlock therefore reported `PASS` on its first green run,
+with the cycle sitting in the output above the pass line. The check now captures
+that grep into a variable and gates the pass on it being empty, and the pattern
+list includes `kernel read not supported for file`, which is a
+`pr_warn_ratelimited` rather than a `WARN_ON` and so matched nothing before.
 
 The lesson generalises past this bug: an assertion suite that passes proves the
 code does what the test expects, and says nothing about what the kernel thinks
 of it. On a debug kernel the kernel's own opinion has to be a hard gate.
 
-### How a done test earns trust
+The fences the script writes to `/dev/kmsg`, so a splat localises to a phase,
+have to be excluded from that grep. Naming one of them after the section it
+introduces made the scan match its own marker and fail every run.
+
+### How a check earns trust
 
 Assert the exact errno, never just that a call failed. The T3 dispatcher
 returned `EPROTO` where it owed `ENOTTY`, and only an exact-errno assertion
@@ -662,6 +669,149 @@ evidence.
 A test that can hang must arm an alarm and be line-buffered. `_exit` from the
 handler drops a full stdout buffer, which turns a diagnosable hang into a silent
 one.
+
+## One integrated check instead of thirteen
+
+The kernel side is finished, so the suite's job changed. It is no longer
+thirteen gates each proving one task complete; it is one dependency check that
+has to run constantly while the userspace bindings are written. Thirteen cold VM
+boots, an eight-second kmemleak sleep in nearly every script, and a ten-minute
+default fuzz came to about twelve minutes, which is not a thing anyone runs in a
+development loop.
+
+It is now `test/koru_check`, one binary run by `scripts/check.sh` in one boot,
+in about twenty-seven seconds. Almost every assertion survived. What was
+wasteful was the scheduling, not the coverage.
+
+### The ordering is the budget
+
+kmemleak reports nothing about an object younger than `MSECS_MIN_AGE`, five
+seconds, so the old scripts each paid a flat `sleep 8`. Paying that once is
+still eight seconds of a twenty-seven second run, and paying it eleven times was
+most of the old cost.
+
+Instead the binary runs everything that allocates in bulk first, stamps
+`KORU-HEAVY-END-MS` as its last line, and the script measures the age of that
+stamp and sleeps only the shortfall below five and a half seconds. The tail
+sections and the shell-driven `rmmod` races cover about four and a half seconds
+of that window for free, because they were going to take that long anyway.
+
+This makes the section ordering load-bearing in a way nothing else in the repo
+is. **A new loop that allocates in bulk must go in the heavy phase.** Put one in
+the tail and the single scan cannot see what it leaks, and nothing will say so.
+The measured window is printed on every run so that a drift is visible rather
+than silent.
+
+The whole budget rests on that scan still working, so it was verified directly:
+an unreachable 128-byte allocation per `OPEN` produces a wall of `unreferenced
+object` reports and fails the run. Without that check the reordering would be an
+untested optimisation of the one thing the suite is worst at seeing.
+
+### Widen the window rather than repeat the roll
+
+The race loops went from three thousand iterations to three or four hundred. The
+compensation is that the shared ring uses 64 KB slots rather than 4 KB, so a
+deferred `READ` or `CHECKSUM` over a whole slot runs sixteen times longer and
+the interesting interleaving becomes the common case instead of a rare one.
+
+Each loop then gates on having actually reached its arm, which none of the old
+loops did. Measured on the dev kernel, with the gates set well below:
+
+- `CLOSE` completes before the in-flight `READ` in 396 of 400 rounds; gate 350.
+- Against an armed timer the cancel wins 300 of 300; gate 250.
+- With `delay_ns` 0 the worker wins 284 of 300; gate 50.
+- Against a whole-slot `CHECKSUM`, out of a thousand rounds, roughly 800
+  cancelled and 180 already done; gates 150 and 20.
+
+A loop that stops reaching its window now fails instead of passing silently.
+That is coverage the three-thousand-iteration versions did not have, and it is
+what the reduced counts were traded for.
+
+**`-EALREADY` is reported, not gated, but it is now reached.** One to three
+rounds per thousand, which is too few to gate on and quite enough to test with.
+That is why the `CHECKSUM` cancel loop is a thousand rounds while the others are
+three hundred: at three hundred it found the window in only two runs out of
+three, and the whole point of the loop is to reach it.
+
+Both halves of the refcount rule are consequently verified, which is new.
+Skipping the drop the cancel owes on a true return leaks 788 objects and wedges
+`rmmod` for the full retry loop, tripping the kmemleak gate and the
+release-timing gate. Dropping it on a false return is an immediate
+use-after-free that KASAN reports through the dmesg gate, in four runs out of
+four — and in only two out of three before the loop was lengthened, in exactly
+the runs that reached the window.
+
+### What the short fuzz costs
+
+Three fixed seconds instead of ten minutes: roughly 35,000 submissions instead
+of eight million. Interleavings that need millions of rolls will not reproduce,
+and that is a real loss with no compensation. `KORU_SEED` replays a failure but
+there is deliberately no duration knob, because a knob invites a slow default.
+
+Two things had to change to survive the shorter run. The coverage gate demanded
+that every opcode *succeed* at least once; at three seconds `READ` succeeds
+about a hundred times rather than two hundred, and at the original handle-table
+size it succeeded twenty-six times, which would eventually flake. The gate is
+now that every opcode *completes* at least once, with the per-opcode success
+claim carried by the deterministic sections, which cover all seven of them.
+And the handle table went to 128, which turned most of the `EMFILE` wall into
+real opens: 254 successful `OPEN`s and 102 `READ`s in three seconds, against 72
+and 26 before.
+
+### What was dropped outright
+
+Loading the `rust_minimal` sample, because `insmod koru.ko` twelve lines later
+is a strictly stronger test of the same thing. The kmemleak scan taken while the
+module is still loaded, keeping only the post-unload scan that was always the
+authoritative one. And a stale placeholder asserting that an unimplemented
+opcode is `-EINVAL`, which had pointed at `OPEN` since T9 implemented it.
+
+### The shared ring
+
+Most sections share one ring rather than building their own, and `ring_quiesce`
+runs between them and asserts nothing was left in flight, so a section that
+walks away from queued work fails at its own boundary instead of confusing the
+next one. Its first version broke on exactly that: it stopped at the first empty
+reap, which on a busy ring is just the timeout expiring, so it reported zero
+while a delay was still running. It now needs three consecutive empty rounds,
+which are free on an idle ring because `min_complete` 1 returns at once when
+`inflight` is zero.
+
+Sections whose geometry is itself the property under test still build their own:
+the `SETUP` rejection matrix needs virgin descriptors because `SETUP` is
+one-shot, slot exclusivity needs eighty slots to span two bitmap words, handle
+exhaustion needs a table of eight, the mmap matrix needs a configured but
+unmapped descriptor, and the credentials test maps after forking.
+
+### `koru_abi.h` split out
+
+The ABI mirror moved out of `test/koru_test.h` into `test/koru_abi.h` on its
+own. T16 creates `user/cpp/include/koru_abi.h` with exactly that content, so it
+becomes an include swap rather than surgery inside a header that also carries
+harness declarations, and the "change it in one place" rule now points at a file
+containing only the mirror.
+
+### What was verified, and how
+
+Four deliberate breakages, each rebuilt and run, because the consolidation
+changes how the suite detects things rather than only how fast it runs:
+
+- An unreachable 128-byte allocation per `OPEN`. The kmemleak gate fires. This
+  is the one the whole time budget depends on.
+- Skipping the reference drop `CANCEL` owes on a true return. 788 unreferenced
+  objects, and `rmmod` wedged for the full retry loop: both gates fire.
+- Dropping that reference on a false return instead. KASAN reports a
+  use-after-free in `refcount_dec_and_test` and the dmesg gate fires.
+- Holding the arena mutex across `kernel_read`. The binary itself passes every
+  assertion and the dmesg scan fails the run on the circular-locking warning,
+  which is precisely why that scan has to gate.
+- `release` no longer cancelling queued work. The two-second `rmmod` assertion
+  fires.
+
+The third of those is the one worth noticing. It passed cleanly at first, and
+the reason was not that the check was weak but that the bug is unreachable until
+the race window is wide enough to enter. A green run against a deliberately
+broken kernel is a statement about coverage, not about correctness.
 
 ## C++20 userspace binding
 

@@ -1,22 +1,26 @@
 # SPDX-License-Identifier: GPL-2.0
 #
-# Interim C test harness for the kernel module. Built on the host, run inside
-# the virtme-ng guest, where this directory is visible at the same path.
+# koru_check: the integrated test. Built on the host, run inside the virtme-ng
+# guest, where this directory is visible at the same path.
 #
-# The real test suites arrive with the bindings: Rust at T13, C++ at T17.
+# The binding test suites arrive later: Rust at T13, C++ at T17.
 
 CFLAGS := -std=c11 -O1 -g -Wall -Wextra -Werror -D_GNU_SOURCE -pthread
+LDLIBS := -pthread
 
-TESTS := t3_setup t4_enter t5_delay t6_teardown t7_arena t8_slots t9_handles t10_read \
-         t11_cancel t12_fuzz
-COMMON := koru_test.c koru_test.h
+SRCS := koru_check.c koru_ops.c koru_race.c koru_fuzz.c koru_test.c
+OBJS := $(SRCS:.c=.o)
+DEPS := koru_abi.h koru_test.h koru_check.h
 
-all: $(TESTS)
+all: koru_check
 
-$(TESTS): %: %.c $(COMMON)
-	$(CC) $(CFLAGS) -o $@ $< koru_test.c
+koru_check: $(OBJS)
+	$(CC) $(CFLAGS) -o $@ $(OBJS) $(LDLIBS)
+
+$(OBJS): %.o: %.c $(DEPS)
+	$(CC) $(CFLAGS) -c -o $@ $<
 
 clean:
-	rm -f $(TESTS)
+	rm -f koru_check $(OBJS)
 
 .PHONY: all clean

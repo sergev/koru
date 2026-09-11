@@ -1,14 +1,17 @@
 // SPDX-License-Identifier: GPL-2.0
 //
-// Shared harness for the interim C tests.
+// Shared harness for koru_check, the integrated test.
 
 #include "koru_test.h"
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -22,8 +25,7 @@ static void alarm_die(int sig)
 
 void test_begin(unsigned alarm_secs)
 {
-    /* _exit from the handler would drop a full buffer, turning a hang into
-     * a hang with no output saying where. */
+    /* _exit from the handler would drop a full buffer. */
     setvbuf(stdout, NULL, _IOLBF, 0);
     if (alarm_secs) {
         signal(SIGALRM, alarm_die);
@@ -67,6 +69,29 @@ void check_res(int64_t got, int64_t want, const char *what)
     }
 }
 
+void check_ge(long long got, long long want, const char *what)
+{
+    if (got >= want) {
+        printf("%-58s PASS\n", what);
+    } else {
+        printf("%-58s FAIL (%lld, want >= %lld)\n", what, got, want);
+        failures++;
+    }
+}
+
+void note(const char *fmt, ...)
+{
+    va_list ap;
+
+    va_start(ap, fmt);
+    printf("    ");
+    vprintf(fmt, ap);
+    printf("\n");
+    va_end(ap);
+}
+
+/* ------------------------------------------------------------------------- */
+
 int open_dev(void)
 {
     int fd = open(KORU_DEV, O_RDWR);
@@ -93,19 +118,17 @@ int setup_ring(int fd, uint32_t sq_entries, uint32_t cq_entries, uint32_t slot_s
     return ioctl(fd, KORU_IOC_SETUP, &p);
 }
 
-int open_ring(uint32_t sq_entries, uint32_t cq_entries, uint32_t slot_size, uint32_t slot_count)
-{
-    return open_ring_handles(sq_entries, cq_entries, slot_size, slot_count, 0);
-}
-
-int open_ring_handles(uint32_t sq_entries, uint32_t cq_entries, uint32_t slot_size,
-                      uint32_t slot_count, uint32_t handle_count)
+int ring_open(struct koru_ring *r, uint32_t sq_entries, uint32_t cq_entries, uint32_t slot_size,
+              uint32_t slot_count, uint32_t handle_count)
 {
     struct koru_params p;
-    int fd = open_dev();
 
-    if (fd < 0)
+    memset(r, 0, sizeof(*r));
+    r->fd = open(KORU_DEV, O_RDWR);
+    if (r->fd < 0) {
+        perror("open " KORU_DEV);
         return -1;
+    }
     memset(&p, 0, sizeof(p));
     p.magic        = KORU_MAGIC;
     p.abi_version  = KORU_ABI_VERSION;
@@ -114,14 +137,74 @@ int open_ring_handles(uint32_t sq_entries, uint32_t cq_entries, uint32_t slot_si
     p.slot_size    = slot_size;
     p.slot_count   = slot_count;
     p.handle_count = handle_count;
-    if (ioctl(fd, KORU_IOC_SETUP, &p) != 0) {
+    if (ioctl(r->fd, KORU_IOC_SETUP, &p) != 0) {
         perror("SETUP");
-        failures++;
-        close(fd);
+        close(r->fd);
+        r->fd = -1;
         return -1;
     }
-    return fd;
+    r->sq_entries   = p.sq_entries;
+    r->cq_entries   = p.cq_entries;
+    r->slot_size    = p.slot_size;
+    r->slot_count   = p.slot_count;
+    r->handle_count = p.handle_count;
+    r->arena_size   = p.arena_size;
+    return 0;
 }
+
+int ring_map(struct koru_ring *r)
+{
+    void *a = mmap(NULL, r->arena_size, PROT_READ | PROT_WRITE, MAP_SHARED, r->fd, 0);
+
+    if (a == MAP_FAILED) {
+        perror("mmap arena");
+        return -1;
+    }
+    r->arena = a;
+    return 0;
+}
+
+void ring_close(struct koru_ring *r)
+{
+    if (r->arena) {
+        munmap(r->arena, r->arena_size);
+        r->arena = NULL;
+    }
+    if (r->fd >= 0) {
+        close(r->fd);
+        r->fd = -1;
+    }
+}
+
+int ring_quiesce(struct koru_ring *r)
+{
+    struct koru_cqe cq[128];
+    struct koru_enter e;
+    unsigned space = r->cq_entries < 128 ? r->cq_entries : 128;
+    int total = 0, spin, idle = 0;
+
+    /* min_complete 1 returns at once on an idle ring, so the idle rounds are
+     * free; on a busy one each costs the timeout, which is what lets a
+     * still-running op land. */
+    for (spin = 0; spin < 64 && idle < 3; spin++) {
+        memset(&e, 0, sizeof(e));
+        e.cq_addr      = (uint64_t)(uintptr_t)cq;
+        e.cq_space     = space;
+        e.min_complete = 1;
+        e.timeout_ns   = 50 * MS;
+        if (ioctl(r->fd, KORU_IOC_ENTER, &e) < 0)
+            break;
+        if (e.completed == 0) {
+            idle++;
+            continue;
+        }
+        idle = 0;
+        total += (int)e.completed;
+    }
+    return total;
+}
+
+/* ------------------------------------------------------------------------- */
 
 void enter_init(struct koru_enter *e, struct koru_sqe *sq, unsigned n, struct koru_cqe *cq,
                 unsigned cq_space)
@@ -157,6 +240,43 @@ int64_t run_one(int fd, struct koru_sqe *s)
         return INT64_MIN;
     return c.res;
 }
+
+const struct koru_cqe *find_cqe(const struct koru_cqe *cq, unsigned n, uint64_t user_data)
+{
+    unsigned i;
+
+    for (i = 0; i < n; i++)
+        if (cq[i].user_data == user_data)
+            return &cq[i];
+    return NULL;
+}
+
+int64_t r_open(struct koru_ring *r, uint32_t slot, const char *path, uint32_t flags)
+{
+    struct koru_sqe s;
+    uint32_t n = put_path(r->arena, r->slot_size, slot, path);
+
+    sqe_open(&s, slot, 0, n, flags, 0x100);
+    return run_one(r->fd, &s);
+}
+
+int64_t r_close(struct koru_ring *r, uint32_t handle)
+{
+    struct koru_sqe s;
+
+    sqe_close(&s, handle, 0x101);
+    return run_one(r->fd, &s);
+}
+
+int64_t r_read(struct koru_ring *r, uint32_t handle, uint32_t slot, uint64_t off, uint32_t len)
+{
+    struct koru_sqe s;
+
+    sqe_read(&s, handle, slot, off, len, 0x102);
+    return run_one(r->fd, &s);
+}
+
+/* ------------------------------------------------------------------------- */
 
 void sqe_nop(struct koru_sqe *s, uint64_t user_data)
 {
@@ -223,6 +343,8 @@ void sqe_cancel(struct koru_sqe *s, uint64_t target, uint64_t user_data)
     s->user_data = user_data;
 }
 
+/* ------------------------------------------------------------------------- */
+
 uint8_t pattern_byte(size_t i)
 {
     return (uint8_t)(i * 31 + (i >> 8) * 7 + 11);
@@ -230,7 +352,7 @@ uint8_t pattern_byte(size_t i)
 
 int make_pattern_file(const char *path, size_t n)
 {
-    uint8_t buf[1024];
+    uint8_t buf[4096];
     size_t done = 0;
     int fd      = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
 
@@ -263,11 +385,53 @@ uint32_t put_path(uint8_t *arena, uint32_t slot_size, uint32_t slot, const char 
     return (uint32_t)n;
 }
 
+long file_nr(void)
+{
+    FILE *f    = fopen("/proc/sys/fs/file-nr", "r");
+    long alloc = -1;
+
+    if (!f)
+        return -1;
+    if (fscanf(f, "%ld", &alloc) != 1)
+        alloc = -1;
+    fclose(f);
+    return alloc;
+}
+
+long file_nr_settled(void)
+{
+    usleep(100000);
+    return file_nr();
+}
+
+int count_fds(void)
+{
+    struct dirent *e;
+    DIR *d = opendir("/proc/self/fd");
+    int n  = 0;
+
+    if (!d)
+        return -1;
+    while ((e = readdir(d)) != NULL)
+        if (e->d_name[0] != '.')
+            n++;
+    closedir(d);
+    return n;
+}
+
 uint64_t now_ms(void)
 {
     struct timespec ts;
 
     clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+uint64_t wall_ms(void)
+{
+    struct timespec ts;
+
+    clock_gettime(CLOCK_REALTIME, &ts);
     return (uint64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
