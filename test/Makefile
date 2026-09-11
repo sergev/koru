@@ -3,7 +3,7 @@
 # koru_check: the integrated test. Built on the host, run inside the virtme-ng
 # guest, where this directory is visible at the same path.
 #
-# The binding test suites arrive later: Rust at T13, C++ at T33.
+# The binding test suites arrive later: Rust at T13, C++ at T39.
 
 CFLAGS := -std=c11 -O1 -g -Wall -Wextra -Werror -D_GNU_SOURCE -pthread
 LDLIBS := -pthread

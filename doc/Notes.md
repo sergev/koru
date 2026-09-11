@@ -86,7 +86,7 @@ not composition of safe abstractions. Budget accordingly.
 
 Since `ENTER` is the only entry point, a shared SQ would save zero syscalls. A
 shared CQ would save syscalls on reaping — a real but deferrable optimization
-(T43).
+(T50).
 
 ### The central invariant
 
@@ -882,11 +882,11 @@ mid-flight" and gets the same treatment:
 - **Symmetric transfer is mandatory.** `final_suspend()` must return an awaiter
   whose `await_suspend` *returns* the continuation handle rather than calling
   `.resume()` on it. Without it, a chain of N awaits consumes N stack frames.
-  T35's done test is exactly this.
+  T41's done test is exactly this.
 - **`await_suspend` must not touch `this` after publishing the handle.** Once
   the handle is visible to the reactor, the coroutine may already have been
   resumed and its frame destroyed. Harmless under the single-threaded executor,
-  fatal the moment a waiter thread appears (T44) — so write the rule down now,
+  fatal the moment a waiter thread appears (T51) — so write the rule down now,
   not then.
 - **No `std::expected` in C++20** (that is C++23). Define `koru::result<T>`
   holding either a value or an `errno`. Errors travel as values: an exception
@@ -977,7 +977,7 @@ arrive with their tasks.
 - `user/cpp/examples/read_file.cpp` — the C++20 demo.
 
 `test/` holds interim C programs, one per task, plus a shared harness. They are
-scaffolding: the real suites are the Rust one at T13 and the C++ one at T33. The
+scaffolding: the real suites are the Rust one at T13 and the C++ one at T39. The
 harness header's first section is a hand-written mirror of `kernel/koru_abi.rs`,
 so a change there means a matching change in that one place, and its
 `_Static_assert`s are what catch you forgetting. T14 deletes that section in

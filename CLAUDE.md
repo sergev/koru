@@ -112,7 +112,7 @@ shared ring, one process, plus the two `rmmod` races that need a second one.
 change there means a matching change in that one place**, and its
 `_Static_assert`s are what catch you forgetting. T14 replaces that file with the
 real `user/cpp/include/koru_abi.h`. The binding suites come later: Rust at T13,
-C++ at T33.
+C++ at T39.
 
 **Section order in `koru_check` is load-bearing.** Everything that allocates in
 bulk runs first and is marked `heavy` in the table in `koru_check.c`; the binary
@@ -327,7 +327,7 @@ and citations.
   (`read_raw`, `write_raw`) are `memcpy` with a documented "no concurrent
   access" precondition that a ring shared with untrusted userspace violates by
   definition, and there is no way to place an `Atomic<u32>` over a shared word.
-  This is why the control plane is an ioctl. Revisiting it is T43, and it
+  This is why the control plane is an ioctl. Revisiting it is T50, and it
   requires solving that problem first.
 - **Do not defer `OPEN` to a workqueue.** In a kworker, `current_cred()` is
   `&init_cred` and `current->fs` is the init root, so `filp_open` would resolve
