@@ -558,7 +558,7 @@ and dropped outside the lock, which is where the `fput`s and `module_put`s
 happen. No completions are posted: the ring is being destroyed and no ioctl can
 be in progress, because the VFS holds a reference for the duration of one.
 
-**This inverted a T6 assertion.** `t6-donetest.sh` asserted that `rmmod` was
+**This inverted a T6 assertion.** T6's done test asserted that `rmmod` was
 refused with work pending after the fd closed. It now asserts the opposite, and
 checks the timing: `rmmod` must succeed within a second or two, because taking
 five seconds would mean the delays were waited out rather than cancelled. That
@@ -621,6 +621,18 @@ Note also that the bitmap is a whole number of 64-bit words, so with a small
 `slot_count` there are spare bits: `slot_count + 1` stays in bounds and hides a
 missing check. Probing past the word boundary is what makes the hole visible,
 which is why the fuzzer generates slots past 64 and near `u32::MAX`.
+
+### The done tests live in the repo now
+
+They used to sit next to the kernel tree, outside version control, which is how
+all thirteen came to reference a path that no longer existed after the project
+was renamed and stayed broken for four commits with nobody noticing. They are
+`donetest/` now, they derive the repo root from their own location, and the
+boilerplate they all shared is one `common.sh`. `donetest/README.md` explains
+each one.
+
+Neighbouring scripts had differed in six lines out of fifty-four, and that tail
+had already needed three separate fix-everywhere edits.
 
 ### The done tests were only advisory
 

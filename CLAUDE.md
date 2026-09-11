@@ -24,6 +24,8 @@ from here is userspace.
   format; `koru.rs` holds the device, the ring state and the `ENTER` path, and
   `koru_ops.rs` holds opcode dispatch, the op implementations and `OpWork`.
 - `test/` — interim C tests, one per task. See Commands.
+- `donetest/` — the per-task done tests, which run inside the VM, plus the
+  host-side runner and the dev kernel's config fragment. It has its own README.
 
 Work proceeds in plan order. Task numbers are referenced across all three
 documents; if you renumber, fix the cross-references.
@@ -60,11 +62,11 @@ T0 is done. The dev kernel lives outside this repo at `../kernel-dev/`:
   tree: `rust/*.rmeta` is only there, and the installed `linux-headers-7.1.12`
   genuinely has no `rust/` directory, so out-of-tree Rust modules cannot be
   built against it.
-- `../kernel-dev/koru-debug.config` — the debug fragment: KASAN
-  generic+inline+vmalloc, `PROVE_LOCKING`, `DEBUG_KMEMLEAK`, `DEBUG_OBJECTS`,
-  DWARF5, `SAMPLE_RUST_MINIMAL=m`. `MODVERSIONS`, `MODULE_SIG`, `DEBUG_INFO_BTF`
-  and `RANDSTRUCT` are deliberately off.
-- `../kernel-dev/t0-donetest.sh` — the T0 done test, run inside the guest.
+
+Only the tree lives there. The config fragment that built it is
+`donetest/koru-debug.config`, and the done tests are `donetest/`, both under
+version control: an earlier copy outside the repo drifted unnoticed for four
+commits after a rename.
 
 The base config comes from `vng --kconfig`, so it is a small VM-only kernel; a
 full build takes about 9 minutes and the tree is ~5.4 GB. After any config
@@ -96,33 +98,10 @@ make -C $KDIR M=$PWD LLVM=1
 # guest. Drop --exec for an interactive shell.
 vng --run $KDIR --user root --memory 4G --cpus 4 --exec "<command>"
 
-# Done tests.
-vng --run $KDIR --user root --memory 4G --cpus 4 \
-    --exec "sh ../kernel-dev/t0-donetest.sh"      # kernel itself
-vng --run $KDIR --user root --memory 4G --cpus 4 \
-    --exec "sh ../kernel-dev/t1-donetest.sh"      # insmod/rmmod koru.ko
-vng --run $KDIR --user root --memory 4G --cpus 4 \
-    --exec "sh ../kernel-dev/t2-donetest.sh"      # 10k open/close, kmemleak
-vng --run $KDIR --user root --memory 4G --cpus 4 \
-    --exec "sh ../kernel-dev/t3-donetest.sh"      # SETUP / GET_PARAMS
-vng --run $KDIR --user root --memory 4G --cpus 4 \
-    --exec "sh ../kernel-dev/t4-donetest.sh"      # ENTER, NOP
-vng --run $KDIR --user root --memory 4G --cpus 4 \
-    --exec "sh ../kernel-dev/t5-donetest.sh"      # DELAY_NS, blocking wait
-vng --run $KDIR --user root --memory 4G --cpus 4 \
-    --exec "sh ../kernel-dev/t6-donetest.sh"      # teardown, module pinning
-vng --run $KDIR --user root --memory 4G --cpus 4 \
-    --exec "sh ../kernel-dev/t7-donetest.sh"      # arena mmap, CHECKSUM
-vng --run $KDIR --user root --memory 4G --cpus 4 \
-    --exec "sh ../kernel-dev/t8-donetest.sh"      # slot exclusivity
-vng --run $KDIR --user root --memory 4G --cpus 4 \
-    --exec "sh ../kernel-dev/t9-donetest.sh"      # OPEN/CLOSE, handles, creds
-vng --run $KDIR --user root --memory 4G --cpus 4 \
-    --exec "sh ../kernel-dev/t10-donetest.sh"     # READ into a slot
-vng --run $KDIR --user root --memory 4G --cpus 4 \
-    --exec "sh ../kernel-dev/t11-donetest.sh"     # CANCEL
-vng --run $KDIR --user root --memory 4G --cpus 4 \
-    --exec "sh ../kernel-dev/t12-donetest.sh 600" # hostile-userspace fuzz
+# Done tests. One verdict line per task; no arguments runs all of them.
+donetest/run.sh
+donetest/run.sh 9 10 11          # just those
+DT_ARGS="30 999" donetest/run.sh 12   # a short fuzz while iterating
 
 # Interim userspace tests, built on the host and run in the guest.
 make -C test
@@ -242,11 +221,15 @@ A test that can hang must arm an alarm and be line-buffered. `_exit` from the
 handler drops a full stdout buffer, which turns a diagnosable hang into a silent
 one.
 
-**A done test must fail on a kernel splat, not just print it.** Every script
-captures its dmesg grep into `$splat` and gates the pass line on it being empty.
-T10's lockdep deadlock first reported `PASS` with the cycle printed right above
-the pass line, because the check was advisory. The pattern list also matches
+**A done test must fail on a kernel splat, not just print it.** `dt_splat` in
+`donetest/common.sh` captures the dmesg grep and the verdict gates on it being
+empty. T10's lockdep deadlock first reported `PASS` with the cycle printed right
+above the pass line, because the check was advisory. The pattern also matches
 `not supported for file`, a `pr_warn_ratelimited` rather than a `WARN_ON`.
+
+The shared parts of every done test live in `donetest/common.sh`, so that rule
+and the kmemleak sleep are written once. Keep that file small: a bug in it
+weakens all thirteen pass conditions at once.
 
 Assert the exact errno, never just that a call failed. The T3 dispatcher
 returned `EPROTO` where it owed `ENOTTY`, and only an exact-errno assertion
