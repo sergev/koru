@@ -488,6 +488,17 @@ impl Sqe {
         }
     }
 
+    /// `len` carries the koru event mask; `off` and `slot` must be zero.
+    pub fn poll_add(user_data: u64, handle: u32, events: u32) -> Sqe {
+        Sqe {
+            opcode: KORU_OP_POLL_ADD,
+            len: events,
+            user_data,
+            handle,
+            ..Sqe::default()
+        }
+    }
+
     /// `off` carries the descriptor; every other field must be zero.
     pub fn adopt_fd(user_data: u64, fd: i32) -> Sqe {
         Sqe {

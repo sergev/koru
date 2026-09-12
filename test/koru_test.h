@@ -74,6 +74,7 @@ void sqe_open(struct koru_sqe *s, uint32_t slot, uint64_t off, uint32_t len, uin
               uint64_t user_data);
 void sqe_close(struct koru_sqe *s, uint32_t handle, uint64_t user_data);
 void sqe_adopt(struct koru_sqe *s, int fd, uint64_t user_data);
+void sqe_poll(struct koru_sqe *s, uint32_t handle, uint32_t events, uint64_t user_data);
 void sqe_read(struct koru_sqe *s, uint32_t handle, uint32_t slot, uint64_t off, uint32_t len,
               uint64_t user_data);
 void sqe_write(struct koru_sqe *s, uint32_t handle, uint32_t slot, uint64_t off, uint32_t len,

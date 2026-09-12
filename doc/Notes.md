@@ -711,6 +711,139 @@ all, so `-ELOOP` is exercised thousands of times a run. **Never 0, 1 or 2.** An
 adopted stdout plus the fuzzer's random `WRITE` would shred the check's own
 output, and the failure would look like a corrupt test rather than a bug.
 
+### Polling, and the third shape an op can have
+
+T22 added `POLL_ADD`, and with it a shape neither inline nor deferred:
+**armed**. Nothing is queued; the op puts a wait entry on the file's own
+waitqueue and stops there, counting as in flight so `ENTER` sleeps for it and
+`release` finds it. Everything below follows from one fact — the thing that
+finishes it runs in a context that may do almost nothing.
+
+#### The wake callback's rule, which is the `UserSlice` rule's sibling
+
+The callback runs **with the waitqueue head's spinlock held**, and for a
+socket fed by the network stack it runs in **softirq**. So it may not take a
+koru lock, may not `complete`, may not `fput`, and may not touch the waitqueue
+list it is being walked from. `kernel::sync::SpinLock` is plain `spin_lock`
+with no irq-safe variant in this tree, so taking the ring lock there is an
+irq-inversion, and lockdep says so.
+
+What it may do is three things: filter the wake against the mask it asked for,
+win a one-shot token, and `queue_work_on` the op's own work item. The kworker
+then does the removal and the completion in process context, where all of that
+is legal. This belongs beside "`ENTER` must never touch a `UserSlice` while
+holding the ring `SpinLock`", and for the same reason: the context decides
+what is allowed, not the call.
+
+#### One token, four claimants
+
+Four parties can want to finish an armed poll: the wake callback, the arming
+`ENTER` itself when the file is already ready, a `CANCEL`, and `release`. Every
+one of them must do exactly the same teardown — take the entry off the
+waitqueue, reclaim one reference, unregister — and exactly one of them may.
+
+So `PollState` carries a one-shot `Atomic<u32>`, `POLL_ARMED` until somebody
+wins the `cmpxchg`. The winner owns the teardown; everyone else walks away.
+That is what preserves the refcount rule Notes already records for `CANCEL`:
+the arm leaks one reference — the credit `run` consumes — *before* it queues
+the wait entry, because the callback can fire the instant the entry is on the
+list and from softirq it could not take one of its own. The winner reclaims
+that credit if `run` will never be called.
+
+`CANCEL` needed a second arm for this. An armed poll is on no workqueue, so
+`cancel_delayed_work` answers false and the old code would have reported
+`-EALREADY` for an op that is merely waiting, for ever. Now the token decides,
+and losing it means the wake has already queued the op — which is `EALREADY`
+for the same reason a running op is.
+
+#### `release` disarms before it drops anything
+
+`cancel_all` disarms every armed poll **inside the `pending` lock and before
+the registry is swapped out**, because the op's `ARef<File>` is the only thing
+keeping the waitqueue head alive. Backwards is not a leak, it is a
+use-after-free walking a freed list node from softirq — and it is a
+use-after-free that only fires if something writes to the file afterwards,
+which is why `koru_check pending` now leaves an armed poll behind and forks a
+child to poke it once the ring is gone.
+
+#### A file on no waitqueue must never be armed
+
+The first version armed whenever the current mask did not match, and the fuzzer
+found the hole in one run: eight SQEs consumed and never reaped. A regular file
+has no `poll` method, so `vfs_poll` reports `DEFAULT_POLLMASK` and queues
+nothing — and a poll for `RDHUP` alone, which that mask does not contain, would
+then wait on a waitqueue that does not exist, holding its CQ reservation and
+its in-flight count until the ring died.
+
+So the rule is not "complete when ready" but **complete whenever nothing could
+ever wake us**: `heads == 0` after the arm completes immediately with whatever
+the mask says, even when that is an empty mask and `res` is 0. `res == 0` is
+therefore a real answer — "this file cannot report what you asked" — and not
+an error.
+
+#### One waitqueue per arm, and a pipe is the reason
+
+`poll_wait` may be called more than once per `poll`, and `pipe_poll` calls it
+twice — `rd_wait` and `wr_wait` — for a pipe opened read-write. Supporting that
+means io_uring's double-entry machinery, which multiplies the refcount rule
+across two entries on the module's most delicate code. koru counts the calls
+instead, queues only the first, and completes `-EOPNOTSUPP`. A FIFO opened for
+reading, which is what a program actually polls, asks for one.
+
+#### What the wake reports
+
+The key a waitqueue passes is the mask that changed, and it may be null. So the
+callback stashes what it was given and the kworker reports it; on a keyless
+wake the kworker asks the file again, with a null `_qproc`, which is the
+ask-only form of `vfs_poll`. Either way the answer is filtered to what the
+caller asked for, plus `ERR` and `HUP`, which poll(2) reports whether or not
+they were requested.
+
+#### No blocking gate, unlike `READ` and `WRITE`
+
+T18's rule — a non-regular file needs `O_NONBLOCK` — does not apply here and
+must not. A poll never transfers anything, so it cannot wedge a kworker;
+waiting is the entire point of it. `POLL_ADD` is the one op a blocking
+descriptor is always welcome on, which is what makes it the answer to the
+`EAGAIN` a non-blocking `READ` gives.
+
+#### Testing a softirq wake needs a real socket
+
+A `socketpair` does not do it: `unix_stream_sendmsg` calls `sk_data_ready` in
+the **sender's own process context**, so an AF_UNIX wake looks exactly like a
+FIFO's. A UDP datagram over loopback is what reaches the wake callback from
+`handle_softirqs`, and that is the case the whole rule is about. Both are in
+the check, labelled for what they are.
+
+The fuzzer's `POLL_ADD` arm names only regular files and bad handles, so it
+exercises the validation surface and never arms anything. That is deliberate:
+an armed poll holds its CQ reservation until its event arrives, and the fuzzer
+has no way to deliver one. It is the same exhaustion the plan gives as a reason
+not to auto-arm on `-EAGAIN`.
+
+#### What was shown to fail
+
+Five perturbations, each applied and reverted. Three of them do not fail an
+assertion — they take the machine down or say nothing at all, which is worth
+knowing about this opcode.
+
+- **Take the ring lock in the wake callback.** Every assertion still passes and
+  the section reports `OK`. Lockdep reports `possible irq lock inversion
+  dependency detected`, with `SOFTIRQ-ON-W` against `IN-SOFTIRQ-W`, and the
+  dmesg gate fails the run. **Lockdep is the only oracle here.**
+- **Call `complete()` from the wake callback.** The guest wedges outright,
+  before lockdep gets to report anything: the double completion underflows the
+  in-flight count in a kworker. A hang is a legitimate failure, but the
+  lock-only perturbation above is the one that shows the rule.
+- **Drop `remove_wait_queue` from the disarm.** KASAN reports a
+  slab-use-after-free the moment the peer writes to the cancelled poll's FIFO,
+  and the guest dies during the scan: the runner reports no verdict at all.
+- **Make the token always succeed.** The cancel-versus-wake loop wedges the
+  guest. The `poll` section alone still passes, because a cancel that disarms
+  first leaves nothing for a wake to race — the race loop is what has teeth.
+- **Skip the disarm in `cancel_all`.** `koru_check pending` plus its poking
+  child gives `BUG: KASAN: slab-use-after-free in __wake_up_common_lock`.
+
 ### Cancellation
 
 `CANCEL` names its target by `user_data` in `off`. A duplicate `user_data`

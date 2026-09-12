@@ -11,11 +11,17 @@ use kernel::{
     page::PAGE_SIZE,
     prelude::*,
     str::CStrExt,
-    sync::{aref::ARef, Arc, ArcBorrow},
+    sync::{
+        aref::ARef,
+        atomic::{Atomic, Full, Relaxed},
+        Arc, ArcBorrow,
+    },
     time::{msecs_to_jiffies, Jiffies},
+    types::Opaque,
     workqueue::{self, DelayedWork, HasWork, Work, WorkItem},
 };
 
+use core::mem::offset_of;
 use core::ptr::NonNull;
 
 use crate::koru_abi::*;
@@ -43,6 +49,63 @@ pub(crate) struct OpWork {
     /// Resolved at submit time, so a `CLOSE` racing this op cannot free it.
     /// Dropped with the work item, whether it ran or not.
     file: Option<ARef<File>>,
+    /// `POLL_ADD`'s arm. Idle in every other op, which costs them the space
+    /// rather than a second allocation; see doc/Notes.md.
+    #[pin]
+    poll: PollState,
+}
+
+/// The armed half of a `POLL_ADD`. Four parties reach it and `token` makes
+/// exactly one of them the owner of the teardown; doc/Notes.md says why.
+#[pin_data]
+pub(crate) struct PollState {
+    /// On the file's waitqueue while armed. Pinned in the `Arc`, so the
+    /// callback can find the op from the entry.
+    #[pin]
+    wait: Opaque<bindings::wait_queue_entry>,
+    /// The head it went on, or null. Written during the arm.
+    head: Atomic<*mut bindings::wait_queue_head>,
+    /// One-shot, `POLL_ARMED` until somebody wins it.
+    token: Atomic<u32>,
+    /// What the wake saw, 0 when it was woken with no key.
+    fired: Atomic<u32>,
+    /// The kernel-side mask asked for. Immutable after the arm.
+    interest: u32,
+}
+
+// SAFETY: the entry is touched only under the waitqueue head's own spinlock,
+// which `add_wait_queue`, `remove_wait_queue` and the wake callback all hold;
+// everything else here is atomic or immutable after the arm.
+unsafe impl Send for PollState {}
+// SAFETY: as above.
+unsafe impl Sync for PollState {}
+
+/// Nobody owns the teardown yet.
+const POLL_ARMED: u32 = 0;
+/// Somebody does, and it is theirs alone.
+const POLL_TAKEN: u32 = 1;
+
+impl PollState {
+    fn new(interest: u32) -> impl PinInit<PollState> {
+        pin_init!(PollState {
+            // `init_waitqueue_func_entry` plus `INIT_LIST_HEAD`, both inlines.
+            wait <- Opaque::ffi_init(|p: *mut bindings::wait_queue_entry| {
+                // SAFETY: `p` points at our own uninitialised storage.
+                unsafe {
+                    (*p).flags = 0;
+                    (*p).private = core::ptr::null_mut();
+                    (*p).func = Some(poll_wake);
+                    let list = &raw mut (*p).entry;
+                    (*list).next = list;
+                    (*list).prev = list;
+                }
+            }),
+            head: Atomic::new(core::ptr::null_mut()),
+            token: Atomic::new(POLL_ARMED),
+            fired: Atomic::new(0),
+            interest,
+        })
+    }
 }
 
 #[pinned_drop]
@@ -70,16 +133,116 @@ impl OpWork {
         }
     }
 
+    /// The `struct work_struct` inside this op, for `queue_work_on`.
+    fn work_struct(op: *const OpWork) -> *mut bindings::work_struct {
+        // SAFETY: `op` points at a live `OpWork`, so its `work` field is live.
+        let work = unsafe { <OpWork as HasWork<OpWork>>::raw_get_work(op.cast_mut()) };
+        // SAFETY: as above.
+        unsafe { Work::raw_get(work) }
+    }
+
     /// The `struct delayed_work` inside this op, for `cancel_delayed_work`.
     fn delayed_work(op: &Arc<OpWork>) -> *mut bindings::delayed_work {
-        let ptr = Arc::as_ptr(op).cast_mut();
-        // SAFETY: `ptr` points at a live `OpWork`, so its `work` field is live.
-        let work = unsafe { <OpWork as HasWork<OpWork>>::raw_get_work(ptr) };
-        // SAFETY: as above.
-        let work = unsafe { Work::raw_get(work) };
-        // SAFETY: `work` is the `work` field of the `DelayedWork` above, which
-        // is `repr(transparent)` over `bindings::delayed_work`.
+        let work = OpWork::work_struct(Arc::as_ptr(op));
+        // SAFETY: `work` is the `work` field of a `DelayedWork`, which is
+        // `repr(transparent)` over `bindings::delayed_work`.
         unsafe { kernel::container_of!(work, bindings::delayed_work, work) }
+    }
+
+    /// Offset of the waitqueue entry, so the wake callback can find the op.
+    const WAIT_OFFSET: usize = offset_of!(OpWork, poll) + offset_of!(PollState, wait);
+
+    /// Win the one-shot token. The winner owns the disarm, the enqueue credit
+    /// and the completion.
+    fn poll_claim(&self) -> bool {
+        self.poll
+            .token
+            .cmpxchg(POLL_ARMED, POLL_TAKEN, Full)
+            .is_ok()
+    }
+
+    /// Take the entry off the file's waitqueue.
+    ///
+    /// # Safety
+    ///
+    /// Process context only, and only by the token's winner, once.
+    unsafe fn poll_disarm(&self) {
+        let head = self.poll.head.load(Relaxed);
+        if !head.is_null() {
+            // SAFETY: the op holds an `ARef<File>`, so the head it was queued
+            // on is still alive; the entry is ours and is still on that list.
+            unsafe { bindings::remove_wait_queue(head, self.poll.wait.get()) };
+        }
+    }
+}
+
+/// The waitqueue callback. **Runs with the head's spinlock held, and for a
+/// socket in softirq**, so it takes no koru lock, completes nothing, drops
+/// nothing and touches no list: token, mask, enqueue. See doc/Notes.md.
+unsafe extern "C" fn poll_wake(
+    entry: *mut bindings::wait_queue_entry,
+    _mode: kernel::ffi::c_uint,
+    _flags: kernel::ffi::c_int,
+    key: *mut kernel::ffi::c_void,
+) -> kernel::ffi::c_int {
+    // SAFETY: the entry is on a queue only between the arm and the disarm, and
+    // for that window the registry and the credit both keep the op alive.
+    let op = unsafe { &*entry.byte_sub(OpWork::WAIT_OFFSET).cast::<OpWork>() };
+
+    // A keyless wake says nothing about what happened, so it always counts.
+    let mask = key as usize as u32;
+    if mask != 0 && mask & (op.poll.interest | POLL_ALWAYS) == 0 {
+        return 0;
+    }
+    if !op.poll_claim() {
+        return 0;
+    }
+    op.poll.fired.store(mask, Relaxed);
+
+    // Cannot fail: the token admits one caller and the work was never queued.
+    // `run` reclaims the credit the arm leaked.
+    // SAFETY: the op is alive as above, and its work was initialised with
+    // `run` as its function when it was allocated.
+    unsafe {
+        bindings::queue_work_on(
+            bindings::wq_misc_consts_WORK_CPU_UNBOUND as kernel::ffi::c_int,
+            bindings::system_wq,
+            OpWork::work_struct(op),
+        );
+    }
+    1
+}
+
+/// The poll table, with our own fields after it. `_qproc` is called
+/// synchronously inside `f_op->poll`, so the arm's stack frame is enough.
+#[repr(C)]
+struct KoruPollTable {
+    pt: bindings::poll_table_struct,
+    op: *const OpWork,
+    heads: u32,
+}
+
+/// Queue the op on the head the file names. One waitqueue only: a second is
+/// counted and refused, rather than growing io_uring's double-entry
+/// machinery. A pipe opened read-write is the reachable case.
+unsafe extern "C" fn poll_queue_proc(
+    _file: *mut bindings::file,
+    head: *mut bindings::wait_queue_head,
+    pt: *mut bindings::poll_table_struct,
+) {
+    // SAFETY: `pt` is the first field of the `KoruPollTable` the arm made.
+    let table = pt.cast::<KoruPollTable>();
+    // SAFETY: as above, and the arm owns it for the whole call.
+    unsafe {
+        (*table).heads += 1;
+        if (*table).heads > 1 {
+            return;
+        }
+        let op = (*table).op;
+        (*op).poll.head.store(head, Relaxed);
+        // The entry is initialised and on no list, and the op holds an
+        // `ARef<File>`, so the head outlives the arm.
+        bindings::add_wait_queue(head, (*op).poll.wait.get());
     }
 }
 
@@ -103,6 +266,22 @@ impl WorkItem for OpWork {
                 .ring
                 .do_write(sqe, this.file.as_deref())
                 .unwrap_or_else(|e| i64::from(e.to_errno())),
+            // Only a fired poll reaches here, once: the callback won the token
+            // before queueing. Off the waitqueue first.
+            KORU_OP_POLL_ADD => {
+                // SAFETY: the callback won the token, so this is the one
+                // disarm, and a kworker is process context.
+                unsafe { this.poll_disarm() };
+                let fired = this.poll.fired.load(Relaxed);
+                // A keyless wake leaves nothing to report, so ask the file.
+                let mask = if fired != 0 {
+                    fired
+                } else {
+                    // SAFETY: the file is alive for as long as the op is.
+                    unsafe { poll_mask_now(&this) }
+                };
+                i64::from(poll_to_koru(mask & (this.poll.interest | POLL_ALWAYS)))
+            }
             _ => i64::from(EINVAL.to_errno()),
         };
         this.ring
@@ -153,6 +332,7 @@ impl RingCtx {
             KORU_OP_READ => RingCtx::read_op(me, sqe),
             KORU_OP_WRITE => RingCtx::write_op(me, sqe),
             KORU_OP_ADOPT_FD => Some(me.adopt_op(ring, sqe)),
+            KORU_OP_POLL_ADD => RingCtx::poll_op(me, sqe),
             KORU_OP_CANCEL => Some(me.cancel_op(sqe)),
             KORU_OP_CHECKSUM => {
                 if sqe.handle != 0 {
@@ -588,13 +768,16 @@ impl RingCtx {
         }
     }
 
-    /// Queue an op on the workqueue. `None` once it owns the reservation.
-    fn defer(
+    /// Allocate an op, count it in flight and register it for `CANCEL`. `Err`
+    /// is the completion the failure owes, never an ioctl error (C1).
+    /// Registration failure is fatal: an unregistered armed poll would outlive
+    /// `release` with its entry on a freed file's queue.
+    fn alloc_op(
         me: ArcBorrow<'_, RingCtx>,
         sqe: &Sqe,
-        jiffies: Jiffies,
         file: Option<ARef<File>>,
-    ) -> Option<i64> {
+        interest: u32,
+    ) -> core::result::Result<Arc<OpWork>, i64> {
         // Paired with `PinnedDrop for OpWork`. Taken before the allocation so
         // the drop impl always has a reference to release.
         module_get_live();
@@ -602,6 +785,7 @@ impl RingCtx {
         let op = match Arc::pin_init(
             pin_init!(OpWork {
                 work <- new_delayed_work!("OpWork::work"),
+                poll <- PollState::new(interest),
                 ring: Arc::from(me),
                 sqe: *sqe,
                 file: file,
@@ -609,10 +793,9 @@ impl RingCtx {
             GFP_KERNEL,
         ) {
             Ok(op) => op,
-            // C1 still holds: a failed op is a completion, not an ioctl error.
             Err(e) => {
                 module_put();
-                return Some(i64::from(e.to_errno()));
+                return Err(i64::from(e.to_errno()));
             }
         };
 
@@ -621,20 +804,102 @@ impl RingCtx {
 
         // Registered before enqueueing: afterwards `run` may already have
         // completed and unregistered, and a late insert would never be removed.
-        let registered = me.pending.lock().push(op.clone(), GFP_KERNEL).is_ok();
+        if me.pending.lock().push(op.clone(), GFP_KERNEL).is_err() {
+            me.state.lock().inflight -= 1;
+            return Err(i64::from(ENOMEM.to_errno()));
+        }
+        Ok(op)
+    }
+
+    /// Queue an op on the workqueue. `None` once it owns the reservation.
+    fn defer(
+        me: ArcBorrow<'_, RingCtx>,
+        sqe: &Sqe,
+        jiffies: Jiffies,
+        file: Option<ARef<File>>,
+    ) -> Option<i64> {
+        let op = match RingCtx::alloc_op(me, sqe, file, 0) {
+            Ok(op) => op,
+            Err(res) => return Some(res),
+        };
 
         match workqueue::system().enqueue_delayed(op, jiffies) {
             Ok(()) => None,
             // The queue handed the `Arc` back, so remove by identity: another
             // submitter may have pushed since.
             Err(op) => {
-                if registered {
-                    RingCtx::pending_remove(&mut me.pending.lock(), &op);
-                }
+                RingCtx::pending_remove(&mut me.pending.lock(), &op);
                 me.state.lock().inflight -= 1;
                 Some(i64::from(EAGAIN.to_errno()))
             }
         }
+    }
+
+    /// `POLL_ADD`: arm a one-shot poll on `handle`.
+    ///
+    /// A third shape beside inline and deferred: *armed*. Nothing is queued;
+    /// the op waits on the file's waitqueue and counts as in flight, so
+    /// `ENTER` sleeps for it and `release` finds it.
+    fn poll_op(me: ArcBorrow<'_, RingCtx>, sqe: &Sqe) -> Option<i64> {
+        // POLL_ADD reads only `handle` and `len`.
+        if sqe.off != 0 || sqe.slot != 0 {
+            return Some(i64::from(EINVAL.to_errno()));
+        }
+        // An empty mask could only ever report an error, which is a bug in the
+        // caller rather than a request.
+        if sqe.len == 0 || sqe.len & !KORU_POLL_EVENTS_ALL != 0 {
+            return Some(i64::from(EINVAL.to_errno()));
+        }
+
+        // No readability or blocking check: waiting is what a poll is for.
+        let file = match me.handles.lock().resolve(sqe.handle) {
+            Ok(file) => file,
+            Err(e) => return Some(i64::from(e.to_errno())),
+        };
+
+        let interest = poll_to_kernel(sqe.len);
+        let op = match RingCtx::alloc_op(me, sqe, Some(file), interest) {
+            Ok(op) => op,
+            Err(res) => return Some(res),
+        };
+
+        // The reference `run` consumes, leaked before the arm: the callback
+        // can fire the instant the entry is queued, and from softirq it
+        // cannot take one of its own.
+        let credit = Arc::into_raw(op.clone());
+
+        // SAFETY: ioctl context, and the op is not reachable from anywhere
+        // else until the entry goes on the queue inside this call.
+        let (mask, heads) = unsafe { poll_arm(&op, interest) };
+        let ready = mask & (interest | POLL_ALWAYS);
+
+        let res = if heads > 1 {
+            i64::from(eopnotsupp().to_errno())
+        } else if ready != 0 || heads == 0 {
+            // Ready, or on no waitqueue at all — a file with no `poll` method,
+            // which nothing can ever wake. Waiting on it would hold a CQ
+            // reservation for the life of the ring, so answer now, even when
+            // the answer is an empty mask.
+            i64::from(poll_to_koru(ready))
+        } else {
+            // Armed. The wake callback, a `CANCEL` or `release` finishes it.
+            return None;
+        };
+
+        // Ready, or refused — but the token still decides. A wake that beat us
+        // has already queued the work, and completing twice would break C1.
+        if !op.poll_claim() {
+            return None;
+        }
+        // SAFETY: we won the token, so this is the one disarm, and a submit is
+        // process context.
+        unsafe { op.poll_disarm() };
+        // SAFETY: we won, so `run` will never be called and nothing else will
+        // ever reclaim the credit.
+        drop(unsafe { Arc::from_raw(credit) });
+        RingCtx::pending_remove(&mut me.pending.lock(), &op);
+        me.state.lock().inflight -= 1;
+        Some(res)
     }
 
     /// Cancel every queued op, for `release`.
@@ -648,11 +913,21 @@ impl RingCtx {
         {
             let list = self.pending.lock();
             for op in list.iter() {
+                // An armed poll is on no workqueue, so `cancel_delayed_work`
+                // would answer false and leave the entry on a queue whose file
+                // is about to be dropped. Disarm here, inside this lock and
+                // before the registry goes: backwards is a use-after-free from
+                // softirq, not a leak.
+                let armed = op.sqe.opcode == KORU_OP_POLL_ADD && op.poll_claim();
+                if armed {
+                    // SAFETY: we won the token, and `release` is process context.
+                    unsafe { op.poll_disarm() };
+                }
                 // SAFETY: the registry entry keeps the `OpWork` alive.
-                if unsafe { bindings::cancel_delayed_work(OpWork::delayed_work(op)) } {
-                    // SAFETY: `run` will never reclaim what `enqueue_delayed`
-                    // leaked, so adopt it. `op` still holds a reference, so
-                    // this drop can never be the last.
+                if armed || unsafe { bindings::cancel_delayed_work(OpWork::delayed_work(op)) } {
+                    // SAFETY: `run` will never reclaim what the arm or
+                    // `enqueue_delayed` leaked, so adopt it. `op` still holds a
+                    // reference, so this drop can never be the last.
                     drop(unsafe { Arc::from_raw(Arc::as_ptr(op)) });
                 }
             }
@@ -681,8 +956,22 @@ impl RingCtx {
         // Cloned so it outlives the removal below and the unlock.
         let op = list[i].clone();
 
-        // SAFETY: `op` keeps the `OpWork`, and so its `delayed_work`, alive.
-        if !unsafe { bindings::cancel_delayed_work(OpWork::delayed_work(&op)) } {
+        // An armed poll is on no workqueue, so the token decides instead of
+        // `cancel_delayed_work`. Losing it means the wake already queued the
+        // op, which is `EALREADY` for the same reason a running op is.
+        let armed = op.sqe.opcode == KORU_OP_POLL_ADD;
+        let won = if armed {
+            let won = op.poll_claim();
+            if won {
+                // SAFETY: we won the token, and this is process context.
+                unsafe { op.poll_disarm() };
+            }
+            won
+        } else {
+            // SAFETY: `op` keeps the `OpWork`, and so its `delayed_work`, alive.
+            unsafe { bindings::cancel_delayed_work(OpWork::delayed_work(&op)) }
+        };
+        if !won {
             // Already running, or already done. Nothing was pending, so no
             // reference is orphaned and none may be dropped.
             return i64::from(ealready().to_errno());
@@ -704,6 +993,112 @@ impl RingCtx {
             OpWork::held_slot(&target),
         );
         0
+    }
+}
+
+// Poll masks. Not in the bindings either: the `EPOLL*` constants carry the
+// same `__force` cast. From include/uapi/asm-generic/poll.h, whose values the
+// `EPOLL*` ones share.
+const POLLIN: u32 = 0x0001;
+const POLLPRI: u32 = 0x0002;
+const POLLOUT: u32 = 0x0004;
+const POLLERR: u32 = 0x0008;
+const POLLHUP: u32 = 0x0010;
+const POLLRDNORM: u32 = 0x0040;
+const POLLWRNORM: u32 = 0x0100;
+const POLLRDHUP: u32 = 0x2000;
+
+/// What `vfs_poll` reports for a file with no `poll` method.
+const DEFAULT_POLLMASK: u32 = POLLIN | POLLOUT | POLLRDNORM | POLLWRNORM;
+/// Reported whether or not they were asked for.
+const POLL_ALWAYS: u32 = POLLERR | POLLHUP;
+
+fn poll_to_kernel(events: u32) -> u32 {
+    let mut mask = POLL_ALWAYS;
+    if events & KORU_POLL_IN != 0 {
+        mask |= POLLIN | POLLRDNORM;
+    }
+    if events & KORU_POLL_OUT != 0 {
+        mask |= POLLOUT | POLLWRNORM;
+    }
+    if events & KORU_POLL_PRI != 0 {
+        mask |= POLLPRI;
+    }
+    if events & KORU_POLL_RDHUP != 0 {
+        mask |= POLLRDHUP;
+    }
+    mask
+}
+
+fn poll_to_koru(mask: u32) -> u32 {
+    let mut events = 0;
+    if mask & (POLLIN | POLLRDNORM) != 0 {
+        events |= KORU_POLL_IN;
+    }
+    if mask & (POLLOUT | POLLWRNORM) != 0 {
+        events |= KORU_POLL_OUT;
+    }
+    if mask & POLLPRI != 0 {
+        events |= KORU_POLL_PRI;
+    }
+    if mask & POLLRDHUP != 0 {
+        events |= KORU_POLL_RDHUP;
+    }
+    if mask & POLLERR != 0 {
+        events |= KORU_POLL_ERR;
+    }
+    if mask & POLLHUP != 0 {
+        events |= KORU_POLL_HUP;
+    }
+    events
+}
+
+/// `vfs_poll`, which is a static inline, with our own poll table.
+///
+/// # Safety
+///
+/// Process context: `add_wait_queue` takes the head's spinlock.
+unsafe fn poll_arm(op: &Arc<OpWork>, interest: u32) -> (u32, u32) {
+    let Some(file) = op.file.as_ref() else {
+        return (0, 0);
+    };
+    let mut table = KoruPollTable {
+        pt: bindings::poll_table_struct {
+            _qproc: Some(poll_queue_proc),
+            _key: interest,
+        },
+        op: Arc::as_ptr(op),
+        heads: 0,
+    };
+    // SAFETY: a live file always has a valid `f_op`, and `poll` is called with
+    // our own table, which outlives the call.
+    unsafe {
+        match (*(*file.as_ptr()).f_op).poll {
+            None => (DEFAULT_POLLMASK, 0),
+            Some(poll) => (poll(file.as_ptr(), &mut table.pt), table.heads),
+        }
+    }
+}
+
+/// The file's mask now, queueing nothing. For a keyless wake.
+///
+/// # Safety
+///
+/// Process context, and the file must still be alive.
+unsafe fn poll_mask_now(op: &OpWork) -> u32 {
+    let Some(file) = op.file.as_ref() else {
+        return 0;
+    };
+    let mut table = bindings::poll_table_struct {
+        _qproc: None,
+        _key: !0,
+    };
+    // SAFETY: as `poll_arm`; a null `_qproc` is the ask-only form.
+    unsafe {
+        match (*(*file.as_ptr()).f_op).poll {
+            None => DEFAULT_POLLMASK,
+            Some(poll) => poll(file.as_ptr(), &mut table),
+        }
     }
 }
 

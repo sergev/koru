@@ -2525,3 +2525,149 @@ fn ioctl_dispatch_matrix() {
         "SETUP with a bad pointer",
     );
 }
+
+// ---------------------------------------------------------------------------
+// T22 - POLL_ADD
+// ---------------------------------------------------------------------------
+
+/// Every regular file: no `poll` method, so nothing could ever wake it and it
+/// answers from the default mask at once.
+#[test]
+fn poll_on_a_regular_file_answers_at_once() {
+    ensure_pattern_file();
+    let m = Mapped::shared();
+    let h = m.open_path(0, PATFILE, KORU_O_RDONLY);
+    assert!(h > 0, "open");
+
+    let ready = m.run_one(&Sqe::poll_add(
+        0x500,
+        h as u32,
+        KORU_POLL_IN | KORU_POLL_OUT,
+    ));
+    assert_eq!(ready, (KORU_POLL_IN | KORU_POLL_OUT) as i64);
+    // Nothing in the default mask, so the honest answer is an empty one rather
+    // than a wait that could never end.
+    assert_eq!(
+        m.run_one(&Sqe::poll_add(0x501, h as u32, KORU_POLL_RDHUP)),
+        0
+    );
+
+    assert_eq!(m.close_handle(h as u32), 0);
+    m.assert_quiesced();
+}
+
+#[test]
+fn poll_rejection_matrix() {
+    ensure_pattern_file();
+    let m = Mapped::shared();
+    let h = m.open_path(0, PATFILE, KORU_O_RDONLY) as u32;
+    let einval = -(EINVAL.0 as i64);
+
+    let mut s = Sqe::poll_add(0x510, h, KORU_POLL_IN);
+    s.off = 1;
+    assert_eq!(m.run_one(&s), einval, "a non-zero off");
+    let mut s = Sqe::poll_add(0x511, h, KORU_POLL_IN);
+    s.slot = 1;
+    assert_eq!(m.run_one(&s), einval, "a non-zero slot");
+    assert_eq!(
+        m.run_one(&Sqe::poll_add(0x512, h, 0)),
+        einval,
+        "an empty mask"
+    );
+    assert_eq!(
+        m.run_one(&Sqe::poll_add(0x513, h, KORU_POLL_EVENTS_ALL + 1)),
+        einval,
+        "an unknown event bit"
+    );
+    assert_eq!(
+        m.run_one(&Sqe::poll_add(0x514, 0, KORU_POLL_IN)),
+        -(EBADF.0 as i64),
+        "a zero handle"
+    );
+
+    assert_eq!(m.close_handle(h), 0);
+    m.assert_quiesced();
+}
+
+/// The deliverable: a poll that waits, and a wake that arrives through the
+/// socket layer rather than inside anybody's `write`.
+#[test]
+fn poll_on_a_socket_waits_for_its_event() {
+    use std::io::Write;
+    use std::os::unix::net::UnixStream;
+
+    let m = Mapped::shared();
+    let (mine, mut theirs) = UnixStream::pair().expect("socketpair");
+    mine.set_nonblocking(true).expect("O_NONBLOCK");
+    let h = m.adopt(mine.as_raw_fd());
+    assert!(h > 0, "adopt");
+
+    let mut cq = vec![Cqe::default(); 4];
+    let armed = m
+        .ring
+        .submit(&[Sqe::poll_add(0x520, h as u32, KORU_POLL_IN)])
+        .expect("ENTER");
+    assert_eq!(armed.consumed, 1);
+    assert_eq!(
+        armed.progress.completed, 0,
+        "an armed poll completes nothing"
+    );
+
+    // Nothing readable, so nothing may arrive.
+    let quiet = m
+        .ring
+        .enter(&[], &mut cq, 1, Some(Duration::from_millis(100)))
+        .expect("ENTER");
+    assert_eq!(quiet.progress.completed, 0, "it stays armed");
+
+    theirs.write_all(b"k").expect("write");
+    let woke = m
+        .ring
+        .enter(&[], &mut cq, 1, Some(Duration::from_millis(1000)))
+        .expect("ENTER");
+    assert_eq!(woke.progress.completed, 1, "the wake completes it");
+    let c = find_cqe(woke.cqes(&cq), 0x520);
+    assert_eq!(c.res, KORU_POLL_IN as i64);
+
+    assert_eq!(m.close_handle(h as u32), 0);
+    m.assert_quiesced();
+}
+
+/// The token is what keeps this to one completion: without it the wake would
+/// post a second one and break C1.
+#[test]
+fn a_cancelled_poll_completes_once_and_never_again() {
+    use std::io::Write;
+    use std::os::unix::net::UnixStream;
+
+    let m = Mapped::shared();
+    let (mine, mut theirs) = UnixStream::pair().expect("socketpair");
+    mine.set_nonblocking(true).expect("O_NONBLOCK");
+    let h = m.adopt(mine.as_raw_fd());
+    assert!(h > 0, "adopt");
+
+    let mut cq = vec![Cqe::default(); 4];
+    m.ring
+        .submit(&[Sqe::poll_add(0x530, h as u32, KORU_POLL_IN)])
+        .expect("ENTER");
+
+    let done = m
+        .ring
+        .enter(&[Sqe::cancel(0x531, 0x530)], &mut cq, 2, None)
+        .expect("ENTER");
+    assert_eq!(done.progress.completed, 2, "the poll and its cancel (C1)");
+    assert_eq!(find_cqe(done.cqes(&cq), 0x530).res, -(ECANCELED.0 as i64));
+    assert_eq!(find_cqe(done.cqes(&cq), 0x531).res, 0);
+
+    // Without `remove_wait_queue` this walks a freed entry; without the token
+    // it is a second completion for an op that already has one.
+    theirs.write_all(b"k").expect("write");
+    let after = m
+        .ring
+        .enter(&[], &mut cq, 1, Some(Duration::from_millis(100)))
+        .expect("ENTER");
+    assert_eq!(after.progress.completed, 0, "no CQE at all");
+
+    assert_eq!(m.close_handle(h as u32), 0);
+    m.assert_quiesced();
+}

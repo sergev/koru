@@ -15,6 +15,7 @@
 // KORU_SEED=<n> replays a fuzz failure. There is no duration knob.
 
 #include <errno.h>
+#include <fcntl.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -61,6 +62,7 @@ static const struct sec sections[] = {
     { "nonblock", sec_nonblock, 0 },
     { "delay", sec_delay, 0 },
     { "cancel", sec_cancel, 0 },
+    { "poll", sec_poll, 0 },
     { "signals", sec_signals, 0 },
     { "creds", sec_creds, 0 },
 };
@@ -698,16 +700,37 @@ static int mode_hold(void)
         pause();
 }
 
-/* release() must cancel these, so the script's rmmod beats the delay. */
+/* release() must cancel these, so the script's rmmod beats the delay. It must
+ * also disarm the poll: the child pokes the pipe once the ring is gone, and
+ * an entry left on that waitqueue is a use-after-free from the wake. */
 static int mode_pending(void)
 {
     struct koru_ring m;
     struct koru_sqe sq[4];
     struct koru_enter e;
+    int pipefd[2];
+    int64_t h;
     unsigned i;
 
     if (ring_open(&m, 32, 64, 4096, 8, 8) != 0)
         return 1;
+    if (pipe2(pipefd, O_NONBLOCK) == 0) {
+        h = r_adopt(&m, pipefd[0]);
+        if (h > 0) {
+            sqe_poll(&sq[0], (uint32_t)h, KORU_POLL_IN, 0x7100);
+            enter_init(&e, sq, 1, NULL, 0);
+            if (ioctl(m.fd, KORU_IOC_ENTER, &e) != 1)
+                return 1;
+            if (fork() == 0) {
+                close(m.fd); /* the child must not hold the ring open */
+                close(pipefd[0]);
+                usleep(200000);
+                if (write(pipefd[1], "x", 1) != 1)
+                    _exit(1);
+                _exit(0);
+            }
+        }
+    }
     for (i = 0; i < 4; i++)
         sqe_delay(&sq[i], 0x7000 + i, 5000 * MS);
     enter_init(&e, sq, 4, NULL, 0);

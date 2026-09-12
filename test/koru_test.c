@@ -347,6 +347,15 @@ void sqe_adopt(struct koru_sqe *s, int fd, uint64_t user_data)
     s->user_data = user_data;
 }
 
+void sqe_poll(struct koru_sqe *s, uint32_t handle, uint32_t events, uint64_t user_data)
+{
+    memset(s, 0, sizeof(*s));
+    s->opcode    = KORU_OP_POLL_ADD;
+    s->handle    = handle;
+    s->len       = events;
+    s->user_data = user_data;
+}
+
 void sqe_read(struct koru_sqe *s, uint32_t handle, uint32_t slot, uint64_t off, uint32_t len,
               uint64_t user_data)
 {

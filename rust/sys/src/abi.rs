@@ -123,9 +123,37 @@ pub const KORU_OP_WRITE: u8 = 7;
 /// **Grants no authority the submitting task does not already hold.** Adopting
 /// any koru descriptor is `ELOOP`.
 pub const KORU_OP_ADOPT_FD: u8 = 8;
+/// Wait once for one of the events in `len` on `handle`. `off` and `slot` must
+/// be zero; `res` is the mask that fired, always non-negative.
+///
+/// Single-shot: admission control leaves a multishot poll nowhere to put its
+/// second completion. A file on no waitqueue — every regular file — completes
+/// at once, with `res` 0 where none of the asked-for events are in its default
+/// mask.
+pub const KORU_OP_POLL_ADD: u8 = 9;
 
 /// Any bit set is rejected.
 pub const KORU_SQE_FLAGS_ALL: u8 = 0;
+
+// Poll events, in a `POLL_ADD` SQE's `len` and returned in `res`. koru's own
+// bit values, like the open flags.
+
+/// Readable, or end of file on a stream.
+pub const KORU_POLL_IN: u32 = 1 << 0;
+/// Writable.
+pub const KORU_POLL_OUT: u32 = 1 << 1;
+/// Out-of-band data.
+pub const KORU_POLL_PRI: u32 = 1 << 2;
+/// The peer closed its writing half.
+pub const KORU_POLL_RDHUP: u32 = 1 << 3;
+/// Error. Reported whether or not it was asked for.
+pub const KORU_POLL_ERR: u32 = 1 << 4;
+/// Hang-up. Reported whether or not it was asked for.
+pub const KORU_POLL_HUP: u32 = 1 << 5;
+
+/// Any bit outside this completes `EINVAL`, and so does an empty mask.
+pub const KORU_POLL_EVENTS_ALL: u32 =
+    KORU_POLL_IN | KORU_POLL_OUT | KORU_POLL_PRI | KORU_POLL_RDHUP | KORU_POLL_ERR | KORU_POLL_HUP;
 
 // Open flags, in an `OPEN` SQE's `handle`. koru's own bit values, not host
 // `O_*`; the kernel translates.

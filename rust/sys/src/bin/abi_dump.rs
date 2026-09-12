@@ -18,8 +18,10 @@ use koru_sys::abi::{
     KORU_MAX_SLOT_COUNT, KORU_MAX_SLOT_SIZE, KORU_MAX_SQ_ENTRIES, KORU_NR_ENTER,
     KORU_NR_GET_PARAMS, KORU_NR_SETUP, KORU_O_ACCMODE, KORU_O_DIRECTORY, KORU_O_NOFOLLOW,
     KORU_O_NONBLOCK, KORU_O_RDONLY, KORU_O_RDWR, KORU_O_WRONLY, KORU_OP_ADOPT_FD, KORU_OP_CANCEL,
-    KORU_OP_CHECKSUM, KORU_OP_CLOSE, KORU_OP_DELAY_NS, KORU_OP_NOP, KORU_OP_OPEN, KORU_OP_READ,
-    KORU_OP_WRITE, KORU_OPEN_FLAGS_ALL, KORU_SETUP_FLAGS_ALL, KORU_SQE_FLAGS_ALL,
+    KORU_OP_CHECKSUM, KORU_OP_CLOSE, KORU_OP_DELAY_NS, KORU_OP_NOP, KORU_OP_OPEN, KORU_OP_POLL_ADD,
+    KORU_OP_READ, KORU_OP_WRITE, KORU_OPEN_FLAGS_ALL, KORU_POLL_ERR, KORU_POLL_EVENTS_ALL,
+    KORU_POLL_HUP, KORU_POLL_IN, KORU_POLL_OUT, KORU_POLL_PRI, KORU_POLL_RDHUP,
+    KORU_SETUP_FLAGS_ALL, KORU_SQE_FLAGS_ALL,
 };
 use koru_sys::error::{KINDS, KORU_ERRNOS};
 use koru_sys::ring::DEV_KORU;
@@ -271,6 +273,49 @@ fn main() {
         "u32",
         KORU_CQE_F_MORE as u64,
     );
+    konst(&mut out, &mut c, "KORU_POLL_IN", "u32", KORU_POLL_IN as u64);
+    konst(
+        &mut out,
+        &mut c,
+        "KORU_POLL_OUT",
+        "u32",
+        KORU_POLL_OUT as u64,
+    );
+    konst(
+        &mut out,
+        &mut c,
+        "KORU_POLL_PRI",
+        "u32",
+        KORU_POLL_PRI as u64,
+    );
+    konst(
+        &mut out,
+        &mut c,
+        "KORU_POLL_RDHUP",
+        "u32",
+        KORU_POLL_RDHUP as u64,
+    );
+    konst(
+        &mut out,
+        &mut c,
+        "KORU_POLL_ERR",
+        "u32",
+        KORU_POLL_ERR as u64,
+    );
+    konst(
+        &mut out,
+        &mut c,
+        "KORU_POLL_HUP",
+        "u32",
+        KORU_POLL_HUP as u64,
+    );
+    konst(
+        &mut out,
+        &mut c,
+        "KORU_POLL_EVENTS_ALL",
+        "u32",
+        KORU_POLL_EVENTS_ALL as u64,
+    );
 
     for (name, v) in [
         ("KORU_IOC_SETUP", KORU_IOC_SETUP),
@@ -291,6 +336,7 @@ fn main() {
         ("KORU_OP_CHECKSUM", KORU_OP_CHECKSUM),
         ("KORU_OP_WRITE", KORU_OP_WRITE),
         ("KORU_OP_ADOPT_FD", KORU_OP_ADOPT_FD),
+        ("KORU_OP_POLL_ADD", KORU_OP_POLL_ADD),
     ] {
         let _ = writeln!(out, "opcode {name} {v}");
         c.opcodes += 1;

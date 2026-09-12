@@ -31,6 +31,12 @@ pub(crate) fn eloop() -> Error {
     Error::from_errno(-(kernel::uapi::ELOOP as i32))
 }
 
+/// `EOPNOTSUPP`: a poll whose file wants two waitqueues. `error::code` has
+/// `ENOTSUPP`, which is a different number and is not a uapi errno.
+pub(crate) fn eopnotsupp() -> Error {
+    Error::from_errno(-(kernel::uapi::EOPNOTSUPP as i32))
+}
+
 /// Set by userspace in [`KoruParams::magic`]. Spells "koru" little-endian.
 pub(crate) const KORU_MAGIC: u32 = 0x7572_6f6b;
 
@@ -196,9 +202,43 @@ pub(crate) const KORU_OP_WRITE: u8 = 7; // T17
 /// Adopting any koru descriptor is `ELOOP` — it would make the ring
 /// unreachable by `release` and the module unloadable.
 pub(crate) const KORU_OP_ADOPT_FD: u8 = 8; // T19
+/// Wait for one of the events in `len` on `handle`, once. `off` and `slot`
+/// must be zero. `res` is the event mask that fired, always non-negative and
+/// never confusable with an errno.
+///
+/// Single-shot: admission control reserves a CQ slot per consumed SQE, so a
+/// multishot poll would have no home for its second completion.
+///
+/// A file on no waitqueue — every regular file, which has no `poll` method —
+/// completes at once with its default mask, and `res` is 0 where none of the
+/// asked-for events are in it. Nothing could ever wake such a poll, so waiting
+/// would pin a CQ reservation for the life of the ring.
+pub(crate) const KORU_OP_POLL_ADD: u8 = 9; // T22
 
 /// Any bit set is rejected.
 pub(crate) const KORU_SQE_FLAGS_ALL: u8 = 0;
+
+// Poll events, carried in a `POLL_ADD` SQE's `len` and returned in `res`.
+// koru's own bit values, like the open flags: the host `EPOLL*` constants are
+// `__force`-cast and vary in spelling, and this way `res` stays small.
+
+/// Readable, or end of file on a stream.
+pub(crate) const KORU_POLL_IN: u32 = 1 << 0;
+/// Writable.
+pub(crate) const KORU_POLL_OUT: u32 = 1 << 1;
+/// Out-of-band data.
+pub(crate) const KORU_POLL_PRI: u32 = 1 << 2;
+/// The peer closed its writing half.
+pub(crate) const KORU_POLL_RDHUP: u32 = 1 << 3;
+/// Error. Reported whether or not it was asked for.
+pub(crate) const KORU_POLL_ERR: u32 = 1 << 4;
+/// Hang-up. Reported whether or not it was asked for.
+pub(crate) const KORU_POLL_HUP: u32 = 1 << 5;
+
+/// Any bit outside this completes with `EINVAL`, and so does an empty mask:
+/// a poll for nothing can only ever report an error.
+pub(crate) const KORU_POLL_EVENTS_ALL: u32 =
+    KORU_POLL_IN | KORU_POLL_OUT | KORU_POLL_PRI | KORU_POLL_RDHUP | KORU_POLL_ERR | KORU_POLL_HUP;
 
 // Open flags, carried in an `OPEN` SQE's `handle` field. koru's own bit values,
 // not the host `O_*` constants, which vary by architecture. The kernel

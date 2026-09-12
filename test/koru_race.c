@@ -6,10 +6,14 @@
 //
 // Why the iteration counts are what they are: doc/Notes.md.
 
+#include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <netinet/in.h>
 #include <stdio.h>
 #include <string.h>
+#include <pthread.h>
+#include <sys/socket.h>
 #include <unistd.h>
 
 #include "koru_check.h"
@@ -20,7 +24,8 @@
 #define READ_ITERS   400
 #define CANCEL_ITERS 300
 /* Longer: this is the only loop that reaches the -EALREADY window. */
-#define ALREADY_ITERS 1000
+#define ALREADY_ITERS   1000
+#define POLL_RACE_ITERS 1000
 #define LEAK_ITERS    200
 
 void sec_devchurn(void)
@@ -347,6 +352,114 @@ static void cancel_leak(void)
         note("file-nr %ld -> %ld", before, after);
 }
 
+/* A free-running poker, so each round's datagram lands wherever it lands
+ * rather than always before the cancel. */
+struct poke {
+    int fd;
+    struct sockaddr_in addr;
+    volatile int stop;
+};
+
+static void *poke_thread(void *arg)
+{
+    struct poke *p = arg;
+
+    while (!p->stop) {
+        sendto(p->fd, "k", 1, 0, (struct sockaddr *)&p->addr, sizeof(p->addr));
+        usleep(50);
+    }
+    return NULL;
+}
+
+/* T22: the wake and the cancel race for the same one-shot token. Exactly one
+ * wins, the poll completes exactly once either way, and the loser's answer
+ * says which. A UDP datagram is the sharpest shot: it arrives in a softirq
+ * rather than inside the sender's own write. */
+static void poll_race(void)
+{
+    struct sockaddr_in addr;
+    socklen_t alen = sizeof(addr);
+    struct koru_sqe sq[1];
+    struct koru_cqe cq[4];
+    const struct koru_cqe *t, *c;
+    unsigned completed = 0;
+    int rx, tx, i, bad = 0, n_cancel = 0, n_woke = 0;
+    struct poke poker;
+    pthread_t th;
+    int64_t h;
+    uint8_t buf[8];
+
+    rx = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0);
+    tx = socket(AF_INET, SOCK_DGRAM, 0);
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family      = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (rx < 0 || tx < 0 || bind(rx, (struct sockaddr *)&addr, sizeof(addr)) != 0 ||
+        getsockname(rx, (struct sockaddr *)&addr, &alen) != 0) {
+        check(0, "bind a UDP socket for the poll race");
+        goto out;
+    }
+    h = r_adopt(&R, rx);
+    if (h <= 0) {
+        check(0, "adopt the UDP socket");
+        goto out;
+    }
+    poker.fd   = tx;
+    poker.addr = addr;
+    poker.stop = 0;
+    if (pthread_create(&th, NULL, poke_thread, &poker) != 0) {
+        check(0, "start the poker thread");
+        goto out;
+    }
+
+    for (i = 0; i < POLL_RACE_ITERS; i++) {
+        sqe_poll(&sq[0], (uint32_t)h, KORU_POLL_IN, 0x80);
+        if (submit(R.fd, sq, 1, cq, 0, 0, &completed) != 1) {
+            bad = 1;
+            break;
+        }
+        sqe_cancel(&sq[0], 0x80, 0x81);
+        if (submit(R.fd, sq, 1, cq, 4, 2, &completed) != 1 || completed != 2) {
+            bad = 1;
+            break;
+        }
+        t = find_cqe(cq, completed, 0x80);
+        c = find_cqe(cq, completed, 0x81);
+        if (!t || !c) {
+            bad = 1;
+            break;
+        }
+        if (t->res == -ECANCELED && c->res == 0)
+            n_cancel++;
+        /* ENOENT rather than EALREADY when the wake completed before the
+         * cancel was even submitted: the registry entry is already gone. */
+        else if (t->res == KORU_POLL_IN && (c->res == -EALREADY || c->res == -ENOENT))
+            n_woke++;
+        else {
+            bad = 1;
+            break;
+        }
+        /* Drain, or the next arm is ready before it is armed. */
+        while (recv(rx, buf, sizeof(buf), 0) > 0)
+            ;
+    }
+    poker.stop = 1;
+    pthread_join(th, NULL);
+    check(!bad, "1000 cancel races against a poll wake hold C1");
+    check(n_cancel + n_woke == POLL_RACE_ITERS, "  every round answered one way or the other");
+    /* Both arms, or the loop proves only one of them. Measured with margin. */
+    check_ge(n_cancel, 20, "  the cancel won often enough");
+    check_ge(n_woke, 20, "  and the wake won often enough");
+    note("cancelled %d, woken %d", n_cancel, n_woke);
+    check_res(r_close(&R, (uint32_t)h), 0, "  the handle closes afterwards");
+
+out:
+    if (rx >= 0)
+        close(rx);
+    if (tx >= 0)
+        close(tx);
+}
+
 void sec_races(void)
 {
     read_race();
@@ -355,5 +468,6 @@ void sec_races(void)
     cancel_race(2 * MS, 250, 0, "cancel races against an armed timer:");
     cancel_race(0, 0, 50, "cancel races against the worker:");
     already_race();
+    poll_race();
     cancel_leak();
 }

@@ -117,6 +117,13 @@ int main()
     konst("KORU_O_NONBLOCK", "u32", KORU_O_NONBLOCK);
     konst("KORU_OPEN_FLAGS_ALL", "u32", KORU_OPEN_FLAGS_ALL);
     konst("KORU_CQE_F_MORE", "u32", KORU_CQE_F_MORE);
+    konst("KORU_POLL_IN", "u32", KORU_POLL_IN);
+    konst("KORU_POLL_OUT", "u32", KORU_POLL_OUT);
+    konst("KORU_POLL_PRI", "u32", KORU_POLL_PRI);
+    konst("KORU_POLL_RDHUP", "u32", KORU_POLL_RDHUP);
+    konst("KORU_POLL_ERR", "u32", KORU_POLL_ERR);
+    konst("KORU_POLL_HUP", "u32", KORU_POLL_HUP);
+    konst("KORU_POLL_EVENTS_ALL", "u32", KORU_POLL_EVENTS_ALL);
 
 #define IOCTL(name)                                                     \
     do {                                                                \
@@ -142,6 +149,7 @@ int main()
     OPCODE(KORU_OP_CHECKSUM);
     OPCODE(KORU_OP_WRITE);
     OPCODE(KORU_OP_ADOPT_FD);
+    OPCODE(KORU_OP_POLL_ADD);
 #undef OPCODE
 
     {

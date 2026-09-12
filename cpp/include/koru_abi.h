@@ -207,6 +207,7 @@ KORU_STATIC_ASSERT(KORU_IOC_ENTER == 0xc0406b02u, "ioctl ENTER");
 #define KORU_OP_CHECKSUM 6
 #define KORU_OP_WRITE    7
 #define KORU_OP_ADOPT_FD 8
+#define KORU_OP_POLL_ADD 9
 
 KORU_STATIC_ASSERT(KORU_OP_NOP == 0, "op NOP");
 KORU_STATIC_ASSERT(KORU_OP_DELAY_NS == 1, "op DELAY_NS");
@@ -217,9 +218,25 @@ KORU_STATIC_ASSERT(KORU_OP_CANCEL == 5, "op CANCEL");
 KORU_STATIC_ASSERT(KORU_OP_CHECKSUM == 6, "op CHECKSUM");
 KORU_STATIC_ASSERT(KORU_OP_WRITE == 7, "op WRITE");
 KORU_STATIC_ASSERT(KORU_OP_ADOPT_FD == 8, "op ADOPT_FD");
+KORU_STATIC_ASSERT(KORU_OP_POLL_ADD == 9, "op POLL_ADD");
 
 /* Any bit set in an SQE's flags is rejected. */
 #define KORU_SQE_FLAGS_ALL 0u
+
+/* Poll events, carried in a POLL_ADD SQE's len and returned in res. koru's own
+ * bit values, like the open flags. ERR and HUP are reported whether or not
+ * they were asked for. */
+#define KORU_POLL_IN    (1u << 0) /* readable, or end of file on a stream */
+#define KORU_POLL_OUT   (1u << 1) /* writable */
+#define KORU_POLL_PRI   (1u << 2) /* out-of-band data */
+#define KORU_POLL_RDHUP (1u << 3) /* the peer closed its writing half */
+#define KORU_POLL_ERR   (1u << 4)
+#define KORU_POLL_HUP   (1u << 5)
+
+/* Any bit outside this completes EINVAL, and so does an empty mask. */
+#define KORU_POLL_EVENTS_ALL                                                                       \
+    (KORU_POLL_IN | KORU_POLL_OUT | KORU_POLL_PRI | KORU_POLL_RDHUP | KORU_POLL_ERR |               \
+     KORU_POLL_HUP)
 
 /* Open flags, carried in an OPEN SQE's handle field. koru's own bit values,
  * not the host O_*; the kernel translates. */

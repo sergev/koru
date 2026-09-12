@@ -5,14 +5,14 @@ code in this repository.
 
 ## State of the repository
 
-**T0–T21 are done: Braam's hello world runs through koru.** The module
-registers `/dev/koru`, configures a ring with `SETUP`, and submits `NOP`,
-`DELAY_NS`, `CHECKSUM`, `OPEN`, `READ`, `WRITE`, `CLOSE` and `CANCEL` through
-`ENTER`, which blocks for completions. The arena is mmap'd, with slot
-exclusivity enforced by the kernel. Open files live in a generational handle
-table. A queued op can be genuinely dequeued, and `close(fd)` cancels whatever
-is still queued. The whole validation surface has been fuzzed under KASAN,
-lockdep and kmemleak.
+**T0–T22 are done: Braam's hello world runs through koru, and the ring can
+wait for a descriptor.** The module registers `/dev/koru`, configures a ring
+with `SETUP`, and submits `NOP`, `DELAY_NS`, `CHECKSUM`, `OPEN`, `READ`,
+`WRITE`, `CLOSE`, `CANCEL`, `ADOPT_FD` and `POLL_ADD` through `ENTER`, which
+blocks for completions. The arena is mmap'd, with slot exclusivity enforced by
+the kernel. Open files live in a generational handle table. A queued op can be
+genuinely dequeued, and `close(fd)` cancels whatever is still queued. The
+whole validation surface has been fuzzed under KASAN, lockdep and kmemleak.
 
 T13 added `rust/sys`: the ABI mirror, the ioctl wrappers, `Ring`, `Arena`,
 `BufPool` and the errno table, with the T4–T11 matrix re-expressed as Rust
@@ -66,6 +66,16 @@ T18's gate refuses a blocking non-regular file and koru never sets `O_NONBLOCK`
 on a descriptor it did not open. The file position is userspace's own
 bookkeeping, which Braam's three-write hello world is what forces. `EPIPE`
 joined the errno table as `Closed`.
+
+T22 added `KORU_OP_POLL_ADD`, a third op shape beside inline and deferred:
+**armed**. The wake callback runs with the waitqueue head's spinlock held and,
+for a socket, in softirq, so it may take no koru lock, complete nothing and
+touch no list — it wins a one-shot token and enqueues, and a kworker does the
+rest. That token is what `CANCEL` and `release` use too, and `release` must
+disarm inside the `pending` lock, before the files are dropped. A file on no
+waitqueue is never armed: it completes at once, with `res` 0 where none of the
+asked-for events can ever come. Lockdep is the only oracle for the callback's
+rule; doc/Notes.md has all five perturbations.
 
 T14 made the two userspace ABI mirrors a diff rather than a promise.
 `cpp/include/koru_abi.h` and `cpp/include/koru_errno.h` are the C mirrors,
@@ -163,7 +173,7 @@ survived**.
 
 ## Commands
 
-These work today (T0 through T21):
+These work today (T0 through T22):
 
 ```sh
 KDIR=../kernel-dev/linux-source-7.1

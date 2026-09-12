@@ -12,6 +12,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -1091,4 +1094,231 @@ void sec_creds(void)
     check(WIFEXITED(st) && WEXITSTATUS(st) == 0,
           "an unprivileged submitter gets EACCES on " SHADOW);
     ring_close(&m);
+}
+
+/* T22: a one-shot poll, armed on the file's own waitqueue. */
+
+#define POLLFIFO "/tmp/koru-check-pollfifo"
+
+static void poll_udp(void);
+
+/* An armed poll must produce nothing until its event arrives. */
+static int poll_quiet(struct koru_ring *r, struct koru_cqe *cq, unsigned space)
+{
+    struct koru_enter e;
+
+    memset(&e, 0, sizeof(e));
+    e.cq_addr      = (uint64_t)(uintptr_t)cq;
+    e.cq_space     = space;
+    e.min_complete = 1;
+    e.timeout_ns   = 100 * MS;
+    if (ioctl(r->fd, KORU_IOC_ENTER, &e) < 0)
+        return -1;
+    return (int)e.completed;
+}
+
+/* Wait for one completion, up to a second. */
+static int poll_wait_one(struct koru_ring *r, struct koru_cqe *cq, unsigned space)
+{
+    struct koru_enter e;
+
+    memset(&e, 0, sizeof(e));
+    e.cq_addr      = (uint64_t)(uintptr_t)cq;
+    e.cq_space     = space;
+    e.min_complete = 1;
+    e.timeout_ns   = 1000 * MS;
+    if (ioctl(r->fd, KORU_IOC_ENTER, &e) < 0)
+        return -1;
+    return (int)e.completed;
+}
+
+/* Arm on `handle`, then have `poke` make it ready. The FIFO and the socket
+ * differ in exactly one thing: a socket wakes from softirq. */
+static void poll_stream(struct koru_ring *r, int64_t h, int poke, const char *what)
+{
+    struct koru_sqe sq[1];
+    struct koru_cqe cq[4];
+    unsigned completed = 0;
+    char label[96];
+
+    sqe_poll(&sq[0], (uint32_t)h, KORU_POLL_IN, 0x300);
+    snprintf(label, sizeof(label), "%s: POLL_ADD arms without completing", what);
+    check(submit(r->fd, sq, 1, cq, 4, 0, &completed) == 1 && completed == 0, label);
+
+    snprintf(label, sizeof(label), "  and stays quiet while nothing is readable");
+    check(poll_quiet(r, cq, 4) == 0, label);
+
+    check(write(poke, "k", 1) == 1, "  the peer writes a byte");
+    completed = (unsigned)poll_wait_one(r, cq, 4);
+    if (completed == 1 && cq[0].user_data == 0x300) {
+        check_res(cq[0].res, KORU_POLL_IN, "  and the poll completes with the read bit");
+    } else {
+        check(0, "  and the poll completes with the read bit");
+        note("completed %u", completed);
+    }
+}
+
+void sec_poll(void)
+{
+    struct koru_sqe sq[1];
+    struct koru_cqe cq[8];
+    const struct koru_cqe *t, *c;
+    unsigned completed = 0;
+    int sv[2], peer, rd;
+    int64_t h;
+    uint8_t buf[8];
+
+    /* 1. A regular file has no poll method, so it is always ready. */
+    h = r_open(&R, PATH_SLOT, PATFILE, KORU_O_RDONLY);
+    check(h > 0, "OPEN a regular file");
+    if (h > 0) {
+        sqe_poll(&sq[0], (uint32_t)h, KORU_POLL_IN, 0x200);
+        check_res(run_one(R.fd, &sq[0]), KORU_POLL_IN,
+                  "  POLL_ADD on it completes at once, readable");
+        sqe_poll(&sq[0], (uint32_t)h, KORU_POLL_OUT, 0x201);
+        check_res(run_one(R.fd, &sq[0]), KORU_POLL_OUT, "  and writable, from the default mask");
+
+        /* Rejection matrix. */
+        sqe_poll(&sq[0], (uint32_t)h, KORU_POLL_IN, 0x202);
+        sq[0].off = 1;
+        check_res(run_one(R.fd, &sq[0]), -EINVAL, "  POLL_ADD with a non-zero off is EINVAL");
+        sqe_poll(&sq[0], (uint32_t)h, KORU_POLL_IN, 0x203);
+        sq[0].slot = 1;
+        check_res(run_one(R.fd, &sq[0]), -EINVAL, "  a non-zero slot is EINVAL");
+        sqe_poll(&sq[0], (uint32_t)h, 0, 0x204);
+        check_res(run_one(R.fd, &sq[0]), -EINVAL, "  an empty event mask is EINVAL");
+        sqe_poll(&sq[0], (uint32_t)h, KORU_POLL_IN | (1u << 6), 0x205);
+        check_res(run_one(R.fd, &sq[0]), -EINVAL, "  an unknown event bit is EINVAL");
+        check_res(r_close(&R, (uint32_t)h), 0, "  and it closes");
+    }
+    sqe_poll(&sq[0], 0, KORU_POLL_IN, 0x206);
+    check_res(run_one(R.fd, &sq[0]), -EBADF, "POLL_ADD on a zero handle is EBADF");
+
+    /* 2. A FIFO: read-only, so pipe_poll asks for one waitqueue. */
+    unlink(POLLFIFO);
+    if (mkfifo(POLLFIFO, 0600) != 0) {
+        check(0, "create the poll FIFO");
+        return;
+    }
+    peer = open(POLLFIFO, O_RDWR | O_NONBLOCK);
+    h    = peer < 0 ? -1 : r_open(&R, PATH_SLOT, POLLFIFO, KORU_O_RDONLY | KORU_O_NONBLOCK);
+    check(h > 0, "OPEN the FIFO for reading");
+    if (h > 0) {
+        poll_stream(&R, h, peer, "FIFO");
+        check(read(peer, buf, sizeof(buf)) == 1, "  and the byte is still there to read");
+
+        /* 3. Cancel an armed poll. Nothing may complete afterwards. */
+        sqe_poll(&sq[0], (uint32_t)h, KORU_POLL_IN, 0x310);
+        check(submit(R.fd, sq, 1, cq, 0, 0, &completed) == 1, "arm a second poll on the FIFO");
+        sqe_cancel(&sq[0], 0x310, 0x311);
+        check(submit(R.fd, sq, 1, cq, 8, 2, &completed) == 1 && completed == 2,
+              "  the CANCEL and the poll both complete (C1)");
+        t = find_cqe(cq, completed, 0x310);
+        c = find_cqe(cq, completed, 0x311);
+        if (t && c) {
+            check_res(t->res, -ECANCELED, "  the poll gets -ECANCELED");
+            check_res(c->res, 0, "  the canceller gets 0");
+        } else {
+            check(0, "  both CQEs carry their own user_data");
+        }
+        /* Without remove_wait_queue this is a use-after-free; without the
+         * token it is a second completion, which breaks C1. */
+        check(write(peer, "x", 1) == 1, "  the peer writes again");
+        check(poll_quiet(&R, cq, 8) == 0, "  and the cancelled poll produces no CQE at all");
+        check(read(peer, buf, sizeof(buf)) == 1, "  the byte is still readable");
+        check_res(r_close(&R, (uint32_t)h), 0, "  and the handle closes");
+    }
+
+    /* 4. A pipe opened read-write wants two waitqueues, which is refused. */
+    h = r_open(&R, PATH_SLOT, POLLFIFO, KORU_O_RDWR | KORU_O_NONBLOCK);
+    check(h > 0, "OPEN the FIFO read-write");
+    if (h > 0) {
+        sqe_poll(&sq[0], (uint32_t)h, KORU_POLL_IN, 0x320);
+        check_res(run_one(R.fd, &sq[0]), -EOPNOTSUPP,
+                  "  POLL_ADD on two waitqueues is EOPNOTSUPP");
+        check_res(r_close(&R, (uint32_t)h), 0, "  and it closes");
+    }
+    if (peer >= 0)
+        close(peer);
+    unlink(POLLFIFO);
+
+    /* 5. A stream socket. Its wake is the writer's own process context, like
+     *    the FIFO's, but it reaches us through the socket layer. */
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) {
+        check(0, "create a socketpair");
+        return;
+    }
+    h = r_adopt(&R, sv[0]);
+    check(h > 0, "adopt one end of a socketpair");
+    if (h > 0) {
+        poll_stream(&R, h, sv[1], "socket");
+        rd = (int)read(sv[0], buf, sizeof(buf));
+        check(rd == 1, "  and the byte is still there to read");
+        check_res(r_close(&R, (uint32_t)h), 0, "  and the handle closes");
+    }
+    close(sv[0]);
+    close(sv[1]);
+
+    /* 6. A UDP socket on loopback, which is the case the wake-callback rule is
+     *    actually about: the datagram arrives in the NET_RX softirq, so the
+     *    callback runs there rather than in any process's context. */
+    poll_udp();
+}
+
+/* Bind a UDP socket on loopback and report where. */
+static int udp_bind(struct sockaddr_in *addr)
+{
+    socklen_t len = sizeof(*addr);
+    int fd        = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0);
+
+    if (fd < 0)
+        return -1;
+    memset(addr, 0, sizeof(*addr));
+    addr->sin_family      = AF_INET;
+    addr->sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (bind(fd, (struct sockaddr *)addr, sizeof(*addr)) != 0 ||
+        getsockname(fd, (struct sockaddr *)addr, &len) != 0) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+static void poll_udp(void)
+{
+    struct sockaddr_in addr;
+    struct koru_sqe sq[1];
+    struct koru_cqe cq[4];
+    unsigned completed = 0;
+    int rx, tx;
+    int64_t h;
+    uint8_t buf[8];
+
+    rx = udp_bind(&addr);
+    tx = rx < 0 ? -1 : socket(AF_INET, SOCK_DGRAM, 0);
+    if (rx < 0 || tx < 0) {
+        check(0, "bind a UDP socket on loopback");
+        if (rx >= 0)
+            close(rx);
+        return;
+    }
+
+    h = r_adopt(&R, rx);
+    check(h > 0, "adopt a UDP socket");
+    if (h > 0) {
+        sqe_poll(&sq[0], (uint32_t)h, KORU_POLL_IN, 0x330);
+        check(submit(R.fd, sq, 1, cq, 4, 0, &completed) == 1 && completed == 0,
+              "  POLL_ADD on it arms without completing");
+        check(sendto(tx, "k", 1, 0, (struct sockaddr *)&addr, sizeof(addr)) == 1,
+              "  a datagram arrives through the softirq");
+        completed = (unsigned)poll_wait_one(&R, cq, 4);
+        if (completed == 1 && cq[0].user_data == 0x330)
+            check_res(cq[0].res, KORU_POLL_IN, "  and the poll completes with the read bit");
+        else
+            check(0, "  and the poll completes with the read bit");
+        check(recv(rx, buf, sizeof(buf), 0) == 1, "  and the datagram is still there");
+        check_res(r_close(&R, (uint32_t)h), 0, "  and the handle closes");
+    }
+    close(rx);
+    close(tx);
 }
