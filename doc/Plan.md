@@ -51,10 +51,10 @@ decision landed. If you renumber again, fix the references in
 [README.md](../README.md), [CLAUDE.md](../CLAUDE.md), [Notes.md](Notes.md) and
 `test/`.
 
-Rust lives in a Cargo workspace under `user/`: `koru-sys` holds the ABI structs,
+Rust lives in a Cargo workspace under `rust/`: `koru-sys` holds the ABI structs,
 the ioctl wrappers and `abi_dump`; `koru` holds the futures, the executor and
-the surface. C++ lives in `user/cpp`, with names in `namespace koru` and
-`user/cpp/include/koru/braam.hpp` hoisting them to global scope, so a Braam
+the surface. C++ lives in `cpp`, with names in `namespace koru` and
+`cpp/include/koru/braam.hpp` hoisting them to global scope, so a Braam
 source compiles with one added include.
 
 The two bindings share no code. That is the point: the second one exists to show
@@ -65,14 +65,6 @@ ABI.
 
 ## Phase 4 — the Rust binding
 
-### T13 [M] — `koru-sys` crate
-
-`#[repr(C)]` ABI structs, ioctl wrappers, `Ring::{setup, enter, mmap}`, and
-`size_of` assertions against the kernel's. Plus the errno-to-`Error` table,
-which both bindings need and which is ABI-adjacent.
-
-Done test: the T4–T11 tests re-expressed as Rust integration tests, passing.
-
 ### T14 [M] — ABI conformance and `abi_dump`
 
 Pulled ahead of the rest of the C++ work, because this is an ABI task rather
@@ -80,11 +72,15 @@ than a C++ one, and it is the only thing that keeps `koru_abi.rs` and
 `koru_abi.h` in step while the kernel phases add eleven opcodes and two structs
 to both.
 
-Create `user/cpp/include/koru_abi.h` from `test/koru_abi.h`, with
+Create `cpp/include/koru_abi.h` from `test/koru_abi.h`, with
 `static_assert` on every `sizeof`, `offsetof` and opcode value. The current
 mirror carries the structs but none of the `KORU_MAX_*` caps, the three
 `*_FLAGS_ALL` masks or `KORU_CQE_F_MORE`; add those. Then an `abi_dump` binary
 on each side, emitting a canonical text dump of the whole surface.
+
+`abi_dump` also emits `koru_sys::error::KORU_ERRNOS`, so the C++ transcription
+of that table at T39 is diffed rather than asserted. `rust/koru-sys/src/abi.rs`
+already carries the caps and masks the C mirror omits; take them from there.
 
 Done test: the `diff` of the two dumps is empty, and perturbing one field in
 either file makes it fail. Verify that, or the test proves nothing.
@@ -273,7 +269,9 @@ so the mapping loses nothing. Native `Result` and `?`. Aliases where Braam's
 names differ from Rust's.
 
 Done test: a table-driven check that every errno koru can produce maps to
-exactly one `Error` and back to a raw errno, sharing the table with T13's.
+exactly one `Error` and back to a raw errno, over `koru_sys::error::KORU_ERRNOS`
+unchanged. `Error` and the fifteen names already exist in `koru-sys`; re-export
+them rather than defining a second type, or every T15 call site sees both.
 
 ### T21 [M] — the ambient ring and runtime entry, Rust
 
@@ -682,7 +680,7 @@ one of them is actually wanted.
 
 ### T33 [M] — the screen protocol ABI
 
-`user/screen/ks_abi.h`, canonical because the daemon is the server and the
+`screen/ks_abi.h`, canonical because the daemon is the server and the
 server owns the protocol. A 16-byte header of `len`, `op`, `flags`, `seq` and
 `res`, the op table, per-op flag masks, and the payload structs. Mirrored by a
 Rust module, with a dump on each side sharing T14's runner. koru's discipline
@@ -886,9 +884,9 @@ RAII `Ring` covering open, `SETUP`, `mmap` and close. `BufPool`, move-only
 `BufSlot` with deleted copy operations, raw `submit()` and `reap()`, and
 `result<T>` carrying both the Braam `Error` and the raw errno. No coroutines.
 
-Done test: the T4–T11 matrix re-expressed in C++, the same assertions as T13 in
-a different language. Any divergence is an ABI ambiguity worth fixing before
-coroutines hide it.
+Done test: the T4–T11 matrix re-expressed in C++, mirroring the test list in
+`rust/koru-sys/tests/kernel.rs` case for case. Any divergence is an ABI
+ambiguity worth fixing before coroutines hide it.
 
 ### T40 [R] — op slab and awaiter
 
@@ -1031,7 +1029,9 @@ lands:
 1. `make -C test && scripts/run.sh` — the module's own check, in a VM. Covers
    the fuzz, the kmemleak scan past its minimum object age, the creds cases,
    the lockdep breakages and a clean `rmmod`.
-2. `cargo test -p koru-sys` — ABI round-trip and per-opcode tests (T13).
+2. `scripts/run-rust.sh` — the Rust suite, in a VM. `(cd rust && cargo test -p
+   koru-sys --lib)` is the host-only half: ABI assertions, the ioctl numbers
+   and the errno table, with no device needed.
 3. `cargo test -p koru` — futures, executor, drop safety and the Rust surface
    (T15, T16, T20, T21, T30–T32), plus the screen client against its fake
    daemon (T37).

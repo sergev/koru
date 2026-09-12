@@ -5,14 +5,19 @@ code in this repository.
 
 ## State of the repository
 
-**T0–T12 are done: the kernel side is finished.** The module registers
+**T0–T13 are done: the kernel side is finished and the Rust ABI layer
+exists.** The module registers
 `/dev/koru`, configures a ring with `SETUP`, and submits `NOP`, `DELAY_NS`,
 `CHECKSUM`, `OPEN`, `READ`, `CLOSE` and `CANCEL` through `ENTER`, which blocks
 for completions. The arena is mmap'd, with slot exclusivity enforced by the
 kernel. Open files live in a generational handle table. A queued op can be
 genuinely dequeued, and `close(fd)` cancels whatever is still queued. The whole
-validation surface has been fuzzed under KASAN, lockdep and kmemleak. Everything
-from here is userspace.
+validation surface has been fuzzed under KASAN, lockdep and kmemleak.
+
+T13 added `rust/koru-sys`: the ABI mirror, the ioctl wrappers, `Ring`, `Arena`,
+`BufPool` and the errno table, with the T4–T11 matrix re-expressed as Rust
+integration tests. It also moved the whole project onto rustup's rustc 1.98.1.
+Everything from here is userspace.
 
 - `doc/Notes.md` — the global picture: design, ABI invariants, research
   findings, accepted gaps, and what T0–T12 established. It records *why* several
@@ -24,6 +29,9 @@ from here is userspace.
   format; `koru.rs` holds the device, the ring state and the `ENTER` path, and
   `koru_ops.rs` holds opcode dispatch, the op implementations and `OpWork`.
 - `test/` — `koru_check`, the one integrated test for the module. See Commands.
+- `rust/` — the Cargo workspace. `koru-sys` is the raw binding; `koru` (the
+  futures, executor and Braam surface) joins at T15. C++ gets its own directory
+  beside it.
 - `scripts/` — the guest-side check and the host-side runner that boots the VM,
   plus the dev kernel's config fragment. It has its own README.
 
@@ -72,14 +80,23 @@ full build takes about 9 minutes and the tree is ~5.4 GB. After any config
 change, re-check that the options actually survived `olddefconfig` —
 `merge_config.sh` drops unmet ones silently.
 
-Verified toolchain (all from Debian testing): rustc 1.95.0 with rust-src,
-bindgen 0.72.1, clang and lld 21, `make LLVM=1`. `make LLVM=1 rustavailable`
-passes. Floors from the design were rustc 1.85.0 and bindgen 0.71.1. For C++:
-GCC ≥ 11 or Clang ≥ 14, `-std=c++20`, built with `-fsanitize=address,undefined`.
+Verified toolchain: rustc and cargo 1.98.1 from **rustup**, with the `rust-src`
+component, plus bindgen 0.72.1, clang and lld 21 from Debian testing, and
+`make LLVM=1`. `make LLVM=1 rustavailable` passes. Floors from the design were
+rustc 1.85.0 and bindgen 0.71.1. For C++: GCC ≥ 11 or Clang ≥ 14, `-std=c++20`,
+built with `-fsanitize=address,undefined`.
+
+T13 moved the whole project off Debian's rustc 1.95.0 onto rustup's 1.98.1;
+`~/.cargo/env` puts it ahead of `/usr/bin`. Kernel Rust needs `rust-src`, so
+`rustup component add rust-src` is not optional. One config option changed:
+`RUSTC_CLANG_LLVM_COMPATIBLE` is gone, because rustc now carries LLVM 22 against
+clang's 21. It gates only `RUST_INLINE_HELPERS`, which was never on. After any
+toolchain move, re-run `olddefconfig` and **re-check the fragment options
+survived**.
 
 ## Commands
 
-These work today (T0 through T12):
+These work today (T0 through T13):
 
 ```sh
 KDIR=../kernel-dev/linux-source-7.1
@@ -104,6 +121,14 @@ make -C test
 scripts/run.sh
 scripts/run.sh open read cancel   # just those sections
 KORU_SEED=12345 scripts/run.sh    # replay a fuzz failure
+
+# The Rust binding. The library half needs no device and runs on the host in
+# under a second; the integration suite needs /dev/koru, so it runs in a VM.
+(cd rust && cargo fmt --all -- --check)
+(cd rust && cargo test -p koru-sys --lib)
+(cd rust && cargo test -p koru-sys --no-run)   # build before the runner
+scripts/run-rust.sh
+scripts/run-rust.sh cancel read                # only matching test names
 ```
 
 `test/koru_check` is the entire test suite for the module: one binary, one
@@ -111,8 +136,17 @@ shared ring, one process, plus the two `rmmod` races that need a second one.
 `test/koru_abi.h` is a hand-written mirror of `kernel/koru_abi.rs`, so **a
 change there means a matching change in that one place**, and its
 `_Static_assert`s are what catch you forgetting. T14 replaces that file with the
-real `user/cpp/include/koru_abi.h`. The binding suites come later: Rust at T13,
-C++ at T39.
+real `cpp/include/koru_abi.h`. Since T13 there is a **third** copy,
+`rust/koru-sys/src/abi.rs`, so a wire-format change is three edits until T14
+makes the agreement a diff. The C++ suite comes at T39.
+
+`rust/koru-sys/tests/kernel.rs` is the Rust suite, T4–T11 plus the T3 matrices,
+run by `scripts/rust.sh` in its own VM boot. It does **not** supersede
+`koru_check`, which keeps the fuzz, the two `rmmod` races and the heavy-phase
+leak window. Two gates exist because `#[test]` can pass without proving
+anything: a filter matching nothing exits 0, so `rust.sh` asserts a minimum
+passed count in `WANT_PASSED`, which must be raised when a test is added; and a
+skipped precondition prints `KORU-RS-SKIP`, which fails the run.
 
 **Section order in `koru_check` is load-bearing.** Everything that allocates in
 bulk runs first and is marked `heavy` in the table in `koru_check.c`; the binary
@@ -270,7 +304,6 @@ The rest of `doc/Plan.md`'s Verification sequence does not work yet; the
 load-bearing ones will be:
 
 ```sh
-cargo test -p koru-sys          # Rust ABI + per-opcode integration tests
 cargo run --example read_file   # Rust demo
 ctest --test-dir build          # C++ tests, under ASan+UBSan
 diff <(./build/abi_dump) <(cargo run -q --bin abi_dump)   # must be empty
@@ -348,7 +381,7 @@ wrappers.
 
 ## Cross-language ABI
 
-`kernel/koru_abi.rs` is canonical; `user/cpp/include/koru_abi.h` mirrors it.
+`kernel/koru_abi.rs` is canonical; `cpp/include/koru_abi.h` mirrors it.
 They are kept identical by a conformance test (T14) that diffs an `abi_dump`
 emitted by each side. When you touch either file, run that diff — and confirm
 the test actually fails when you perturb a field, or it proves nothing.

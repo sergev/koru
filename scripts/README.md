@@ -106,6 +106,31 @@ kmemleak, the debug-objects family. Deliberately off: `MODVERSIONS`,
 change, re-check that the options survived `olddefconfig` — `merge_config.sh`
 drops unmet ones silently.
 
+## The Rust suite
+
+`scripts/rust.sh` and `scripts/run-rust.sh` are the same shape for
+`rust/koru-sys`'s integration tests: its own VM boot, its own verdict line
+`KORU-RUST-PASS`, and the same insmod, kmemleak, taint and dmesg gates.
+`check.sh` is untouched, because it carries every pass condition for the kernel
+and is meant to stay small.
+
+```sh
+(cd ../rust && cargo test -p koru-sys --no-run)   # build first, as above
+scripts/run-rust.sh
+scripts/run-rust.sh cancel read                   # only matching test names
+```
+
+Two gates exist that `check.sh` does not need, because `cargo test` can succeed
+without running anything. A filter matching nothing exits 0, so `WANT_PASSED`
+sets a minimum passed count and must be raised when a test is added. And a
+skipped precondition prints `KORU-RS-SKIP`, which fails the run rather than
+passing quietly.
+
+It pays a flat six-second kmemleak window instead of the stamp arithmetic
+below: libtest orders tests by name, so the suite cannot promise the heavy-first
+ordering that budget depends on. The kernel is unchanged, so leak coverage is
+still `koru_check`'s job.
+
 ## Adding a check
 
 Put it in the section it belongs to, or add a section to the table in

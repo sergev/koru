@@ -786,7 +786,7 @@ unmapped descriptor, and the credentials test maps after forking.
 ### `koru_abi.h` split out
 
 The ABI mirror moved out of `test/koru_test.h` into `test/koru_abi.h` on its
-own. T14 creates `user/cpp/include/koru_abi.h` with exactly that content, so it
+own. T14 creates `cpp/include/koru_abi.h` with exactly that content, so it
 becomes an include swap rather than surgery inside a header that also carries
 harness declarations, and the "change it in one place" rule now points at a file
 containing only the mirror.
@@ -812,6 +812,216 @@ The third of those is the one worth noticing. It passed cleanly at first, and
 the reason was not that the check was weak but that the bug is unreachable until
 the race window is wide enough to enter. A green run against a deliberately
 broken kernel is a statement about coverage, not about correctness.
+
+## The Rust binding
+
+`rust/koru-sys` is the raw layer: the ABI mirror, the ioctl wrappers, `Ring`,
+`Arena`, `BufPool` and the errno table. The kernel side is unchanged.
+
+### Two toolchains became one, at 1.98.1
+
+T13 began with Debian's rustc 1.95.0 and no cargo at all. Cargo arrived through
+rustup, which also brought rustc 1.98.1 and put `~/.cargo/bin` ahead of
+`/usr/bin`; the Debian packages were then removed. That broke module builds
+outright, because the dev kernel was configured against 1.95.0 and kernel Rust
+needs `rust-src`, which rustup had not installed.
+
+The whole project moved to 1.98.1: `rustup component add rust-src`,
+`olddefconfig`, a full kernel rebuild. The tree accepts it: the floor is
+1.85.0 and `init/Kconfig` already gates a feature at `RUSTC_VERSION >= 109800`.
+The only config change was `RUSTC_CLANG_LLVM_COMPATIBLE` going away, because
+rustc now carries LLVM 22 against clang's 21. It gates nothing but
+`RUST_INLINE_HELPERS`, an EXPERT cross-language LTO option that was never on.
+Every option in
+`scripts/koru-debug.config` survived, checked mechanically rather than by eye.
+
+### Zero dependencies, and why it is worth keeping
+
+`koru-sys` has no dependencies at all. `std` already covers opening files,
+reading `/proc`, both clocks, sleeping, pipes, `strerror` and errno; only
+fourteen symbols have to be declared by hand in `src/sys.rs`, each with its C
+signature quoted above it. Nothing checks those prototypes, which is the same
+written obligation the kernel side carries for `filp_open`.
+
+rustup's cargo has no distribution crate cache, so a single dependency would
+mean a network fetch and a lockfile pinned to whatever `stable` was that week.
+An empty `Cargo.lock` is the artifact that proves the claim.
+
+Two simplifications fell out. `getpwnam` is replaced by parsing `/etc/passwd`,
+which keeps the forked credentials child free of allocating libc calls. And no
+threads: `koru_race.c` links `-pthread` but creates none, and a thread would
+make every later `fork` unsafe.
+
+### The ioctl number is derived on both sides
+
+`src/sys.rs` reimplements the asm-generic `_IOC` encoding, so the three command
+numbers come from `size_of::<KoruParams>()` and `size_of::<KoruEnter>()` exactly
+as the kernel's `kernel::ioctl::_IOWR::<T>` does. A struct size change therefore
+moves the number on both sides at once, and the kernel's size-and-direction
+check rejects a skewed userspace with `EPROTO`.
+
+That was verified by adding a field to `KoruParams` on the kernel side alone:
+the host unit tests still pass, and 56 of 58 device tests fail with errno 71 at
+`SETUP`. The three literal constants pinned in a unit test are a **canary for
+that break**, not a duplicate of the arithmetic. Without them it surfaces only
+as an unexplained `EPROTO` inside the VM. Do not delete them as redundant.
+
+### What is safe, and what cannot be
+
+`Ring::enter` is safe, and the reason is the strongest thing the Rust binding
+has to say: `sq_addr` and `cq_addr` are derived from real slices, so the kernel
+reads and writes memory Rust has proved is live, and `cq: &mut [Cqe]` proves
+exclusivity for the half the kernel writes. It takes `&self`, because the kernel
+serialises submitters itself and T15 will hold the ring behind an `Rc`.
+
+`Arena::slot` and `slot_mut` are `unsafe`. A kworker writes into the arena, and
+handing out `&mut [u8]` over memory a kernel thread is concurrently writing is
+UB by Rust's own rules whatever `MAP_SHARED` says. `BufSlot` is the wrapper that
+discharges the obligation: it is move-only, and submitting an op *moves* it into
+the op state, so no `&mut` can exist while the kernel holds the slot.
+
+**`Arena` deliberately does not borrow `Ring`.** The mapping outlives
+`close(fd)`, and the test for that is `let a = ring.mmap()?; drop(ring);
+a.slot(2)`. A lifetime tying the two together would make that property
+inexpressible rather than merely untested.
+
+**The raw layer stays `pub`.** Most of the rejection matrix cannot be expressed
+through the safe API: a well-typed `enter` cannot send `to_submit` past
+`sq_entries`, a non-zero reserved word, an unmapped `sq_addr`, or a `SETUP`
+encoded read-only. Hiding `enter_raw`, `setup_raw` and `ioctl_raw` would make
+the safe API's claim to be safe untestable. This is a deliberate export.
+
+### `enter` must lose none of its three outcomes
+
+The ioctl carries a consumed count, a `submitted`/`completed` writeback, and an
+errno, and the writeback happens **even on `-EINTR`**. So `EnterError` carries
+`Progress` alongside the errno, and `enter_raw` reads the writeback out of the
+struct *before* it looks at the return value. Breaking that order was tested
+from both ends: deleting the kernel's writeback fails only the SIGINT test,
+and reordering the two reads in the binding fails it too.
+
+A short `submitted` or `completed` is never an error. Admission control produces
+the first, a timeout or quiescence the second.
+
+Two smaller traps. `Some(Duration::ZERO)` would map to `timeout_ns = 0`, which
+means *no cap*, so it is rejected locally rather than silently inverting the
+caller's intent. And the suite asserts `consumed == progress.submitted` on every
+success — E1 reports the two independently, so checking they agree is free and
+the C suite never did it.
+
+### The errno table
+
+`KORU_ERRNOS` is a closed set of every errno koru can produce, each row carrying
+the kernel path it comes from. The reason column is what makes the table
+reviewable instead of a copy of `errno.h`.
+
+Five rows are judgement calls, settled here rather than rediscovered later.
+`EBUSY` is a slot collision and `EALREADY` a cancel that lost its race, so both
+are `Again`. `EMFILE` is an exhausted handle table, a resource limit, so
+`NoMemory`. `EPROTO` and `ENOTTY` are version skew, so `Unsupported`.
+
+`Error` carries the vocabulary name *and* the raw errno, which is what keeps the
+mapping lossless where several errnos share a name. `Kind::Closed` has no errno
+preimage at all: end of file is `res == 0`, and T30's `read_chunk` is what turns
+one into the other. T20 adds the aliases and `?` conversions over this table
+unchanged, and should re-export `Error` rather than define a second type.
+
+### Idiomatic `#[test]`, and the two gates it needs
+
+The suite is ordinary `#[test]` functions rather than a transcription of
+`koru_check.c`'s section table. The C harness's soft assertions are genuinely
+better, since a section reports every failure it has rather than only the
+first, so tests are cut finely enough that one failure hides little. It runs
+with
+`--test-threads=1`, because three tests fork and several read process-global
+counters.
+
+That choice opens two ways to pass without proving anything, and both needed a
+gate in `scripts/rust.sh`:
+
+- **A filter matching nothing exits 0.** `cargo test -p koru-sys nosuchname`
+  runs zero tests and succeeds. The script runs unfiltered and asserts the
+  passed count against `WANT_PASSED`. Raise it when a test is added.
+- **A skip is indistinguishable from a pass.** Preconditions that fail print a
+  `KORU-RS-SKIP` marker and the script fails the run on it. That makes the Rust
+  suite stricter than the C one, where `sec_creds` can skip and still pass;
+  worth back-porting.
+
+The skip gate had a real bug when first written: it anchored the grep at
+`^KORU-RS-SKIP`, but under `--nocapture` libtest prefixes the line with
+`test <name> ... `, so it never matched. Found by forcing a skip and watching
+the run pass. A gate that has not been shown to fire is not a gate.
+
+Three shapes the `#[test]` choice forces. A forked child may call only the raw
+prototypes and must leave through `_exit`: a panic would unwind into libtest and
+report twice, and a `println!` would flush the parent's inherited buffer. The
+credentials test maps the arena *after* forking, because `VM_DONTCOPY` means the
+child cannot inherit it. And a test that can hang arms `alarm()` itself, with a
+handler that `_exit`s — never a watchdog thread, which would make every later
+fork unsafe.
+
+### Its own boot, and a flat leak window
+
+`scripts/rust.sh` and `scripts/run-rust.sh` mirror `check.sh` and `run.sh`:
+insmod, run, rmmod, kmemleak, taint exactly 4096, and the same gating dmesg
+scan. `check.sh` is untouched, because it carries every pass condition for the
+kernel and is meant to stay small.
+
+One deliberate difference. `check.sh` earns its leak window by running bulk
+allocators first and stamping `KORU-HEAVY-END-MS`, and that ordering is
+load-bearing. libtest orders tests by name, so this suite cannot promise it;
+`rust.sh` pays a flat six seconds instead. The kernel is unchanged at T13, so
+leak coverage belongs to `check.sh` and the Rust scan is a regression net.
+
+### A race that was nearly a flake
+
+The slot-exclusivity tests first used 4 KB slots, copying the C section's
+geometry. Two `CHECKSUM`s on one slot in a single batch are a collision only
+if the first op's worker cannot finish before the submit loop dispatches the
+second, and at 4 KB it sometimes could. The test failed as collateral damage
+during an unrelated breakage, then passed eight times out of eight in
+isolation. Raised to 64 KB, the same reasoning this file already records for
+the shared ring, it became deterministic.
+
+Worth generalising: a test that asserts a race was won is only as good as the
+window, and the window is a property of the geometry, not of the assertion.
+
+### What the suite does not re-express
+
+`devchurn`, because `ringchurn`'s 300 lifecycles already cover open and close.
+The hostile-userspace fuzz, because its target is the kernel's validation
+surface, which the C fuzzer covers, and a second transcription of its per-opcode
+oracle adds no information. And the two `rmmod` races, which need a second
+process driven by the shell against an unchanged kernel and are already gated by
+`check.sh`. The `setup` and `ioctl` matrices *are* included despite being T3,
+because T13 owns the ioctl numbers and a wrong direction bit is the likeliest
+defect in a hand-written `_IOWR`.
+
+### What was shown to fail
+
+Every one of these was applied to the kernel, rebuilt, run, and reverted. The
+value is in which tests failed, not that some did.
+
+- Neutralise the ioctl **direction** check, or return `EPROTO` where the
+  dispatcher owes `ENOTTY`: only `ioctl_dispatch_matrix` fails, once each.
+- Return the **completion count** from `ENTER` instead of the consumed count:
+  14 tests fail, including the new `consumed == submitted` cross-check.
+- Delete the **`EINTR` writeback**: only the SIGINT test fails. Reordering the
+  two reads in `enter_raw` fails it from the userspace side too.
+- Make `slot_try_acquire` **always succeed**: the four exclusivity assertions
+  fail and every distinct-slot case stays green.
+- Delete the **slot bounds guard** before `slot_try_acquire`: the guest dies and
+  the run reports no verdict, which is the gate firing the hard way.
+- Stop bumping the **handle generation** on `CLOSE`: only the two handle tests
+  fail.
+- Accept **`MAP_PRIVATE`**: only `mmap_rejection_matrix` fails.
+- Add a field to **`KoruParams`** kernel-side only: the host unit tests still
+  pass, and 56 of 58 device tests fail with `EPROTO` at `SETUP`.
+
+The cancel-versus-running-`CHECKSUM` loop reaches the `-EALREADY` window about
+once per thousand rounds, matching what the C suite measures. That is what makes
+the cancel refcount rule testable in both directions, so the count is printed
+rather than gated.
 
 ## C++20 userspace binding
 
@@ -955,7 +1165,7 @@ In dependency order. The kernel files marked *exists* are written; the rest
 arrive with their tasks.
 
 - `kernel/koru_abi.rs` — `#[repr(C)]` SQE/CQE/params/ioctl definitions.
-  Mirrored byte-for-byte by `user/koru-sys/src/abi.rs`. The most consequential
+  Mirrored byte-for-byte by `rust/koru-sys/src/abi.rs`. The most consequential
   file in the project. *exists*
 - `kernel/koru.rs` — `MiscDevice` impl, the `Arc<RingCtx>` graph, admission
   control. *exists*
@@ -964,24 +1174,35 @@ arrive with their tasks.
 - `kernel/koru_arena.rs` — `KVec<Page>`, the `mmap` validation matrix, the
   `vm_insert_page` loop, slot busy tracking. The arena code is still in
   `koru.rs`; split it out when it grows enough to be worth the churn.
-- `user/koru/src/lib.rs` — op slab, `OpState` owning `BufSlot`, `Future` impls,
+- `rust/koru-sys/src/abi.rs` — the userspace mirror of `koru_abi.rs`, with the
+  same assertions as compile-time `const` checks. *exists*
+- `rust/koru-sys/src/sys.rs` — the fourteen hand-declared libc prototypes, the
+  `_IOC` encoding and the typed ioctl wrappers. *exists*
+- `rust/koru-sys/src/error.rs` — `Errno`, the fifteen-name `Kind`, `Error` and
+  `KORU_ERRNOS`. *exists*
+- `rust/koru-sys/src/ring.rs` — `Ring`, `Arena`, the `ENTER` outcome types and
+  the `Sqe` constructors. *exists*
+- `rust/koru-sys/src/pool.rs` — `BufPool` and move-only `BufSlot`. *exists*
+- `rust/koru-sys/tests/kernel.rs` — the device suite, T4-T11 plus the T3
+  matrices. *exists*
+- `rust/koru/src/lib.rs` — op slab, `OpState` owning `BufSlot`, `Future` impls,
   executor.
-- `user/cpp/include/koru_abi.h` — the C mirror of `koru_abi.rs`, kept
+- `cpp/include/koru_abi.h` — the C mirror of `koru_abi.rs`, kept
   byte-identical by the T14 conformance test.
-- `user/cpp/include/koru.hpp` — `Ring`, `BufPool`, move-only `BufSlot`,
+- `cpp/include/koru.hpp` — `Ring`, `BufPool`, move-only `BufSlot`,
   `result<T>`.
-- `user/cpp/include/koru/task.hpp` — `task<T>` promise type, symmetric transfer,
+- `cpp/include/koru/task.hpp` — `task<T>` promise type, symmetric transfer,
   `sync_wait`.
-- `user/cpp/include/koru/awaiter.hpp` — op slab, `op_awaiter`, the abandonment
+- `cpp/include/koru/awaiter.hpp` — op slab, `op_awaiter`, the abandonment
   path.
-- `user/cpp/examples/read_file.cpp` — the C++20 demo.
+- `cpp/examples/read_file.cpp` — the C++20 demo.
 
-`test/` holds interim C programs, one per task, plus a shared harness. They are
-scaffolding: the real suites are the Rust one at T13 and the C++ one at T39. The
-harness header's first section is a hand-written mirror of `kernel/koru_abi.rs`,
-so a change there means a matching change in that one place, and its
-`_Static_assert`s are what catch you forgetting. T14 deletes that section in
-favour of the real `user/cpp/include/koru_abi.h`.
+`test/koru_check` stays the kernel's own check and is not superseded by the
+Rust suite: it owns the fuzz, the two `rmmod` races and the heavy-phase leak
+window. `test/koru_abi.h` is a hand-written mirror of `kernel/koru_abi.rs`, so a
+change there now means a matching change in **three** places — that header,
+`rust/koru-sys/src/abi.rs`, and the kernel file itself. T14 replaces the header
+with the real `cpp/include/koru_abi.h` and makes the agreement a diff.
 
 ## Why the tasks are ordered this way
 

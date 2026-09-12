@@ -104,9 +104,9 @@ and no `Waker`.
   the only entry point.
 - **The `mmap`'d arena** — fixed-size slots in kernel-owned pages. This is the
   data plane.
-- **`user/koru-sys`, `user/koru`** — the Rust binding: ABI structs and ioctl
+- **`rust/koru-sys`, `rust/koru`** — the Rust binding: ABI structs and ioctl
   wrappers, then `Future` impls, an executor and the Braam surface.
-- **`user/cpp`** — the C++20 binding: awaiters, `task<T>` and an executor.
+- **`cpp`** — the C++20 binding: awaiters, `task<T>` and an executor.
 
 The coroutines are entirely in userspace. Kernel Rust has no async runtime, so
 the kernel side is a dispatch table plus a worker pool — the same split io_uring
@@ -114,7 +114,7 @@ makes with `io-wq`.
 
 ## Status
 
-**The kernel module works; the bindings are not written yet.** It registers
+**The kernel module works, and the Rust ABI layer is written.** It registers
 `/dev/koru` and runs `NOP`, `DELAY_NS`, `CHECKSUM`, `OPEN`, `READ`, `CLOSE` and
 `CANCEL` through `ENTER`. The arena is mapped and slot exclusivity is enforced
 by the kernel, open files live in a generational handle table, a queued
@@ -125,6 +125,12 @@ KASAN, lockdep and kmemleak with no kernel messages.
 One binary, `test/koru_check`, is the entire test suite for the module.
 `scripts/run.sh` boots a VM, runs it and prints one verdict line in about half a
 minute.
+
+`rust/koru-sys` is the first half of the Rust binding: the `#[repr(C)]` ABI
+mirror, the ioctl wrappers, the ring and its arena, a buffer pool, and the errno
+table. Its integration suite re-expresses the module's own tests against that
+API, so the two independent views of the wire format have to agree.
+`scripts/run-rust.sh` runs it in a VM. The futures and the executor are next.
 
 Next is userspace, and the Braam decision reopens the kernel for one phase:
 there is no `WRITE` opcode yet, and `OPEN` refuses anything but regular files

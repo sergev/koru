@@ -20,3 +20,6 @@ test/*
 !test/*.c
 !test/*.h
 !test/Makefile
+
+# Cargo build output for the Rust binding.
+rust/target/

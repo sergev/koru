@@ -1,0 +1,9 @@
+# The Rust binding. `koru` (futures, executor, surface) joins at T15; a member
+# path that does not exist is a hard error, so it is added when it is created.
+[workspace]
+members = ["koru-sys"]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+license = "GPL-2.0"

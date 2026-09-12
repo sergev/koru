@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 
-//! The koru wire format. **Canonical**; `user/cpp/include/koru_abi.h` mirrors
-//! it and T16 diffs the two.
+//! The koru wire format. **Canonical**; `cpp/include/koru_abi.h` mirrors
+//! it and T14 diffs the two.
 //!
 //! Two rules hold everywhere: reserved fields must be zero and unknown flag bits
 //! are rejected, and nothing has padding (`AsBytes` forbids uninitialised bytes).
