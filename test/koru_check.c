@@ -57,6 +57,7 @@ static const struct sec sections[] = {
     { "checksum", sec_checksum, 0 },
     { "open", sec_open, 0 },
     { "read", sec_read, 0 },
+    { "nonblock", sec_nonblock, 0 },
     { "delay", sec_delay, 0 },
     { "cancel", sec_cancel, 0 },
     { "signals", sec_signals, 0 },

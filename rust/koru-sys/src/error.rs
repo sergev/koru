@@ -80,6 +80,7 @@ pub const EPERM: Errno = Errno(1);
 pub const ENOENT: Errno = Errno(2);
 pub const EINTR: Errno = Errno(4);
 pub const EIO: Errno = Errno(5);
+pub const ENXIO: Errno = Errno(6);
 pub const EBADF: Errno = Errno(9);
 pub const EAGAIN: Errno = Errno(11);
 pub const ENOMEM: Errno = Errno(12);
@@ -167,6 +168,12 @@ pub const KORU_ERRNOS: &[ErrnoDef] = &[
         produced_by: "kernel_read, propagated verbatim",
     },
     ErrnoDef {
+        errno: ENXIO,
+        name: "ENXIO",
+        kind: Kind::NotFound,
+        produced_by: "a write-only non-blocking OPEN of a FIFO with no reader",
+    },
+    ErrnoDef {
         errno: EBADF,
         name: "EBADF",
         kind: Kind::Invalid,
@@ -176,7 +183,7 @@ pub const KORU_ERRNOS: &[ErrnoDef] = &[
         errno: EAGAIN,
         name: "EAGAIN",
         kind: Kind::Again,
-        produced_by: "enqueue_delayed failed to queue a deferred op",
+        produced_by: "a non-blocking READ or WRITE with nothing ready, or a failed enqueue",
     },
     ErrnoDef {
         errno: ENOMEM,

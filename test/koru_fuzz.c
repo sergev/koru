@@ -166,7 +166,9 @@ static void gen_valid(uint64_t *s, struct koru_sqe *q, uint64_t ud, uint32_t pat
         uint32_t flags;
 
         /* WRFILE is the only path ever opened for writing. A writable handle
-         * plus a random offset would otherwise corrupt whatever it names. */
+         * plus a random offset would otherwise corrupt whatever it names.
+         * No FIFO here either: the hostile generator can clear O_NONBLOCK,
+         * and filp_open on a peerless FIFO would then hang a worker. */
         if (one_in(s, 3)) {
             path  = FUZZWRFILE;
             flags = KORU_O_RDWR;
@@ -174,6 +176,8 @@ static void gen_valid(uint64_t *s, struct koru_sqe *q, uint64_t ud, uint32_t pat
             path  = one_in(s, 2) ? PATFILE : HOSTNAME;
             flags = KORU_O_RDONLY;
         }
+        if (one_in(s, 4))
+            flags |= KORU_O_NONBLOCK; /* a no-op on a regular file */
         sqe_open(q, path_slot, 0, put_path(arena, F_SLOT, path_slot, path), flags, ud);
         break;
     }

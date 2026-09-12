@@ -97,34 +97,6 @@ existing "unimplemented completes `-EINVAL`" rule. A new bit in an existing
 Per-opcode meanings for `Cqe::extra` are within its documented contract. New
 data-plane structs change no existing size or offset.
 
-### T18 [M] — `KORU_O_NONBLOCK` and the non-regular-file gate
-
-`RWF_NOWAIT` is not the mechanism. `kiocb_set_rw_flags` returns `-EOPNOTSUPP`
-unless `f_mode & FMODE_NOWAIT`, and a `filp_open`'d FIFO never has that bit — it
-is set only by `pipe(2)`, `sock_alloc_file`, eventfd, timerfd, signalfd and
-userfaultfd. A tty never sets it, and `n_tty` checks `f_flags & O_NONBLOCK` and
-nothing else. The mechanism is `O_NONBLOCK` at open time.
-
-Add the flag to `KORU_OPEN_FLAGS_ALL`, translate it in `open_flags`, and relax
-`check_readable` and `check_writable` to admit a non-regular file when and only
-when `f_flags & O_NONBLOCK` is set. **koru never sets or clears that bit on a
-file it did not open**: for an adopted descriptor the `struct file` is shared
-with the rest of the process, so flipping it on stdin changes behaviour for
-everything else holding that open file description.
-
-This also closes a denial of service Notes.md lists as accepted. A blocking
-`filp_open` on a peerless FIFO stalls the whole ring *before* the file-type
-check can run, and the file-type restriction does not close it. An opt-in flag
-does, with nothing changing for existing callers.
-
-Done test: opening a peerless FIFO with `KORU_O_NONBLOCK` returns promptly,
-which is the assertion that closes the stall; `READ` on it gives `-EAGAIN`; a
-FIFO handle opened without the flag is rejected at submit with `-EINVAL`, and
-deleting that check must make the test **hang** rather than fail, so arm the
-alarm and keep stdout line-buffered. The regular-file restriction was one of two
-independent readability guards, so re-verify the surviving `f_op` guard on its
-own rather than assuming it.
-
 ### T19 [M] — `KORU_OP_ADOPT_FD`
 
 A handle for an already-open descriptor, so stdin, stdout and stderr are usable.

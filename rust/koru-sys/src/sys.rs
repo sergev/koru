@@ -26,6 +26,7 @@ pub type PidT = i32;
 pub type UidT = u32;
 pub type GidT = u32;
 pub type OffT = i64;
+pub type ModeT = u32;
 
 unsafe extern "C" {
     /// `int ioctl(int fd, unsigned long request, ...);`
@@ -76,6 +77,9 @@ unsafe extern "C" {
 
     /// `int setgroups(size_t size, const gid_t *list);`
     pub fn setgroups(size: usize, list: *const GidT) -> c_int;
+
+    /// `int mkfifo(const char *pathname, mode_t mode);`
+    pub fn mkfifo(pathname: *const std::ffi::c_char, mode: ModeT) -> c_int;
 }
 
 pub const PROT_READ: c_int = 0x1;

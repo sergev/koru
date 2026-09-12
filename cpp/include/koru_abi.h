@@ -227,10 +227,15 @@ KORU_STATIC_ASSERT(KORU_OP_WRITE == 7, "op WRITE");
 #define KORU_O_RDWR      2u
 #define KORU_O_NOFOLLOW  (1u << 2) /* ELOOP rather than following a symlink */
 #define KORU_O_DIRECTORY (1u << 3) /* ENOTDIR unless the path is a directory */
+/* Open without blocking, and make READ and WRITE answer EAGAIN rather than
+ * wait. Required to READ or WRITE anything but a regular file. koru never sets
+ * or clears O_NONBLOCK on a file it did not open. */
+#define KORU_O_NONBLOCK (1u << 4)
 
 /* Any bit outside this completes EINVAL. No O_CREAT: no field carries a
  * creation mode. */
-#define KORU_OPEN_FLAGS_ALL (KORU_O_ACCMODE | KORU_O_NOFOLLOW | KORU_O_DIRECTORY)
+#define KORU_OPEN_FLAGS_ALL                                                                        \
+    (KORU_O_ACCMODE | KORU_O_NOFOLLOW | KORU_O_DIRECTORY | KORU_O_NONBLOCK)
 
 /* Multishot bit, reserved and never set. */
 #define KORU_CQE_F_MORE (1u << 0)

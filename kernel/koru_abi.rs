@@ -164,7 +164,7 @@ pub(crate) const KORU_OP_DELAY_NS: u8 = 1; // T5
 pub(crate) const KORU_OP_OPEN: u8 = 2; // T9
 /// Read `len` bytes from file offset `off` of `handle` into slot `slot`, at
 /// slot offset 0. `res` is the count actually read: short at EOF, 0 at or past
-/// it. Regular files only.
+/// it. Regular files, or anything opened `KORU_O_NONBLOCK`.
 pub(crate) const KORU_OP_READ: u8 = 3; // T10
 /// Retire the handle in `handle`. `len`, `off` and `slot` must be zero.
 pub(crate) const KORU_OP_CLOSE: u8 = 4; // T9
@@ -178,8 +178,9 @@ pub(crate) const KORU_OP_CANCEL: u8 = 5; // T11
 pub(crate) const KORU_OP_CHECKSUM: u8 = 6; // T7
 /// Write `len` bytes from slot `slot`, at slot offset 0, to file offset `off`
 /// of `handle`. `res` is the count written; short is a result, not an error.
-/// Regular files only. A non-zero `off` needs a seekable file, else `EINVAL`;
-/// on an `O_APPEND` handle the kernel appends and `off` is ignored.
+/// Regular files, or anything opened `KORU_O_NONBLOCK`. A non-zero `off` needs
+/// a seekable file, else `EINVAL`; on an `O_APPEND` handle the kernel appends
+/// and `off` is ignored.
 pub(crate) const KORU_OP_WRITE: u8 = 7; // T17
 
 /// Any bit set is rejected.
@@ -200,11 +201,19 @@ pub(crate) const KORU_O_RDWR: u32 = 2;
 pub(crate) const KORU_O_NOFOLLOW: u32 = 1 << 2;
 /// Fail with `ENOTDIR` unless the path names a directory.
 pub(crate) const KORU_O_DIRECTORY: u32 = 1 << 3;
+/// Open without blocking, and make `READ` and `WRITE` answer `EAGAIN` rather
+/// than wait. Required to `READ` or `WRITE` anything but a regular file: a
+/// blocking transfer in a kworker cannot be interrupted.
+///
+/// **koru never sets or clears `O_NONBLOCK` on a file it did not open.** An
+/// adopted descriptor's `struct file` is shared with the rest of the process,
+/// so flipping it on stdin would change behaviour for every other holder.
+pub(crate) const KORU_O_NONBLOCK: u32 = 1 << 4;
 
 /// Any bit outside this completes with `EINVAL`. No `O_CREAT`: there is no
 /// field for a creation mode.
 pub(crate) const KORU_OPEN_FLAGS_ALL: u32 =
-    KORU_O_ACCMODE | KORU_O_NOFOLLOW | KORU_O_DIRECTORY;
+    KORU_O_ACCMODE | KORU_O_NOFOLLOW | KORU_O_DIRECTORY | KORU_O_NONBLOCK;
 
 /// Multishot bit, reserved and never set: admission control forecloses multishot.
 #[expect(dead_code)]

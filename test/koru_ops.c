@@ -181,9 +181,12 @@ static void flag_matrix(void)
     check_res(r_open(&R, PATH_SLOT, "/etc", KORU_O_WRONLY), -EISDIR,
               "O_WRONLY on a directory is EISDIR");
 
-    /* Regular files and directories only. */
-    check_res(r_open(&R, PATH_SLOT, "/dev/null", KORU_O_RDONLY), -EINVAL,
-              "OPEN of a device node is EINVAL");
+    /* Since T18 OPEN gates on nothing: READ and WRITE carry the file-type
+     * rule, and sec_nonblock proves it. */
+    h = r_open(&R, PATH_SLOT, "/dev/null", KORU_O_RDONLY);
+    check(h > 0, "OPEN of a device node yields a handle");
+    if (h > 0)
+        check_res(r_close(&R, (uint32_t)h), 0, "  and closes");
 
     unlink(LINKPATH);
     if (symlink(HOSTNAME, LINKPATH) == 0) {
@@ -498,6 +501,110 @@ void sec_write(void)
     check_res(r_close(&R, (uint32_t)h), 0, "the handle closes");
     close(fd);
     unlink(WRFILE);
+}
+
+/* T18: KORU_O_NONBLOCK, and the gate that moved off OPEN onto READ/WRITE. */
+
+#define FIFOPATH "/tmp/koru-check-fifo"
+
+void sec_nonblock(void)
+{
+    uint8_t buf[64];
+    int64_t h, wh;
+    uint64_t t0;
+    int peer;
+    ssize_t n;
+
+    unlink(FIFOPATH);
+    if (mkfifo(FIFOPATH, 0600) != 0) {
+        printf("%-58s SKIP (cannot mkfifo)\n", "a peerless FIFO opens at once");
+        return;
+    }
+
+    /* Closes the stall: without the flag filp_open blocks for ever. */
+    t0 = now_ms();
+    h  = r_open(&R, PATH_SLOT, FIFOPATH, KORU_O_RDONLY | KORU_O_NONBLOCK);
+    check(h > 0, "a peerless FIFO opens with KORU_O_NONBLOCK");
+    check(now_ms() - t0 < 500, "  and returns at once rather than waiting for a writer");
+
+    /* No writer is EOF, not EAGAIN: pipe_read checks writers first. */
+    if (h > 0) {
+        check_res(r_read(&R, (uint32_t)h, 1, 0, 64), 0, "  READ with no writer is 0, not EAGAIN");
+        check_res(r_close(&R, (uint32_t)h), 0, "  and it closes");
+    }
+
+    /* fifo_open owes ENXIO here. */
+    check_res(r_open(&R, PATH_SLOT, FIFOPATH, KORU_O_WRONLY | KORU_O_NONBLOCK), -ENXIO,
+              "a peerless FIFO opened write-only is ENXIO");
+
+    /* O_RDWR is both peers, so nothing below blocks and no fork is needed. */
+    peer = open(FIFOPATH, O_RDWR | O_NONBLOCK);
+    if (peer < 0) {
+        check(0, "hold the FIFO open as its own peer");
+        unlink(FIFOPATH);
+        return;
+    }
+
+    /* A writer exists and the pipe is empty: now it is EAGAIN. */
+    h = r_open(&R, PATH_SLOT, FIFOPATH, KORU_O_RDONLY | KORU_O_NONBLOCK);
+    check(h > 0, "OPEN the FIFO non-blocking with a peer attached");
+    if (h > 0) {
+        check_res(r_read(&R, (uint32_t)h, 1, 0, 64), -EAGAIN, "  an empty FIFO READ is EAGAIN");
+
+        memset(R.arena + R.slot_size, 0, 64);
+        check(write(peer, "koru", 4) == 4, "  the peer writes four bytes");
+        check(r_read(&R, (uint32_t)h, 1, 0, 64) == 4 &&
+                  memcmp(R.arena + R.slot_size, "koru", 4) == 0,
+              "  and READ returns them");
+
+        /* No FMODE_LSEEK, so `off` names nothing. */
+        check_res(r_read(&R, (uint32_t)h, 1, 1, 64), -EINVAL,
+                  "  a non-zero off on an unseekable READ is EINVAL");
+        check_res(r_close(&R, (uint32_t)h), 0, "  and it closes");
+    }
+
+    /* Delete the gate and this hangs rather than fails. */
+    h = r_open(&R, PATH_SLOT, FIFOPATH, KORU_O_RDONLY);
+    check(h > 0, "OPEN the FIFO without the flag, which the peer makes possible");
+    if (h > 0) {
+        check_res(r_read(&R, (uint32_t)h, 1, 0, 64), -EINVAL,
+                  "  READ through it is EINVAL, not a blocked kworker");
+        check_res(r_close(&R, (uint32_t)h), 0, "  and it closes");
+    }
+
+    /* WRITE takes the same gate. */
+    wh = r_open(&R, PATH_SLOT, FIFOPATH, KORU_O_WRONLY | KORU_O_NONBLOCK);
+    check(wh > 0, "OPEN the FIFO for writing, non-blocking");
+    if (wh > 0) {
+        memcpy(R.arena + 2 * (size_t)R.slot_size, "ring", 4);
+        check_res(r_write(&R, (uint32_t)wh, 2, 0, 4), 4, "  WRITE puts four bytes in");
+        n = read(peer, buf, sizeof(buf));
+        check(n == 4 && memcmp(buf, "ring", 4) == 0, "  and the peer reads them back");
+        check_res(r_write(&R, (uint32_t)wh, 2, 1, 4), -EINVAL,
+                  "  a non-zero off on an unseekable WRITE is EINVAL");
+        check_res(r_close(&R, (uint32_t)wh), 0, "  and it closes");
+    }
+
+    close(peer);
+    unlink(FIFOPATH);
+
+    /* Non-blocking clears the type check, so only the f_op guard is left. */
+    h = r_open(&R, PATH_SLOT, "/etc", KORU_O_RDONLY | KORU_O_DIRECTORY | KORU_O_NONBLOCK);
+    check(h > 0, "OPEN a directory non-blocking");
+    if (h > 0) {
+        check_res(r_read(&R, (uint32_t)h, 1, 0, 64), -EINVAL,
+                  "  READ of it is EINVAL from the f_op guard alone");
+        check_res(r_close(&R, (uint32_t)h), 0, "  and it closes");
+    }
+
+    /* OPEN no longer gates on the file type; READ does. */
+    h = r_open(&R, PATH_SLOT, "/dev/null", KORU_O_RDONLY);
+    check(h > 0, "OPEN of a device node now yields a handle");
+    if (h > 0) {
+        check_res(r_read(&R, (uint32_t)h, 1, 0, 64), -EINVAL,
+                  "  but READ without the flag is EINVAL");
+        check_res(r_close(&R, (uint32_t)h), 0, "  and it closes");
+    }
 }
 
 void sec_delay(void)

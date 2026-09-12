@@ -5,7 +5,7 @@ code in this repository.
 
 ## State of the repository
 
-**T0–T17 are done: the Rust binding runs and the kernel has reopened.**
+**T0–T18 are done: the Rust binding runs and the kernel has reopened.**
 The module registers `/dev/koru`, configures a ring with `SETUP`, and submits
 `NOP`, `DELAY_NS`, `CHECKSUM`, `OPEN`, `READ`, `WRITE`, `CLOSE` and `CANCEL`
 through `ENTER`, which blocks for completions. The arena is mmap'd, with slot
@@ -37,6 +37,12 @@ one page-sized bounce buffer, the arena mutex never held across the VFS call.
 `features` stays zero, because `WRITE` is unconditional. Two of its guards are
 not falsifiable yet and one never will be by errno alone; doc/Notes.md says
 which and why.
+
+T18 added `KORU_O_NONBLOCK`, so a FIFO can be opened and read. The file-type
+gate moved off `OPEN`, which now refuses nothing, onto `check_readable` and
+`check_writable`, which admit a non-regular file only when it was opened
+non-blocking. Two of its six perturbations fail as a hang rather than an
+assertion, and two of them retire gaps T17 had to record as untested.
 
 T14 made the two userspace ABI mirrors a diff rather than a promise.
 `cpp/include/koru_abi.h` and `cpp/include/koru_errno.h` are the C mirrors,
@@ -129,7 +135,7 @@ survived**.
 
 ## Commands
 
-These work today (T0 through T17):
+These work today (T0 through T18):
 
 ```sh
 KDIR=../kernel-dev/linux-source-7.1

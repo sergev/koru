@@ -48,6 +48,7 @@ enum koru_kind { KORU_KIND_TABLE(KORU_KIND_ENUMERATOR) };
     X(ENOENT, 2, NotFound)         \
     X(EINTR, 4, Intr)              \
     X(EIO, 5, Io)                  \
+    X(ENXIO, 6, NotFound)          \
     X(EBADF, 9, Invalid)           \
     X(EAGAIN, 11, Again)           \
     X(ENOMEM, 12, NoMemory)        \

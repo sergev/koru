@@ -100,7 +100,8 @@ pub const KORU_OP_DELAY_NS: u8 = 1;
 /// open flags. `res` is the new handle, always positive.
 pub const KORU_OP_OPEN: u8 = 2;
 /// Read `len` bytes from file offset `off` of `handle` into slot `slot` at slot
-/// offset 0. `res` is the count read: short at EOF, 0 past it. Regular files.
+/// offset 0. `res` is the count read: short at EOF, 0 past it. Regular files,
+/// or anything opened `KORU_O_NONBLOCK`.
 pub const KORU_OP_READ: u8 = 3;
 /// Retire `handle`. `len`, `off`, `slot` must be zero.
 pub const KORU_OP_CLOSE: u8 = 4;
@@ -112,8 +113,9 @@ pub const KORU_OP_CANCEL: u8 = 5;
 pub const KORU_OP_CHECKSUM: u8 = 6;
 /// Write `len` bytes from slot `slot`, at slot offset 0, to file offset `off`
 /// of `handle`. `res` is the count written; short is a result, not an error.
-/// Regular files only. A non-zero `off` needs a seekable file, else `EINVAL`;
-/// on an `O_APPEND` handle the kernel appends and `off` is ignored.
+/// Regular files, or anything opened `KORU_O_NONBLOCK`. A non-zero `off` needs
+/// a seekable file, else `EINVAL`; on an `O_APPEND` handle the kernel appends
+/// and `off` is ignored.
 pub const KORU_OP_WRITE: u8 = 7;
 
 /// Any bit set is rejected.
@@ -132,10 +134,16 @@ pub const KORU_O_RDWR: u32 = 2;
 pub const KORU_O_NOFOLLOW: u32 = 1 << 2;
 /// `ENOTDIR` unless the path names a directory.
 pub const KORU_O_DIRECTORY: u32 = 1 << 3;
+/// Open without blocking, and make `READ` and `WRITE` answer `EAGAIN` rather
+/// than wait. Required to `READ` or `WRITE` anything but a regular file.
+///
+/// **koru never sets or clears `O_NONBLOCK` on a file it did not open.**
+pub const KORU_O_NONBLOCK: u32 = 1 << 4;
 
 /// Any bit outside this completes `EINVAL`. No `O_CREAT`: no field carries a
 /// creation mode.
-pub const KORU_OPEN_FLAGS_ALL: u32 = KORU_O_ACCMODE | KORU_O_NOFOLLOW | KORU_O_DIRECTORY;
+pub const KORU_OPEN_FLAGS_ALL: u32 =
+    KORU_O_ACCMODE | KORU_O_NOFOLLOW | KORU_O_DIRECTORY | KORU_O_NONBLOCK;
 
 /// Multishot bit, reserved and never set.
 pub const KORU_CQE_F_MORE: u32 = 1 << 0;
@@ -281,10 +289,11 @@ mod tests {
 
     #[test]
     fn open_flags_mask_covers_exactly_the_defined_bits() {
-        assert_eq!(KORU_OPEN_FLAGS_ALL, 0xf);
+        assert_eq!(KORU_OPEN_FLAGS_ALL, 0x1f);
         assert_eq!(KORU_O_ACCMODE, 0x3);
         assert_eq!(KORU_O_NOFOLLOW, 0x4);
         assert_eq!(KORU_O_DIRECTORY, 0x8);
+        assert_eq!(KORU_O_NONBLOCK, 0x10);
     }
 
     #[test]

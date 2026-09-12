@@ -303,12 +303,10 @@ impl RingCtx {
         // SAFETY: `filp_open` returned a reference and we take ownership of it.
         let file = unsafe { ARef::from_raw(ptr) };
 
-        // Nothing else is useful yet, and a FIFO or a device would block a
-        // later READ in a kworker with no way out. Dropped on the way past.
-        let ty = file_type(&file);
-        if ty != bindings::S_IFREG && ty != bindings::S_IFDIR {
-            return Err(EINVAL);
-        }
+        // No file-type gate here since T18: `check_readable` and
+        // `check_writable` carry it, so a handle to a socket or a device is
+        // harmless. `filp_open` ran with the caller's creds in the caller's
+        // context, so it grants no authority the caller did not have.
 
         // Bound first: a guard in the scrutinee would live across the arms, so
         // the fput below would run with the table locked.
@@ -355,6 +353,12 @@ impl RingCtx {
         // Bound first: a guard in the scrutinee would live across the arms.
         let file = self.handles.lock().resolve(sqe.handle)?;
         check_readable(&file)?;
+        // As in `write_validate`: an unseekable file would ignore `off` rather
+        // than refuse it, and silently ignoring a field is how a second
+        // implementer loses a day.
+        if sqe.off != 0 && !is_seekable(&file) {
+            return Err(EINVAL);
+        }
         Ok(file)
     }
 
@@ -681,9 +685,9 @@ fn check_readable(file: &File) -> Result<()> {
     if f_mode & (FMODE_READ | FMODE_CAN_READ) != FMODE_READ | FMODE_CAN_READ {
         return Err(EBADF);
     }
-    // Blocking reads live in a kworker with no way to interrupt them, so a FIFO
-    // or a socket would wedge a worker for good. See doc/Notes.md.
-    if file_type(file) != bindings::S_IFREG {
+    // A blocking read in a kworker cannot be interrupted, so a FIFO or a socket
+    // would wedge a worker for good unless it was opened non-blocking.
+    if file_type(file) != bindings::S_IFREG && !is_nonblock(file) {
         return Err(EINVAL);
     }
     // SAFETY: a live file always has a valid `f_op`.
@@ -706,8 +710,8 @@ fn check_writable(file: &File) -> Result<()> {
     if f_mode & (FMODE_WRITE | FMODE_CAN_WRITE) != FMODE_WRITE | FMODE_CAN_WRITE {
         return Err(EBADF);
     }
-    // A blocking write in a kworker cannot be interrupted; same rule as READ.
-    if file_type(file) != bindings::S_IFREG {
+    // Same rule as READ: non-regular needs O_NONBLOCK, or a kworker wedges.
+    if file_type(file) != bindings::S_IFREG && !is_nonblock(file) {
         return Err(EINVAL);
     }
     // SAFETY: a live file always has a valid `f_op`.
@@ -716,6 +720,14 @@ fn check_writable(file: &File) -> Result<()> {
         return Err(EINVAL);
     }
     Ok(())
+}
+
+/// Whether this file was opened non-blocking. koru only ever reads this bit;
+/// it never sets or clears it on a file it did not open.
+fn is_nonblock(file: &File) -> bool {
+    // SAFETY: as above.
+    let f_flags = unsafe { (*file.as_ptr()).f_flags };
+    f_flags & bindings::O_NONBLOCK != 0
 }
 
 /// Whether `off` means anything on this file.
@@ -778,6 +790,9 @@ fn open_flags(flags: u32) -> Result<i32> {
     }
     if flags & KORU_O_DIRECTORY != 0 {
         out |= bindings::O_DIRECTORY;
+    }
+    if flags & KORU_O_NONBLOCK != 0 {
+        out |= bindings::O_NONBLOCK;
     }
     // Always: kernel opens of regular files, with no controlling terminal.
     out |= bindings::O_LARGEFILE | bindings::O_NOCTTY;

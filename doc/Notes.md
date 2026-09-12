@@ -438,19 +438,21 @@ the rule the ring spinlock already had: **the arena mutex is taken under
 `mmap_lock`, so nothing may hold it across a call that can reach the VFS.**
 
 **Two readability guards, and each earns its place.** `check_readable` rejects a
-non-`S_IFREG` file and separately rejects a file whose `f_op` has `read` set or
-`read_iter` unset. Deleting either one alone fails no test, because both catch
-the directory case; deleting both lets the read reach `__kernel_read`, which
-answers `-EINVAL` and logs `kernel read not supported for file`. They are kept
-apart because they protect different things: only the `S_IFREG` check gives the
-blocking-file-type property, since a FIFO uses `read_iter` and would sail
-through the other one.
+file that is neither regular nor opened non-blocking, and separately rejects a
+file whose `f_op` has `read` set or `read_iter` unset. They protect different
+things: only the first gives the blocking-file-type property, since a FIFO uses
+`read_iter` and would sail through the second. Before T18 neither could be
+falsified alone, because both caught the directory case; since T18 a directory
+opened `KORU_O_NONBLOCK` clears the first and is refused only by the second, so
+each is now tested on its own.
 
-**Reads are restricted to regular files**, and `OPEN` to regular files and
-directories. A blocking read inside a kworker cannot be interrupted — `CANCEL`
-is best-effort and cannot touch work that has already started — so a read on a
-FIFO, socket or tty would consume a system workqueue thread for good. This is a
-deliberate limit; lifting it needs a non-blocking path that does not exist.
+**Reads are restricted to regular files, or to anything opened
+`KORU_O_NONBLOCK`.** A blocking read inside a kworker cannot be interrupted —
+`CANCEL` is best-effort and cannot touch work that has already started — so a
+read on a FIFO, socket or tty would consume a system workqueue thread for good.
+T18 lifted the limit the only way that is safe, by making the caller ask for a
+file that cannot block. `OPEN` itself gates on nothing since T18; the rule lives
+on `READ` and `WRITE`.
 
 **A deferred op resolves every resource it needs at submit time** and then owns
 it outright: `OpWork` carries the `Sqe` by value, an `Arc<RingCtx>`, and an
@@ -545,6 +547,77 @@ check's `all_opcodes` and the Rust suite's `ALL_OPCODES`. Both now name
 `KORU_OP_WRITE` and probe 8 instead. The fuzzer's per-opcode counters were
 sized 8 with slot 7 as an "other" bucket, so they and their `& 7` masks had to
 widen before the new opcode could be counted at all.
+
+### Non-blocking, and the gate that moved
+
+T18 added `KORU_O_NONBLOCK` and with it the first file koru can reach that is
+not a regular file or a directory. Stdin and stdout are still out of reach
+until `ADOPT_FD`, but the kernel rule they need is now in place.
+
+**`RWF_NOWAIT` is not the mechanism.** `kiocb_set_rw_flags` returns
+`-EOPNOTSUPP` unless `f_mode` carries `FMODE_NOWAIT`, and a `filp_open`'d FIFO
+never has it: only `pipe(2)`, `sock_alloc_file`, eventfd, timerfd, signalfd and
+userfaultfd set it. A tty never does, and `n_tty` looks at `f_flags &
+O_NONBLOCK` and nothing else. So the mechanism is `O_NONBLOCK` at open time.
+That works through `kernel_read` because `init_sync_kiocb` copies the `struct
+file` pointer into the iocb, and the pipe code tests `ki_filp->f_flags`
+directly. It does *not* work through `f_iocb_flags`, which encodes only
+`O_APPEND`, `O_DIRECT` and the sync flags — `IOCB_NOWAIT` is never set on this
+path.
+
+**An empty FIFO with no writer reads as 0, not `-EAGAIN`.** The pipe code checks
+for a missing writer before it looks at `O_NONBLOCK`, so end of file wins.
+`-EAGAIN` needs a writer attached and the pipe empty. The obvious expectation is
+the wrong one, and a test that asserts it passes for the wrong reason.
+
+**The gate moved off `OPEN` onto `READ` and `WRITE`.** `do_open` used to refuse
+anything but a regular file or a directory; now it refuses nothing, and
+`check_readable` and `check_writable` admit a non-regular file exactly when it
+was opened non-blocking. Three reasons. The done test needs a FIFO handle whose
+`READ` is refused, which is impossible if `OPEN` refuses the FIFO. `ADOPT_FD`
+will hand out handles that never went through `OPEN` at all, and one gate is
+better than two. And a handle to a socket or a device grants nothing: the open
+ran with the caller's credentials in the caller's context, so it is exactly what
+`open(2)` would have given them. The visible change is that `OPEN` of a device
+node now yields a handle instead of `-EINVAL`.
+
+**koru never sets or clears `O_NONBLOCK` on a file it did not open.** It only
+ever reads the bit. For an adopted descriptor the `struct file` is shared with
+the rest of the process, so flipping it on stdin would change behaviour for
+every other holder of that open file description. This is written into the
+flag's own doc comment because T19 is where the temptation arrives.
+
+`ENXIO` joined the errno table: a write-only non-blocking open of a FIFO with no
+reader is the first way koru can produce it.
+
+#### What was verified, and how
+
+Six perturbations, each reverted. **Two of them fail as a hang rather than as an
+assertion**, which is the point — a blocked kworker is what the gate exists to
+prevent, and it cannot show up as a wrong value.
+
+- Delete the non-blocking condition in `check_readable`. The `READ` of a FIFO
+  handle opened without the flag blocks in a kworker and the run stops dead
+  mid-section; the watchdog is the only thing that ends it.
+- Stop translating the flag in `open_flags`. The section produces no output at
+  all: the very first open, of a peerless FIFO, blocks inside `filp_open`. That
+  is the stall itself, reproduced.
+- Delete the `f_op` shape guard. The non-blocking directory `READ` still answers
+  `-EINVAL`, because `__kernel_read` refuses it too — but it logs `kernel read
+  not supported for file`, and the dmesg gate fails the run. Same shape as T17's
+  `FMODE_WRITE` finding: the guard's job is the log, and the gate is its oracle.
+- Delete the seekability guard in `read_validate`, then in `write_validate`. A
+  `READ` from a FIFO with a non-zero `off` answers `-EAGAIN` instead of
+  `-EINVAL`, and a `WRITE` returns a byte count, silently ignoring the field.
+  **T17 had to record both as unreachable; they are falsified now.**
+- Drop the bit from `KORU_OPEN_FLAGS_ALL`. Every open carrying it is `-EINVAL`.
+
+The fuzzer learned the flag but was deliberately given no FIFO path. Its hostile
+generator flips flag bits, so it could clear `O_NONBLOCK` and block a worker
+inside `filp_open` for ever — a hang with no diagnosis, in the one place that
+already runs for three seconds under eight threads. On the three regular files
+it does open, the flag is a no-op, which is all the coverage the translation
+needs.
 
 ### Cancellation
 
@@ -1618,13 +1691,14 @@ common logic across them.
   be `fput`: `ARef<File>` is what will let a T10 `READ` outlive a `CLOSE`, and
   you cannot `filp_close` a file another reference still holds. Invisible for
   regular files, which have no `->flush`; visible on NFS and FUSE.
-- **A blocking `OPEN` stalls the whole ring.** It runs inline, so it holds
-  `submit_lock` for the rest of its batch and every other submitter waits behind
-  a slow path lookup. That is the direct price of resolving in the submitting
-  task's context, and there is no version of this that both runs inline and does
-  not block. The file-type restriction does not close this: `filp_open` on a
-  FIFO blocks *before* we ever see the file, so the check cannot run. Closing it
-  properly means passing `O_NONBLOCK`, which changes what a later `READ` does.
+- **A blocking `OPEN` can still stall the whole ring, if the caller lets it.**
+  It runs inline, so it holds `submit_lock` for the rest of its batch and every
+  other submitter waits behind a slow path lookup. That is the direct price of
+  resolving in the submitting task's context. T18 made it avoidable rather than
+  unavoidable: `KORU_O_NONBLOCK` returns at once from a peerless FIFO, where no
+  file-type check could have helped, since `filp_open` blocks before we ever see
+  the file. What is left is self-inflicted by a caller who does not pass the
+  flag, and a slow path lookup on a regular file, which nothing can help.
 - **The arena is per fd and unaccounted**, so N open fds is N × the arena cap of
   unreclaimable memory. The device node is `0600 root:root`, which is the only
   thing bounding it.

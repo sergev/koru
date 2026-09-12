@@ -19,7 +19,7 @@
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 CPP=$ROOT/build/abi_dump
 # Raise when the surface grows.
-WANT_RECORDS=${WANT_RECORDS:-133}
+WANT_RECORDS=${WANT_RECORDS:-135}
 
 while [ $# -gt 0 ]; do
 	case $1 in

@@ -1106,11 +1106,11 @@ fn open_flag_matrix() {
         -(ENOTDIR.0 as i64)
     );
     assert_eq!(m.open_path(0, "/etc", KORU_O_WRONLY), -(EISDIR.0 as i64));
-    assert_eq!(
-        m.open_path(0, "/dev/null", KORU_O_RDONLY),
-        bad,
-        "a device node"
-    );
+    // Since T18 OPEN gates on nothing: READ and WRITE carry the type rule.
+    let d = m.open_path(0, "/dev/null", KORU_O_RDONLY);
+    assert!(d > 0, "a device node yields a handle");
+    assert_eq!(m.read_into(d as u32, 1, 0, 64), bad, "but READ refuses it");
+    assert_eq!(m.close_handle(d as u32), 0);
 
     let link = "/tmp/koru-check-rs-symlink";
     let _ = std::fs::remove_file(link);
@@ -1657,6 +1657,166 @@ fn write_releases_its_slot_when_cancelled() {
         "the cancelled WRITE never released its slot"
     );
     assert_eq!(m.close_handle(h), 0);
+    m.assert_quiesced();
+}
+
+// ---------------------------------------------------------------------------
+// T18 - KORU_O_NONBLOCK
+// ---------------------------------------------------------------------------
+
+/// A FIFO removed when the guard drops.
+struct Fifo(String);
+
+impl Fifo {
+    fn new(tag: &str) -> Option<Fifo> {
+        let path = format!("/tmp/koru-check-rs-fifo-{tag}");
+        let _ = std::fs::remove_file(&path);
+        let c = std::ffi::CString::new(path.as_str()).expect("path");
+        // SAFETY: `c` is NUL-terminated and lives across the call.
+        if unsafe { sys::mkfifo(c.as_ptr(), 0o600) } != 0 {
+            return None;
+        }
+        Some(Fifo(path))
+    }
+
+    fn path(&self) -> &str {
+        &self.0
+    }
+
+    /// Both peers at once, so nothing below blocks and no fork is needed.
+    fn peer(&self) -> std::fs::File {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(0o4000) // O_NONBLOCK
+            .open(&self.0)
+            .expect("peer")
+    }
+}
+
+impl Drop for Fifo {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// Without the flag this blocks in `filp_open` for ever, so the alarm is the
+/// only way out and a failure here is a hang.
+#[test]
+fn nonblock_opens_a_peerless_fifo_at_once() {
+    arm_alarm(30);
+    let Some(f) = Fifo::new("peerless") else {
+        skip("nonblock_opens_a_peerless_fifo_at_once", "cannot mkfifo");
+        return;
+    };
+    let m = Mapped::shared();
+
+    let t0 = Instant::now();
+    let h = m.open_path(0, f.path(), KORU_O_RDONLY | KORU_O_NONBLOCK);
+    assert!(h > 0, "a peerless FIFO opens non-blocking");
+    assert!(t0.elapsed() < Duration::from_millis(500), "it waited");
+
+    // No writer is EOF, not EAGAIN: pipe_read checks writers first.
+    assert_eq!(m.read_into(h as u32, 1, 0, 64), 0, "no writer is 0");
+    assert_eq!(m.close_handle(h as u32), 0);
+
+    assert_eq!(
+        m.open_path(0, f.path(), KORU_O_WRONLY | KORU_O_NONBLOCK),
+        -(ENXIO.0 as i64),
+        "write-only with no reader"
+    );
+    disarm_alarm();
+    m.assert_quiesced();
+}
+
+#[test]
+fn nonblock_read_and_write_a_fifo() {
+    arm_alarm(30);
+    let Some(f) = Fifo::new("rw") else {
+        skip("nonblock_read_and_write_a_fifo", "cannot mkfifo");
+        return;
+    };
+    let mut peer = f.peer();
+    let m = Mapped::shared();
+
+    let h = m.open_path(0, f.path(), KORU_O_RDONLY | KORU_O_NONBLOCK);
+    assert!(h > 0);
+    assert_eq!(
+        m.read_into(h as u32, 1, 0, 64),
+        -(EAGAIN.0 as i64),
+        "a writer exists and the pipe is empty"
+    );
+
+    peer.write_all(b"koru").expect("peer write");
+    assert_eq!(m.read_into(h as u32, 1, 0, 64), 4);
+    assert_eq!(&m.slot(1)[..4], b"koru");
+
+    // A FIFO has no FMODE_LSEEK, so `off` names nothing on it.
+    assert_eq!(
+        m.read_into(h as u32, 1, 1, 64),
+        -(EINVAL.0 as i64),
+        "a non-zero off on an unseekable READ"
+    );
+    assert_eq!(m.close_handle(h as u32), 0);
+
+    let w = m.open_path(0, f.path(), KORU_O_WRONLY | KORU_O_NONBLOCK);
+    assert!(w > 0);
+    m.slot(2)[..4].copy_from_slice(b"ring");
+    assert_eq!(m.write_from(w as u32, 2, 0, 4), 4);
+    let mut buf = [0u8; 8];
+    assert_eq!(peer.read(&mut buf).expect("peer read"), 4);
+    assert_eq!(&buf[..4], b"ring");
+    assert_eq!(
+        m.write_from(w as u32, 2, 1, 4),
+        -(EINVAL.0 as i64),
+        "a non-zero off on an unseekable WRITE"
+    );
+    assert_eq!(m.close_handle(w as u32), 0);
+    disarm_alarm();
+    m.assert_quiesced();
+}
+
+/// The gate lives on READ and WRITE, not on OPEN. Delete it and this hangs in a
+/// kworker rather than failing.
+#[test]
+fn a_blocking_handle_to_a_fifo_is_refused_by_read() {
+    arm_alarm(30);
+    let Some(f) = Fifo::new("gate") else {
+        skip(
+            "a_blocking_handle_to_a_fifo_is_refused_by_read",
+            "cannot mkfifo",
+        );
+        return;
+    };
+    let _peer = f.peer();
+    let m = Mapped::shared();
+
+    let h = m.open_path(0, f.path(), KORU_O_RDONLY);
+    assert!(h > 0, "the peer makes a blocking open possible");
+    assert_eq!(
+        m.read_into(h as u32, 1, 0, 64),
+        -(EINVAL.0 as i64),
+        "READ without the flag"
+    );
+    assert_eq!(m.close_handle(h as u32), 0);
+    disarm_alarm();
+    m.assert_quiesced();
+}
+
+/// Non-blocking clears the file-type check, so only the `f_op` shape guard is
+/// left to reject a directory.
+#[test]
+fn the_f_op_guard_rejects_a_directory_on_its_own() {
+    let m = Mapped::shared();
+    let h = m.open_path(
+        0,
+        "/etc",
+        KORU_O_RDONLY | KORU_O_DIRECTORY | KORU_O_NONBLOCK,
+    );
+    assert!(h > 0, "a directory opens non-blocking");
+    assert_eq!(m.read_into(h as u32, 1, 0, 64), -(EINVAL.0 as i64));
+    assert_eq!(m.close_handle(h as u32), 0);
     m.assert_quiesced();
 }
 
