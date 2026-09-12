@@ -1119,6 +1119,180 @@ it — exactly the failure that gate exists for. Selecting on `"test":true` is
 not the fix either, because a bin target carries that field too; the runner now
 selects on the target kind.
 
+## Futures and the executor
+
+T15 built `rust/koru`: a slab of op state keyed by a generational cookie, a
+future per opcode, and a single-threaded executor whose park is
+`ENTER(min_complete = 1)`. The ownership rule the design section states —
+the slab entry owns the `BufSlot`, the future owns only the cookie, a drop
+frees nothing — survived contact unchanged. What follows is what it did not
+say.
+
+The crate is `#![forbid(unsafe_code)]`. `koru-sys` carries all of it, and the
+executor's wakers go through `std::task::Wake` on an `Arc` rather than a
+hand-rolled `RawWaker` vtable over an `Rc`, which would be unsound the moment
+a waker crossed a thread. T51's waiter thread is exactly that, written down in
+advance, so the safe route costs a mutex lock per wake and buys a checkable
+claim. Dependencies stay at zero, so the lockfile still lists nothing but the
+workspace's own packages.
+
+### `Queued` is not `Live`, and that distinction is the whole task
+
+Futures are lazy in the Rust convention: nothing is registered and nothing is
+queued until the first poll, so an unawaited future costs nothing and hands
+its slot straight back. Lazy registration means an op has a state the design
+section never named — sitting in our own batch, with the kernel unaware of it.
+
+Dropping one of those must drop its SQE and must **not** submit a `CANCEL`.
+`cancel_op` looks its target up in `RingCtx::pending`, would answer `-ENOENT`,
+and no completion for the target would ever arrive; the entry and its slot
+would then leak for the life of the process. Leaving the SQE in the batch is
+worse: it submits an op naming a slot that is already back in the free pool,
+and the next user of that index gets `-EBUSY` from the `slot_busy` bitmap,
+which is verbatim the failure T16 exists to catch.
+
+So the states are `Queued`, `Live`, `Ready`, `Abandoned`, `Dead` and
+`CancelProbe`, and three of them are drop cases rather than one. `Ready` is
+not a corner: `OPEN`, `CLOSE` and `NOP` complete inline inside the submitting
+`ENTER`, so a future is very often already complete by the time anything drops
+it, and a `CANCEL` there is a wasted SQE that always answers `-ENOENT`.
+
+The `Queued` to `Live` transition is per **consumed prefix**, never per batch.
+A short `submitted` is admission control, so only `batch[..submitted]` becomes
+`Live` and the tail goes back on the pending queue still `Queued`. Marking the
+whole batch instead double-counts in-flight ops, resubmits SQEs the kernel has
+already consumed, and hangs the run.
+
+`CancelProbe` exists because a `CANCEL` is an op like any other: C1 gives it
+its own completion, and it needs a unique cookie of its own, since a duplicate
+`user_data` cancels an unspecified one of the two.
+
+### `to_submit` past `sq_entries` fails the ioctl
+
+Admission control produces a short count, but `to_submit > sq_entries` is a
+protocol failure and fails `ENTER` outright, as does `cq_space > cq_entries`.
+A batching executor therefore has to chunk its own batch to the queue depth;
+discovering this cost one VM run with `ENTER failed: EINVAL`. It is not an
+admission-control interaction and no amount of retrying helps.
+
+### Three cells, one order
+
+`RefCell<Slab<Task>> > RefCell<Slab<Op>> > RefCell<Vec<Sqe>>`, and no borrow is
+held across a poll, across a wake, or across the drop of a payload. Every
+borrow in the reactor is scoped to a block that *decides*; the acting happens
+after it is released. Concretely: dispatch takes the payload out and ends the
+borrow before dropping it, `Future::drop` releases the slab before pushing its
+`CANCEL`, and the executor takes the boxed future out of its task slot before
+polling it — otherwise the first poll that spawns or wakes panics with
+`already borrowed`. The ready queue is drained into a local before any poll for
+the same reason: a self-waking task would deadlock on a non-reentrant mutex.
+
+`Ring::enter` and `BufPool::acquire` both take `&self`, so neither the ring nor
+the pool needs a cell. Do not add one.
+
+### The empty-ring foot-gun, on this side
+
+The kernel returns rather than sleeps whenever `min_complete` is unreachable,
+which is precisely when nothing is in flight. So the userspace failure is not a
+D-state hang but a spin: an executor that parks with every task pending,
+nothing queued and nothing in flight burns a core forever. That state is a bug
+in the program, so it panics with a message naming it. The predicate is a pure
+function of three counts, which is what makes its whole truth table testable
+with no device.
+
+"Poll, do not block" is `min_complete = 0`, never a zero timeout: `timeout_ns`
+0 means *no cap*, and `koru-sys` already rejects `Some(Duration::ZERO)` for
+that reason.
+
+### Two shapes the plan's sketch got approximately right
+
+The plan's demo writes `let (n, buf) = read(h, buf).await?`. The real output is
+`BufResult<T> = (Result<T, Error>, BufSlot)`: the caller must get the slot back
+on the error path too, or every failed read leaks one slot of `slot_count` for
+good. That is forced by completion-based I/O, not a style choice.
+
+It also writes `open("/etc/hostname")` with no buffer. Every open needs a slot
+for the path, and the raw layer takes it as an argument rather than reaching
+into the pool, so T30 owns every acquisition — which is what T30's own
+description already says. The consequence is that T15 needs no waiter queue for
+slot exhaustion; T30 does.
+
+Ops are methods on the runtime handle, named after the opcodes, so the
+free-function namespace stays clear for T21's ambient surface and T30's Braam
+names. `Error` is `koru_sys::error::Error` unchanged, so T20 re-exports rather
+than introducing a second type, and end of file stays `res == 0`.
+
+### `Stats`, because none of this is otherwise observable
+
+`enters`, `sqes_submitted`, `cqes_reaped`, `cancels_submitted`, `eintrs`, and
+the three gauges. T16's "assert a `CANCEL` is submitted" and "the slot is not
+back in the free pool until the target's CQE lands" cannot be written without
+it, and T31's measured `ENTER` count needs the same counter. It also makes the
+inline-completion claim assertable: a lone `OPEN` costs exactly one `ENTER`.
+
+Teardown reaps until nothing is in flight, bounded, so the free count means
+something at exit. Without it the ordinary case of dropping a future in the
+last poll before `block_on` returns leaves an entry whose completion never
+arrives. It is not a safety bug — closing the fd makes the kernel cancel
+everything — but it makes the accounting untestable.
+
+### A forked libtest child that panics exits 0
+
+The EINTR test forks, because libtest runs each test on a spawned thread and a
+process-directed alarm lands on the main one rather than the parked one. The
+first version then passed against a deliberately broken executor. The child
+panicked exactly as intended, printed the panic, and exited **0**: it is a fork
+of a worker thread, so there is no harness left to report the failure to, and
+the process ends cleanly when that one thread unwinds. The parent's verdict was
+vacuous.
+
+The child now wraps its body in `catch_unwind` and leaves through `_exit` with
+a distinct code. Notes already said a forked child must leave through `_exit`;
+the reason turns out to be stronger than double-reporting.
+
+### The two suites share one boot
+
+`scripts/rust.sh` grew a `run_suite` function and the runner an explicit suite
+list, so `koru-sys`'s `kernel` and `koru`'s `runtime` run in one VM boot under
+one verdict. The floor stays **per suite**: a single total would let one
+crate's growth mask a filter typo that ran none of another's, which is the hole
+`WANT_PASSED` exists to plug. Adding a test raises that suite's number in
+`scripts/run-rust.sh`.
+
+### Eager or lazy: the bindings will differ, on purpose
+
+The C++ awaiter sketch below has `await_ready() -> false // op already
+submitted`, which is eager. An eager binding has no `Queued` state and its
+destructor always submits a `CANCEL`. Both choices are sound; write down which
+one each binding made, or T40 will transcribe a state it does not need or drop
+a filter it does.
+
+### What was verified, and how
+
+Six perturbations, each reverted.
+
+- Delete the generation comparison in the slab. Two host tests fail, the
+  recycled-index one and the cookie-zero one, and nothing else. Both genuinely
+  depend on it.
+- Stop filtering dead SQEs out of the batch. The queued-drop test fails, and
+  earlier than expected: the state machine sees a completion for a `Dead` entry
+  and refuses it before the kernel's `-EBUSY` can appear.
+- Return the slot to the pool in `Future::drop` instead of leaving it in the
+  entry. The live-drop test fails on the free count, which is T16's assertion
+  reached early.
+- Mark the whole batch `Live` rather than the consumed prefix. The run hangs
+  and the runner reports no verdict, which is what a hang looks like from
+  outside.
+- Treat `EINTR` as a hard error. The forked child panics and the parent's
+  verdict fails — but only after the `catch_unwind` fix above, which is how
+  that fix was found.
+- Remove the stall predicate. The executor spins, the test's own alarm fires,
+  and the binary exits 99.
+
+The demo needs no perturbation to have teeth: the timers are armed 30, 10, 20
+and asserted to resolve 10, 20, 30, so an executor that ran them serially would
+record submission order and fail.
+
 ## C++20 userspace binding
 
 The kernel side is **unchanged** — same device, same ioctls, same wire format,
@@ -1281,8 +1455,17 @@ arrive with their tasks.
 - `rust/koru-sys/src/pool.rs` — `BufPool` and move-only `BufSlot`. *exists*
 - `rust/koru-sys/tests/kernel.rs` — the device suite, T4-T11 plus the T3
   matrices. *exists*
-- `rust/koru/src/lib.rs` — op slab, `OpState` owning `BufSlot`, `Future` impls,
-  executor.
+- `rust/koru/src/slab.rs` — the generational `Cookie` and the payload-generic
+  slab. Device-free, so its mechanics are host tests. *exists*
+- `rust/koru/src/op.rs` — the op states and their transitions, plus the stall
+  predicate. Also device-free. *exists*
+- `rust/koru/src/reactor.rs` — the pending batch, `ENTER`, dispatch, and the
+  lock order everything else obeys. *exists*
+- `rust/koru/src/exec.rs` — `Runtime`, the task slab, the waker, `spawn`,
+  `block_on`. *exists*
+- `rust/koru/src/future.rs` — one future per opcode and their shared drop.
+  *exists*
+- `rust/koru/tests/runtime.rs` — the device suite for all of it. *exists*
 - `cpp/include/koru_abi.h` — the C mirror of `koru_abi.rs`, kept in step by
   the T14 conformance diff. *exists*
 - `cpp/include/koru_errno.h` — the C mirror of `error.rs`'s vocabulary and

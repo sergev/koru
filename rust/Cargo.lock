@@ -3,5 +3,12 @@
 version = 4
 
 [[package]]
+name = "koru"
+version = "0.1.0"
+dependencies = [
+ "koru-sys",
+]
+
+[[package]]
 name = "koru-sys"
 version = "0.1.0"

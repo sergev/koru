@@ -114,7 +114,7 @@ makes with `io-wq`.
 
 ## Status
 
-**The kernel module works, and the Rust ABI layer is written.** It registers
+**The kernel module works, and the Rust binding runs async code.** It registers
 `/dev/koru` and runs `NOP`, `DELAY_NS`, `CHECKSUM`, `OPEN`, `READ`, `CLOSE` and
 `CANCEL` through `ENTER`. The arena is mapped and slot exclusivity is enforced
 by the kernel, open files live in a generational handle table, a queued
@@ -130,7 +130,14 @@ minute.
 mirror, the ioctl wrappers, the ring and its arena, a buffer pool, and the errno
 table. Its integration suite re-expresses the module's own tests against that
 API, so the two independent views of the wire format have to agree.
-`scripts/run-rust.sh` runs it in a VM. The futures and the executor are next.
+`scripts/run-rust.sh` runs it in a VM.
+
+`rust/koru` is the second half: an op slab keyed by a generational cookie, a
+future per opcode, and a single-threaded executor whose park is the `ENTER`
+ioctl. An async block reads a file through the ring while timers complete out
+of order. Dropping a future mid-flight cancels its operation and holds its
+buffer slot until the completion lands, so nothing the kernel is still writing
+into can be reused. The crate contains no `unsafe` at all.
 
 The wire format now exists in a C mirror as well, `cpp/include/koru_abi.h`,
 which the C test suite includes rather than copying. Each side prints a

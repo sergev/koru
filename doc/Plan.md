@@ -65,26 +65,18 @@ ABI.
 
 ## Phase 4 — the Rust binding
 
-### T15 [R] — futures and executor
-
-Op slab keyed by `(index, generation)`, `Future` impls, and a single-threaded
-executor whose `park()` is `ENTER`. `OpState` owns the `BufSlot`; the future
-owns only the cookie.
-
-Done test: this async block prints the file while timers complete out of order.
-**This is the deliverable for the phase.** Output goes through an ordinary
-`println!` — writing through the ring needs T17 and T19, and is T21's job.
-
-```rust
-async {
-    let h = open("/etc/hostname").await?;
-    let (n, buf) = read(h, buf).await?;
-    println!("{}", str::from_utf8(&buf[..n])?);
-    close(h).await?;
-}
-```
-
 ### T16 [R] — drop safety
+
+T15 built the mechanism and asserted it once each way; this task is its
+falsification under a race. It also needs a `race` combinator, which T15 did
+not build: `join` was not required by its own done test.
+
+Settle before starting what "under ASan" means here. Rust's is
+`-Zsanitizer=address` on nightly and this project is pinned to stable 1.98.1,
+so either the suite gains a nightly toolchain or the equivalent is the crate's
+`forbid(unsafe_code)` plus the kernel's KASAN plus the pool and slab
+accounting `Stats` already exposes. Decide it rather than discover it at the
+hundred-thousandth iteration.
 
 Done test: race a `read` future against a timer and drop it mid-flight. Assert
 that a `CANCEL` is submitted, that the slot is *not* back in the free pool until
@@ -1012,9 +1004,12 @@ lands:
 2. `scripts/run-rust.sh` — the Rust suite, in a VM. `(cd rust && cargo test -p
    koru-sys --lib)` is the host-only half: ABI assertions, the ioctl numbers
    and the errno table, with no device needed.
-3. `cargo test -p koru` — futures, executor, drop safety and the Rust surface
-   (T15, T16, T20, T21, T30–T32), plus the screen client against its fake
-   daemon (T37).
+3. `(cd rust && cargo test -p koru --lib)` — the host-only half: the cookie,
+   the slab, the op state machine and the stall predicate, with no device.
+   Everything else in that crate needs `/dev/koru` and runs as the `runtime`
+   suite inside step 2's boot: futures, executor, drop safety and the Rust
+   surface (T15, T16, T20, T21, T30–T32), plus the screen client against its
+   fake daemon (T37).
 4. `cargo run --example read_file` — the Rust demo (T21).
 5. `cmake -B build -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined"`, then
    `cmake --build build`.

@@ -5,7 +5,7 @@ code in this repository.
 
 ## State of the repository
 
-**T0–T14 are done: the kernel side is finished and the Rust ABI layer exists.**
+**T0–T15 are done: the kernel side is finished and the Rust binding runs.**
 The module registers `/dev/koru`, configures a ring with `SETUP`, and submits
 `NOP`, `DELAY_NS`, `CHECKSUM`, `OPEN`, `READ`, `CLOSE` and `CANCEL` through
 `ENTER`, which blocks for completions. The arena is mmap'd, with slot
@@ -18,6 +18,11 @@ T13 added `rust/koru-sys`: the ABI mirror, the ioctl wrappers, `Ring`, `Arena`,
 `BufPool` and the errno table, with the T4–T11 matrix re-expressed as Rust
 integration tests. It also moved the whole project onto rustup's rustc 1.98.1.
 Everything from here is userspace.
+
+T15 added `rust/koru`: the op slab, a future per opcode and a
+single-threaded executor whose park is `ENTER`. An async block now reads a file
+through the ring while timers complete out of order. The crate is
+`#![forbid(unsafe_code)]` and depends on nothing but `koru-sys`.
 
 T14 made the two userspace ABI mirrors a diff rather than a promise.
 `cpp/include/koru_abi.h` and `cpp/include/koru_errno.h` are the C mirrors,
@@ -36,8 +41,8 @@ its fastest gate: no VM, no device, no module.
   `koru_ops.rs` holds opcode dispatch, the op implementations and `OpWork`.
 - `test/` — `koru_check`, the one integrated test for the module. It includes
   the C ABI mirror from `cpp/include/` and keeps no copy. See Commands.
-- `rust/` — the Cargo workspace. `koru-sys` is the raw binding; `koru` (the
-  futures, executor and Braam surface) joins at T15.
+- `rust/` — the Cargo workspace. `koru-sys` is the raw binding; `koru` holds
+  the futures, the executor and, from T20 on, the Braam surface.
 - `cpp/` — the C ABI mirrors and `abi_dump`, built by the top-level
   `CMakeLists.txt`. The binding itself arrives at T39.
 - `scripts/` — the guest-side check and the host-side runner that boots the VM,
@@ -110,7 +115,7 @@ survived**.
 
 ## Commands
 
-These work today (T0 through T14):
+These work today (T0 through T15):
 
 ```sh
 KDIR=../kernel-dev/linux-source-7.1
@@ -139,8 +144,9 @@ KORU_SEED=12345 scripts/run.sh    # replay a fuzz failure
 # The Rust binding. The library half needs no device and runs on the host in
 # under a second; the integration suite needs /dev/koru, so it runs in a VM.
 (cd rust && cargo fmt --all -- --check)
-(cd rust && cargo test -p koru-sys --lib)
-(cd rust && cargo test -p koru-sys --no-run)   # build before the runner
+(cd rust && cargo test -p koru-sys --lib)      # ABI, ioctl numbers, errnos
+(cd rust && cargo test -p koru --lib)          # cookie, slab, op states
+(cd rust && cargo test --workspace --no-run)   # build before the runner
 scripts/run-rust.sh
 scripts/run-rust.sh cancel read                # only matching test names
 
@@ -160,13 +166,15 @@ only the kernel one is unchecked: `scripts/abi.sh` diffs the other two, and the
 header's own `static_assert`s catch a layout slip at compile time. The C++
 suite comes at T39.
 
-`rust/koru-sys/tests/kernel.rs` is the Rust suite, T4–T11 plus the T3 matrices,
-run by `scripts/rust.sh` in its own VM boot. It does **not** supersede
-`koru_check`, which keeps the fuzz, the two `rmmod` races and the heavy-phase
-leak window. Two gates exist because `#[test]` can pass without proving
-anything: a filter matching nothing exits 0, so `rust.sh` asserts a minimum
-passed count in `WANT_PASSED`, which must be raised when a test is added; and a
-skipped precondition prints `KORU-RS-SKIP`, which fails the run.
+`scripts/rust.sh` runs both Rust suites in one VM boot:
+`rust/koru-sys/tests/kernel.rs`, which is T4–T11 plus the T3 matrices, and
+`rust/koru/tests/runtime.rs`, which is the futures and the executor. Neither
+supersedes `koru_check`, which keeps the fuzz, the two `rmmod` races and the
+heavy-phase leak window. Two gates exist because `#[test]` can pass without
+proving anything: a filter matching nothing exits 0, so `rust.sh` asserts a
+minimum passed count **per suite**, taken from the `SUITES` list in
+`scripts/run-rust.sh` and raised when a test is added; and a skipped
+precondition prints `KORU-RS-SKIP`, which fails the run.
 
 **Section order in `koru_check` is load-bearing.** Everything that allocates in
 bulk runs first and is marked `heavy` in the table in `koru_check.c`; the binary

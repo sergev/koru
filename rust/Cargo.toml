@@ -1,7 +1,7 @@
-# The Rust binding. `koru` (futures, executor, surface) joins at T15; a member
-# path that does not exist is a hard error, so it is added when it is created.
+# The Rust binding. `koru-sys` is the raw layer; `koru` holds the futures, the
+# executor and, from T20 on, the surface.
 [workspace]
-members = ["koru-sys"]
+members = ["koru-sys", "koru"]
 resolver = "3"
 
 [workspace.package]

@@ -1,26 +1,55 @@
 #!/bin/sh
 # SPDX-License-Identifier: MIT
 #
-# The guest side of the Rust suite. Runs inside the virtme-ng guest, never on
+# The guest side of the Rust suites. Runs inside the virtme-ng guest, never on
 # the host. Mirrors check.sh; that script is left alone because it carries every
 # pass condition for the kernel itself.
 #
 # Prints exactly one KORU-RUST-PASS or KORU-RUST-FAIL marker, which
 # scripts/run-rust.sh greps for. Every check below gates that marker.
 #
-# BIN is the test binary, built on the host and passed in by the runner.
+# SUITES is `name|binary|floor` per suite, built by the runner on the host.
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 KO=${KO:-$ROOT/kernel/koru.ko}
-BIN=${BIN:-}
-# A filter matching nothing exits 0, so an unfiltered run must report at least
-# this many passes. Raise it when a test is added.
-WANT_PASSED=${WANT_PASSED:-58}
+SUITES=${SUITES:-}
+FILTERS="$*"
 
 fail=0
 fence() { echo "koru-check: $1" > /dev/kmsg 2>/dev/null; echo; echo "=== $1 ==="; }
 
-echo "=== koru rust suite ==="
+# One suite: run it, then the two gates that exist because `cargo test` can
+# succeed without proving anything.
+run_suite() {
+	name=$1
+	bin=$2
+	floor=$3
+	fence "suite $name"
+	if [ ! -x "$bin" ]; then
+		echo "NOT BUILT: $bin"
+		echo "run: (cd rust && cargo test --workspace --no-run)"
+		fail=1
+		return
+	fi
+	out=$("$bin" --test-threads=1 --nocapture $FILTERS 2>&1)
+	rc=$?
+	echo "$out"
+	echo "$name exit: $rc"
+	[ "$rc" -eq 0 ] || fail=1
+
+	# A filter matching nothing exits 0.
+	passed=$(echo "$out" | sed -n 's/^test result: ok\. \([0-9]*\) passed.*/\1/p' | tail -1)
+	passed=${passed:-0}
+	echo "$name passed: $passed (want at least $floor)"
+	[ "$passed" -ge "$floor" ] || { echo "TOO FEW TESTS RAN"; fail=1; }
+
+	# A skip is indistinguishable from a pass. Not anchored: --nocapture makes
+	# libtest prefix the line with the test name.
+	skips=$(echo "$out" | grep 'KORU-RS-SKIP')
+	[ -z "$skips" ] || { echo "SKIPPED, which is not a pass:"; echo "$skips"; fail=1; }
+}
+
+echo "=== koru rust suites ==="
 uname -r
 mount -t debugfs none /sys/kernel/debug 2>/dev/null
 
@@ -40,35 +69,26 @@ else
 	fail=1
 fi
 
-fence "koru-sys"
-if [ ! -x "$BIN" ]; then
-	echo "NOT BUILT: $BIN"
-	echo "run: (cd rust && cargo test -p koru-sys --no-run)"
+if [ -z "$SUITES" ]; then
+	echo "NO SUITES"
 	echo
 	echo "=== KORU-RUST-FAIL ==="
 	exit 1
 fi
-out=$("$BIN" --test-threads=1 --nocapture "$@" 2>&1)
-rc=$?
-echo "$out"
-echo "koru-sys exit: $rc"
-[ "$rc" -eq 0 ] || fail=1
-
-# Two ways this suite can pass without proving anything.
-passed=$(echo "$out" | sed -n 's/^test result: ok\. \([0-9]*\) passed.*/\1/p' | tail -1)
-passed=${passed:-0}
-echo "tests passed: $passed (want at least $WANT_PASSED)"
-[ "$passed" -ge "$WANT_PASSED" ] || { echo "TOO FEW TESTS RAN"; fail=1; }
-# Not anchored: --nocapture makes libtest prefix the line with the test name.
-skips=$(echo "$out" | grep 'KORU-RS-SKIP')
-[ -z "$skips" ] || { echo "SKIPPED, which is not a pass:"; echo "$skips"; fail=1; }
+for suite in $SUITES; do
+	name=${suite%%|*}
+	rest=${suite#*|}
+	bin=${rest%%|*}
+	floor=${rest##*|}
+	run_suite "$name" "$bin" "$floor"
+done
 
 fence "rmmod"
 rmmod koru || { echo "RMMOD FAILED"; fail=1; }
 [ -e /dev/koru ] && { echo "/dev/koru STILL PRESENT AFTER RMMOD"; fail=1; } \
 	|| echo "device node gone"
 
-# libtest orders tests by name, so this suite cannot promise the heavy-first
+# libtest orders tests by name, so these suites cannot promise the heavy-first
 # ordering check.sh earns its window with. Pay the flat five seconds instead;
 # leak coverage of the kernel belongs to check.sh, which is unchanged.
 fence "kmemleak"
