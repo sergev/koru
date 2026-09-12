@@ -214,6 +214,12 @@ pub(crate) const KORU_OP_ADOPT_FD: u8 = 8; // T19
 /// asked-for events are in it. Nothing could ever wake such a poll, so waiting
 /// would pin a CQ reservation for the life of the ring.
 pub(crate) const KORU_OP_POLL_ADD: u8 = 9; // T22
+/// Stat `handle` into slot `slot` at slot offset `off`, which must be a
+/// multiple of 8. `len` is the caller's buffer size and doubles as version
+/// negotiation: the kernel writes `min(len, sizeof(KoruStat))` bytes and
+/// returns that count in `res`. `extra` is the [`KORU_STAT_*`](KORU_STAT_INO)
+/// mask of fields the filesystem actually reported.
+pub(crate) const KORU_OP_STAT: u8 = 10; // T23
 
 /// Any bit set is rejected.
 pub(crate) const KORU_SQE_FLAGS_ALL: u8 = 0;
@@ -287,9 +293,9 @@ pub(crate) struct Sqe {
     /// Opcode-specific length.
     pub(crate) len: u32,
     /// Opcode-specific offset. A file offset on `READ` and `WRITE`, a
-    /// within-slot offset on `OPEN` and `CHECKSUM`, nanoseconds on `DELAY_NS`,
-    /// the target's `user_data` on `CANCEL`, a file descriptor on `ADOPT_FD`.
-    /// `NOP` and `CLOSE` want zero.
+    /// within-slot offset on `OPEN`, `CHECKSUM` and `STAT`, nanoseconds on
+    /// `DELAY_NS`, the target's `user_data` on `CANCEL`, a file descriptor on
+    /// `ADOPT_FD`. `NOP` and `CLOSE` want zero.
     pub(crate) off: u64,
     /// Echoed into the CQE. Opaque; userspace packs (slab index, generation).
     pub(crate) user_data: u64,
@@ -315,7 +321,8 @@ pub(crate) struct Cqe {
     pub(crate) flags: u32,
     /// Must be zero.
     pub(crate) rsvd0: u32,
-    /// Opcode-specific extra result. Currently always zero.
+    /// Opcode-specific extra result, zero on every opcode that defines none.
+    /// `STAT` puts the mask of fields it filled here.
     pub(crate) extra: u64,
 }
 
@@ -352,6 +359,112 @@ pub(crate) struct KoruEnter {
     pub(crate) reserved: [u64; 2],
 }
 
+// ---------------------------------------------------------------------------
+// Stat
+// ---------------------------------------------------------------------------
+
+// File type, the top bits of [`KoruStat::mode`]. Unlike the open flags, these
+// values are the same on every Linux architecture, so they are passed through.
+
+#[expect(dead_code)]
+pub(crate) const KORU_S_IFMT: u64 = 0o170000;
+#[expect(dead_code)]
+pub(crate) const KORU_S_IFIFO: u64 = 0o010000;
+#[expect(dead_code)]
+pub(crate) const KORU_S_IFCHR: u64 = 0o020000;
+#[expect(dead_code)]
+pub(crate) const KORU_S_IFDIR: u64 = 0o040000;
+#[expect(dead_code)]
+pub(crate) const KORU_S_IFBLK: u64 = 0o060000;
+#[expect(dead_code)]
+pub(crate) const KORU_S_IFREG: u64 = 0o100000;
+#[expect(dead_code)]
+pub(crate) const KORU_S_IFLNK: u64 = 0o120000;
+#[expect(dead_code)]
+pub(crate) const KORU_S_IFSOCK: u64 = 0o140000;
+
+// Which [`KoruStat`] fields the kernel filled, returned in `Cqe::extra`.
+// koru's own bits, one per field and in this struct's field order, not statx's:
+// that mask names fields koru does not carry and misses three koru does.
+// `blksize`, `dev` and `rdev` have no statx bit because the VFS always fills
+// them, and they get one here so the mask describes the whole struct.
+
+pub(crate) const KORU_STAT_INO: u64 = 1 << 0;
+pub(crate) const KORU_STAT_SIZE: u64 = 1 << 1;
+pub(crate) const KORU_STAT_BLOCKS: u64 = 1 << 2;
+pub(crate) const KORU_STAT_BLKSIZE: u64 = 1 << 3;
+pub(crate) const KORU_STAT_NLINK: u64 = 1 << 4;
+pub(crate) const KORU_STAT_TYPE: u64 = 1 << 5;
+pub(crate) const KORU_STAT_MODE: u64 = 1 << 6;
+pub(crate) const KORU_STAT_UID: u64 = 1 << 7;
+pub(crate) const KORU_STAT_GID: u64 = 1 << 8;
+pub(crate) const KORU_STAT_DEV: u64 = 1 << 9;
+pub(crate) const KORU_STAT_RDEV: u64 = 1 << 10;
+pub(crate) const KORU_STAT_ATIME: u64 = 1 << 11;
+pub(crate) const KORU_STAT_MTIME: u64 = 1 << 12;
+pub(crate) const KORU_STAT_CTIME: u64 = 1 << 13;
+pub(crate) const KORU_STAT_BTIME: u64 = 1 << 14;
+
+/// Everything `STAT` can report. A filesystem may report less; never more.
+#[expect(dead_code)]
+pub(crate) const KORU_STAT_ALL: u64 = KORU_STAT_INO
+    | KORU_STAT_SIZE
+    | KORU_STAT_BLOCKS
+    | KORU_STAT_BLKSIZE
+    | KORU_STAT_NLINK
+    | KORU_STAT_TYPE
+    | KORU_STAT_MODE
+    | KORU_STAT_UID
+    | KORU_STAT_GID
+    | KORU_STAT_DEV
+    | KORU_STAT_RDEV
+    | KORU_STAT_ATIME
+    | KORU_STAT_MTIME
+    | KORU_STAT_CTIME
+    | KORU_STAT_BTIME;
+
+/// What `STAT` writes into the slot. 256 bytes, every field 64 bits, no
+/// padding.
+///
+/// Times are second-plus-nanosecond pairs and device numbers are explicit major
+/// and minor, so nothing here is a kernel-internal encoding. `reserved` is
+/// zeroed and is where a later field is carved out, as `handle_count` was.
+///
+/// The whole destination is written, `reserved` included: a partly filled
+/// struct would make the caller read its own stale bytes as kernel-reported
+/// values.
+#[repr(C)]
+#[derive(Copy, Clone, Default)]
+pub(crate) struct KoruStat {
+    pub(crate) ino: u64,
+    pub(crate) size: u64,
+    /// 512-byte blocks allocated.
+    pub(crate) blocks: u64,
+    pub(crate) blksize: u64,
+    pub(crate) nlink: u64,
+    /// File type in [`KORU_S_IFMT`], permission bits below it.
+    pub(crate) mode: u64,
+    /// Translated into the *submitting* task's user namespace.
+    pub(crate) uid: u64,
+    pub(crate) gid: u64,
+    pub(crate) dev_major: u64,
+    pub(crate) dev_minor: u64,
+    pub(crate) rdev_major: u64,
+    pub(crate) rdev_minor: u64,
+    /// Seconds since the epoch; signed, because a date before 1970 is a date.
+    pub(crate) atime_sec: i64,
+    pub(crate) atime_nsec: u64,
+    pub(crate) mtime_sec: i64,
+    pub(crate) mtime_nsec: u64,
+    pub(crate) ctime_sec: i64,
+    pub(crate) ctime_nsec: u64,
+    /// Creation time. Absent from most filesystems; [`KORU_STAT_BTIME`] says.
+    pub(crate) btime_sec: i64,
+    pub(crate) btime_nsec: u64,
+    /// out: must read as zero.
+    pub(crate) reserved: [u64; 12],
+}
+
 // Size alone would not catch two fields being swapped, so assert every offset.
 kernel::static_assert!(core::mem::size_of::<Sqe>() == 32);
 kernel::static_assert!(core::mem::align_of::<Sqe>() == 8);
@@ -385,6 +498,30 @@ kernel::static_assert!(core::mem::offset_of!(KoruEnter, completed) == 40);
 kernel::static_assert!(core::mem::offset_of!(KoruEnter, submitted) == 44);
 kernel::static_assert!(core::mem::offset_of!(KoruEnter, reserved) == 48);
 
+kernel::static_assert!(core::mem::size_of::<KoruStat>() == 256);
+kernel::static_assert!(core::mem::align_of::<KoruStat>() == 8);
+kernel::static_assert!(core::mem::offset_of!(KoruStat, ino) == 0);
+kernel::static_assert!(core::mem::offset_of!(KoruStat, size) == 8);
+kernel::static_assert!(core::mem::offset_of!(KoruStat, blocks) == 16);
+kernel::static_assert!(core::mem::offset_of!(KoruStat, blksize) == 24);
+kernel::static_assert!(core::mem::offset_of!(KoruStat, nlink) == 32);
+kernel::static_assert!(core::mem::offset_of!(KoruStat, mode) == 40);
+kernel::static_assert!(core::mem::offset_of!(KoruStat, uid) == 48);
+kernel::static_assert!(core::mem::offset_of!(KoruStat, gid) == 56);
+kernel::static_assert!(core::mem::offset_of!(KoruStat, dev_major) == 64);
+kernel::static_assert!(core::mem::offset_of!(KoruStat, dev_minor) == 72);
+kernel::static_assert!(core::mem::offset_of!(KoruStat, rdev_major) == 80);
+kernel::static_assert!(core::mem::offset_of!(KoruStat, rdev_minor) == 88);
+kernel::static_assert!(core::mem::offset_of!(KoruStat, atime_sec) == 96);
+kernel::static_assert!(core::mem::offset_of!(KoruStat, atime_nsec) == 104);
+kernel::static_assert!(core::mem::offset_of!(KoruStat, mtime_sec) == 112);
+kernel::static_assert!(core::mem::offset_of!(KoruStat, mtime_nsec) == 120);
+kernel::static_assert!(core::mem::offset_of!(KoruStat, ctime_sec) == 128);
+kernel::static_assert!(core::mem::offset_of!(KoruStat, ctime_nsec) == 136);
+kernel::static_assert!(core::mem::offset_of!(KoruStat, btime_sec) == 144);
+kernel::static_assert!(core::mem::offset_of!(KoruStat, btime_nsec) == 152);
+kernel::static_assert!(core::mem::offset_of!(KoruStat, reserved) == 160);
+
 // SAFETY: `repr(C)`, integers only, so every bit pattern is valid. No interior
 // mutability.
 unsafe impl FromBytes for Sqe {}
@@ -398,3 +535,5 @@ unsafe impl FromBytes for KoruEnter {}
 unsafe impl AsBytes for Cqe {}
 // SAFETY: as above.
 unsafe impl AsBytes for KoruEnter {}
+// SAFETY: as above. This is what lets `STAT` copy the struct out as bytes.
+unsafe impl AsBytes for KoruStat {}

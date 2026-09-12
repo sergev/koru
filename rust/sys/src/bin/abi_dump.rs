@@ -10,7 +10,7 @@
 //! field count and checks that the field sizes sum to `sizeof`.
 
 use koru_sys::abi::{
-    Cqe, KoruEnter, KoruParams, Sqe, handle_generation, handle_index, make_handle,
+    Cqe, KoruEnter, KoruParams, KoruStat, Sqe, handle_generation, handle_index, make_handle,
 };
 use koru_sys::abi::{
     KORU_ABI_VERSION, KORU_CQE_F_MORE, KORU_DEFAULT_HANDLES, KORU_ENTER_FLAGS_ALL, KORU_IOC_TYPE,
@@ -19,9 +19,13 @@ use koru_sys::abi::{
     KORU_NR_GET_PARAMS, KORU_NR_SETUP, KORU_O_ACCMODE, KORU_O_DIRECTORY, KORU_O_NOFOLLOW,
     KORU_O_NONBLOCK, KORU_O_RDONLY, KORU_O_RDWR, KORU_O_WRONLY, KORU_OP_ADOPT_FD, KORU_OP_CANCEL,
     KORU_OP_CHECKSUM, KORU_OP_CLOSE, KORU_OP_DELAY_NS, KORU_OP_NOP, KORU_OP_OPEN, KORU_OP_POLL_ADD,
-    KORU_OP_READ, KORU_OP_WRITE, KORU_OPEN_FLAGS_ALL, KORU_POLL_ERR, KORU_POLL_EVENTS_ALL,
-    KORU_POLL_HUP, KORU_POLL_IN, KORU_POLL_OUT, KORU_POLL_PRI, KORU_POLL_RDHUP,
-    KORU_SETUP_FLAGS_ALL, KORU_SQE_FLAGS_ALL,
+    KORU_OP_READ, KORU_OP_STAT, KORU_OP_WRITE, KORU_OPEN_FLAGS_ALL, KORU_POLL_ERR,
+    KORU_POLL_EVENTS_ALL, KORU_POLL_HUP, KORU_POLL_IN, KORU_POLL_OUT, KORU_POLL_PRI,
+    KORU_POLL_RDHUP, KORU_S_IFBLK, KORU_S_IFCHR, KORU_S_IFDIR, KORU_S_IFIFO, KORU_S_IFLNK,
+    KORU_S_IFMT, KORU_S_IFREG, KORU_S_IFSOCK, KORU_SETUP_FLAGS_ALL, KORU_SQE_FLAGS_ALL,
+    KORU_STAT_ALL, KORU_STAT_ATIME, KORU_STAT_BLKSIZE, KORU_STAT_BLOCKS, KORU_STAT_BTIME,
+    KORU_STAT_CTIME, KORU_STAT_DEV, KORU_STAT_GID, KORU_STAT_INO, KORU_STAT_MODE, KORU_STAT_MTIME,
+    KORU_STAT_NLINK, KORU_STAT_RDEV, KORU_STAT_SIZE, KORU_STAT_TYPE, KORU_STAT_UID,
 };
 use koru_sys::error::{KINDS, KORU_ERRNOS};
 use koru_sys::ring::DEV_KORU;
@@ -317,6 +321,36 @@ fn main() {
         KORU_POLL_EVENTS_ALL as u64,
     );
 
+    // The stat vocabulary, in the C emitter's order.
+    for (name, v) in [
+        ("KORU_S_IFMT", KORU_S_IFMT),
+        ("KORU_S_IFIFO", KORU_S_IFIFO),
+        ("KORU_S_IFCHR", KORU_S_IFCHR),
+        ("KORU_S_IFDIR", KORU_S_IFDIR),
+        ("KORU_S_IFBLK", KORU_S_IFBLK),
+        ("KORU_S_IFREG", KORU_S_IFREG),
+        ("KORU_S_IFLNK", KORU_S_IFLNK),
+        ("KORU_S_IFSOCK", KORU_S_IFSOCK),
+        ("KORU_STAT_INO", KORU_STAT_INO),
+        ("KORU_STAT_SIZE", KORU_STAT_SIZE),
+        ("KORU_STAT_BLOCKS", KORU_STAT_BLOCKS),
+        ("KORU_STAT_BLKSIZE", KORU_STAT_BLKSIZE),
+        ("KORU_STAT_NLINK", KORU_STAT_NLINK),
+        ("KORU_STAT_TYPE", KORU_STAT_TYPE),
+        ("KORU_STAT_MODE", KORU_STAT_MODE),
+        ("KORU_STAT_UID", KORU_STAT_UID),
+        ("KORU_STAT_GID", KORU_STAT_GID),
+        ("KORU_STAT_DEV", KORU_STAT_DEV),
+        ("KORU_STAT_RDEV", KORU_STAT_RDEV),
+        ("KORU_STAT_ATIME", KORU_STAT_ATIME),
+        ("KORU_STAT_MTIME", KORU_STAT_MTIME),
+        ("KORU_STAT_CTIME", KORU_STAT_CTIME),
+        ("KORU_STAT_BTIME", KORU_STAT_BTIME),
+        ("KORU_STAT_ALL", KORU_STAT_ALL),
+    ] {
+        konst(&mut out, &mut c, name, "u64", v);
+    }
+
     for (name, v) in [
         ("KORU_IOC_SETUP", KORU_IOC_SETUP),
         ("KORU_IOC_GET_PARAMS", KORU_IOC_GET_PARAMS),
@@ -337,6 +371,7 @@ fn main() {
         ("KORU_OP_WRITE", KORU_OP_WRITE),
         ("KORU_OP_ADOPT_FD", KORU_OP_ADOPT_FD),
         ("KORU_OP_POLL_ADD", KORU_OP_POLL_ADD),
+        ("KORU_OP_STAT", KORU_OP_STAT),
     ] {
         let _ = writeln!(out, "opcode {name} {v}");
         c.opcodes += 1;
@@ -431,6 +466,40 @@ fn main() {
         "koru_enter",
         size_of::<KoruEnter>(),
         align_of::<KoruEnter>(),
+        body,
+        n,
+        sum,
+    );
+
+    let (body, n, sum) = fields!(KoruStat, "koru_stat", [
+        ino: "u64",
+        size: "u64",
+        blocks: "u64",
+        blksize: "u64",
+        nlink: "u64",
+        mode: "u64",
+        uid: "u64",
+        gid: "u64",
+        dev_major: "u64",
+        dev_minor: "u64",
+        rdev_major: "u64",
+        rdev_minor: "u64",
+        atime_sec: "i64",
+        atime_nsec: "u64",
+        mtime_sec: "i64",
+        mtime_nsec: "u64",
+        ctime_sec: "i64",
+        ctime_nsec: "u64",
+        btime_sec: "i64",
+        btime_nsec: "u64",
+        reserved: "u64[12]",
+    ]);
+    emit_struct(
+        &mut out,
+        &mut c,
+        "koru_stat",
+        size_of::<KoruStat>(),
+        align_of::<KoruStat>(),
         body,
         n,
         sum,

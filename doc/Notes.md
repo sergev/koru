@@ -260,6 +260,12 @@ The dev kernel is 7.1.12 with KASAN generic+inline, `PROVE_LOCKING` and
 `linux-headers` omit `rust/*.rmeta` and cannot build out-of-tree Rust modules at
 all. Tree location and commands live in `CLAUDE.md`.
 
+`CONFIG_USER_NS=y` joined the fragment at T23, which is the only config change
+since T0. It is not debug instrumentation: with it off the id-translation
+helpers a `STAT` needs are static inlines bindgen never emits, and every id maps
+one to one so the namespace handling cannot be shown to be wrong. See "Stat, and
+the first result that does not fit in a CQE".
+
 Expected taint with the module loaded is exactly 4096, `TAINT_OOT_MODULE`.
 Module signing is off, so bit 13 must never appear; anything other than 4096 is
 a finding.
@@ -843,6 +849,160 @@ knowing about this opcode.
   first leaves nothing for a wake to race — the race loop is what has teeth.
 - **Skip the disarm in `cancel_all`.** `koru_check pending` plus its poking
   child gives `BUG: KASAN: slab-use-after-free in __wake_up_common_lock`.
+
+### Stat, and the first result that does not fit in a CQE
+
+`res` plus `extra` is sixteen bytes and a `kstat` is about a hundred and fifty,
+so T23's `STAT` answers into the arena. That makes it the first opcode whose
+result is data rather than a number, and the first to use all four SQE fields at
+once for that purpose: `handle` names the file, `slot` and `off` name the
+destination, and `len` is the caller's buffer size.
+
+**`len` is version negotiation, not a request.** The kernel writes
+`min(len, sizeof(KoruStat))` bytes and returns that count in `res`, so a binary
+built against a shorter `KoruStat` asks for its own size and gets exactly that
+prefix, while one built against a longer future struct asks for more and is told
+how much it actually got. Nothing outside `[off, off + res)` is touched, which
+is what lets the caller keep its own data in the rest of the slot.
+
+**`off` must be a multiple of eight.** Every field is 64 bits, so an aligned
+destination is what lets userspace read the struct in place rather than copying
+it out; refusing an unaligned one is what makes that promise true rather than
+usually true. This is the same reasoning T29's dirent header will need.
+
+`check_range` is the right bounds check here, unlike on `READ` and `WRITE`:
+`off` is a within-slot offset on `STAT`, as it is on `OPEN` and `CHECKSUM`. A
+zero `len` is refused for the reason an empty `POLL_ADD` mask is — a stat that
+reports nothing can only be a caller bug.
+
+**Deferred, and therefore in `held_slot`.** `vfs_getattr` calls into the
+filesystem and blocks on NFS and FUSE, so it may not run inline; holding a slot
+across that window puts `STAT` in the same category as `CHECKSUM`, `READ` and
+`WRITE`, and `OpWork::held_slot` is again the only thing that frees the slot
+when a queued one is cancelled. That is now the third opcode to need that line
+and the third time the symptom of forgetting it is every later op on that index
+getting `-EBUSY` with nothing saying why.
+
+**`KoruStat` is 256 bytes and is filled whole.** `READ`'s argument that the rest
+of the slot is the caller's own data does not transfer: a partly filled struct
+would make the caller read its own stale bytes as kernel-reported values. The
+struct is built by a `#[derive(Default)]` literal in which every field is either
+assigned or an explicitly zeroed `reserved` word, and then copied out as bytes,
+so "partly filled" is not representable rather than merely avoided. Times are
+second-plus-nanosecond pairs and device numbers are explicit major and minor, so
+nothing on the wire is a kernel-internal encoding; `kstat` is translated field
+by field, never transmuted.
+
+`mode` is the one place a host value passes straight through. The `S_IF*` values
+are identical on every Linux architecture — unlike `O_*`, which is why the open
+flags are translated — so `KORU_S_IFREG` and friends are koru constants with
+those values, and a binding needs no `<sys/stat.h>`.
+
+#### The user namespace has to travel with the op
+
+`kstat.uid` is a `kuid_t`, meaningful only through `from_kuid(ns, ...)`. In a
+kworker `current_user_ns()` is init's, so a deferred stat translated there
+reports the wrong numbers inside a container — wrong numbers rather than a
+privilege escalation, so nothing catches it by accident. It is finding 3's quiet
+sibling.
+
+`OpWork` therefore carries an `ARef<Credential>`, taken from `current->cred` in
+ioctl context, and the worker translates through `cred->user_ns`. The cred is
+taken for **every** deferred op rather than only for `STAT`: an op resolves
+everything it needs at submit time, a kworker has no route back to the
+submitting task, and one `get_cred` beside the existing allocation and module
+reference costs nothing measurable. Reading `current->cred` needs no RCU —
+a task's creds are replaced only by that task — and holding the cred is also
+what keeps the namespace alive, since `cred` holds a reference to it.
+
+The ids are munged, exactly as `stat(2)` munges them: an id with no mapping
+reports `overflowuid` rather than a raw `(uid_t)-1` that nothing else in the
+system uses. `from_kuid_munged` and `from_kgid_munged` are used directly.
+
+**This forced a kernel config change.** `vng --kconfig` leaves `CONFIG_USER_NS`
+off, and with it off `from_kuid` and `from_kgid` are static inlines that bindgen
+never emits — `from_kuid` survives only because `rust/helpers/task.c` happens to
+wrap it, and there is no equivalent for `from_kgid`, so a gid could not be
+translated from Rust at all. Worse for the check: every id maps one to one, so
+the whole mechanism above would have had no way to be wrong. `CONFIG_USER_NS=y`
+is now in `scripts/koru-debug.config`; it needs only `NAMESPACES`, which the
+base config already has, and it turned out to bring the `_munged` variants into
+the bindings too. The module now requires a kernel with `CONFIG_USER_NS`, which
+every distribution kernel has.
+
+The consequence for the check is the point: the namespace test is no longer the
+"would fail in a container" comment the plan settled for. A child `unshare`s a
+user namespace, maps `100 0 1` and `200 0 1`, and stats a root-owned file; koru
+must report uid 100 and gid 200, and `fstat(2)` in the same child must agree.
+`uid_map` is accepted because the single mapped id is the task's own; `gid_map`
+needs `setgroups` set to `deny` first, because `unshare` has just taken away the
+`CAP_SETGID` in the parent namespace that would otherwise permit it.
+
+#### `extra`, and a mask that was almost untestable
+
+`STAT` is the first opcode to set `Cqe::extra`, which carries the mask of fields
+the kernel actually filled. The fuzzer's blanket `extra == 0` oracle became
+per-opcode at the same time; leaving it blanket would have made the fuzz green
+for the wrong reason, and making it per-opcode is what keeps it honest for every
+opcode after this one.
+
+The mask is koru's own bits, not `kstat.result_mask`, for the reason the poll
+events and the open flags are koru's own: the wire format does not name host
+constants, and statx's mask names fields koru does not carry. **The first
+version of it was not falsifiable, and the perturbation is what found that.**
+Twelve koru bits in `KoruStat` field order are a permutation of statx's twelve,
+and a permutation maps the full set to the full set — so on a filesystem that
+reports everything, passing `result_mask` straight through produced exactly the
+same number as translating it, and the deliberately broken build passed.
+
+The fix was to make the mask describe the whole struct rather than only the
+fields statx has a bit for: `blksize`, `dev` and `rdev` are always filled by the
+VFS and now have bits of their own, so `KORU_STAT_ALL` is fifteen bits and a
+pass-through of statx's twelve fails three assertions at once. That is a better
+ABI as well as a testable one — every `KoruStat` field is either covered by the
+mask or reserved.
+
+#### What was verified, and how
+
+Nine perturbations, each applied and reverted. Eight fail; the ninth is the
+finding below.
+
+- **Drop `KORU_OP_STAT` from `held_slot`.** Nine assertions fail: the slot is
+  never released, so everything after the first stat gets `-EBUSY`.
+- **Translate in `current_user_ns()` instead of the carried cred.** Exactly one
+  assertion fails, the namespace child's, with the verdict that says koru and
+  `fstat(2)` disagreed.
+- **Delete the eight-alignment guard.** The unaligned stat succeeds and returns
+  256.
+- **Delete the zero-`len` guard.** A zero-length stat returns 0 instead of
+  `-EINVAL`.
+- **Write `sizeof(KoruStat)` instead of `min(len, sizeof)`.** The short-`len`
+  case returns 256 and the sentinel past `len` is overwritten — the dangerous
+  half, since that is the caller's own data.
+- **Stop the copy short of `reserved`.** Four assertions fail: the poison
+  pre-filled into the slot reads back where zeros belong.
+- **Pass `result_mask` through untranslated.** Three assertions fail — *after*
+  the mask was widened. Before that it passed, which is recorded above.
+- **Delete `check_range`.** The off-plus-len case writes sixteen bytes past the
+  slot into its neighbour and reports success. The slot-index case still fails
+  `EINVAL`, because `write_slot` finds no page there — so on this opcode only
+  the range half of that guard has teeth.
+- **Hold the arena mutex across `vfs_getattr`.** Nothing fails and lockdep says
+  nothing. `READ`'s three-link cycle needs the inode rwsem, and neither
+  `vfs_getattr` nor any `getattr` method takes it. The rule is still observed
+  here — `write_slot` runs after the VFS call returns — but on this opcode it is
+  inherited from `READ`, not independently tested. Do not mistake it for a
+  tested guard.
+
+The fuzzer grew a `STAT` arm and reaches it about 2,500 times per three-second
+run, with a few dozen succeeding — the same handle-pool-limited rate `READ`,
+`WRITE` and `POLL_ADD` get.
+
+One assertion is weaker than the plan asked for. The plan wanted two concurrent
+stats on one slot to produce one `-EBUSY`; two 256-byte stats on tmpfs almost
+never overlap, so the check pairs a whole-slot `CHECKSUM` with a `STAT` instead,
+which is the idiom `OPEN` and `READ` already use and tests the same property
+deterministically.
 
 ### Cancellation
 

@@ -5,14 +5,15 @@ code in this repository.
 
 ## State of the repository
 
-**T0–T22 are done: Braam's hello world runs through koru, and the ring can
+**T0–T23 are done: Braam's hello world runs through koru, and the ring can
 wait for a descriptor.** The module registers `/dev/koru`, configures a ring
 with `SETUP`, and submits `NOP`, `DELAY_NS`, `CHECKSUM`, `OPEN`, `READ`,
-`WRITE`, `CLOSE`, `CANCEL`, `ADOPT_FD` and `POLL_ADD` through `ENTER`, which
-blocks for completions. The arena is mmap'd, with slot exclusivity enforced by
-the kernel. Open files live in a generational handle table. A queued op can be
-genuinely dequeued, and `close(fd)` cancels whatever is still queued. The
-whole validation surface has been fuzzed under KASAN, lockdep and kmemleak.
+`WRITE`, `CLOSE`, `CANCEL`, `ADOPT_FD`, `POLL_ADD` and `STAT` through `ENTER`,
+which blocks for completions. The arena is mmap'd, with slot exclusivity
+enforced by the kernel. Open files live in a generational handle table. A queued
+op can be genuinely dequeued, and `close(fd)` cancels whatever is still queued.
+The whole validation surface has been fuzzed under KASAN, lockdep and
+kmemleak.
 
 T13 added `rust/sys`: the ABI mirror, the ioctl wrappers, `Ring`, `Arena`,
 `BufPool` and the errno table, with the T4–T11 matrix re-expressed as Rust
@@ -76,6 +77,18 @@ disarm inside the `pending` lock, before the files are dropped. A file on no
 waitqueue is never armed: it completes at once, with `res` 0 where none of the
 asked-for events can ever come. Lockdep is the only oracle for the callback's
 rule; doc/Notes.md has all five perturbations.
+
+T23 added `KORU_OP_STAT`, the first opcode whose result is data rather than a
+number: `res` plus `extra` is sixteen bytes and a `kstat` is about a hundred and
+fifty, so `KoruStat` goes in the slot. `len` is the caller's buffer size and its
+version negotiation, `off` must be eight-aligned, and `extra` carries the mask
+of fields the kernel filled — the first non-zero `extra` koru has ever posted,
+which is why the fuzzer's `extra` oracle is per-opcode from here. `OpWork` now
+carries the submitter's `ARef<Credential>`, because a uid translated in a
+kworker would be translated in init's namespace. That forced `CONFIG_USER_NS=y`
+into `scripts/koru-debug.config`: with it off, `from_kgid` is unreachable from
+Rust and the namespace handling cannot be shown to be wrong. doc/Notes.md has
+the nine perturbations, one of which passed until the mask was redesigned.
 
 T14 made the two userspace ABI mirrors a diff rather than a promise.
 `cpp/include/koru_abi.h` and `cpp/include/koru_errno.h` are the C mirrors,
@@ -157,6 +170,11 @@ full build takes about 9 minutes and the tree is ~5.4 GB. After any config
 change, re-check that the options actually survived `olddefconfig` —
 `merge_config.sh` drops unmet ones silently.
 
+Not every fragment option is debug instrumentation. T23 added
+`CONFIG_USER_NS=y`, which the module now **requires**: without it `from_kgid` is
+a static inline bindgen never emits, so `STAT` cannot translate a gid at all.
+A config change means rebuilding the kernel and then the module against it.
+
 Verified toolchain: rustc and cargo 1.98.1 from **rustup**, with the `rust-src`
 component, plus bindgen 0.72.1, clang and lld 21 from Debian testing, and
 `make LLVM=1`. `make LLVM=1 rustavailable` passes. Floors from the design were
@@ -173,7 +191,7 @@ survived**.
 
 ## Commands
 
-These work today (T0 through T22):
+These work today (T0 through T23):
 
 ```sh
 KDIR=../kernel-dev/linux-source-7.1
@@ -320,8 +338,14 @@ That is a reference cycle broken by unregistering on every completion path, and
 which is what makes the cancel refcount rule testable in both directions.
 
 **A deferred op owns everything it needs**, resolved at submit time: the `Sqe`
-by value, an `Arc<RingCtx>`, and an `ARef<File>`. Never an index into a table
-that can be reindexed, and never a pointer into the arena.
+by value, an `Arc<RingCtx>`, an `ARef<File>` and an `ARef<Credential>`. Never an
+index into a table that can be reindexed, and never a pointer into the arena.
+The creds are the submitter's: in a kworker `current_cred()` is `init_cred` and
+`current_user_ns()` is init's, so `STAT` would report container-wrong ids.
+
+**An opcode that holds its slot across a deferred window must be in
+`OpWork::held_slot`** — `CHECKSUM`, `READ`, `WRITE`, `STAT`. Forgetting it
+leaves the slot busy for ever after a cancel, and nothing says why.
 
 **Handles.** A handle is `(index: u16, generation: u16)`, index low, generation
 starting at 1 and skipping 0 on wrap — so a valid handle is never 0 and every

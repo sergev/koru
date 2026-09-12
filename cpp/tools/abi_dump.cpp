@@ -124,6 +124,30 @@ int main()
     konst("KORU_POLL_ERR", "u32", KORU_POLL_ERR);
     konst("KORU_POLL_HUP", "u32", KORU_POLL_HUP);
     konst("KORU_POLL_EVENTS_ALL", "u32", KORU_POLL_EVENTS_ALL);
+    konst("KORU_S_IFMT", "u64", KORU_S_IFMT);
+    konst("KORU_S_IFIFO", "u64", KORU_S_IFIFO);
+    konst("KORU_S_IFCHR", "u64", KORU_S_IFCHR);
+    konst("KORU_S_IFDIR", "u64", KORU_S_IFDIR);
+    konst("KORU_S_IFBLK", "u64", KORU_S_IFBLK);
+    konst("KORU_S_IFREG", "u64", KORU_S_IFREG);
+    konst("KORU_S_IFLNK", "u64", KORU_S_IFLNK);
+    konst("KORU_S_IFSOCK", "u64", KORU_S_IFSOCK);
+    konst("KORU_STAT_INO", "u64", KORU_STAT_INO);
+    konst("KORU_STAT_SIZE", "u64", KORU_STAT_SIZE);
+    konst("KORU_STAT_BLOCKS", "u64", KORU_STAT_BLOCKS);
+    konst("KORU_STAT_BLKSIZE", "u64", KORU_STAT_BLKSIZE);
+    konst("KORU_STAT_NLINK", "u64", KORU_STAT_NLINK);
+    konst("KORU_STAT_TYPE", "u64", KORU_STAT_TYPE);
+    konst("KORU_STAT_MODE", "u64", KORU_STAT_MODE);
+    konst("KORU_STAT_UID", "u64", KORU_STAT_UID);
+    konst("KORU_STAT_GID", "u64", KORU_STAT_GID);
+    konst("KORU_STAT_DEV", "u64", KORU_STAT_DEV);
+    konst("KORU_STAT_RDEV", "u64", KORU_STAT_RDEV);
+    konst("KORU_STAT_ATIME", "u64", KORU_STAT_ATIME);
+    konst("KORU_STAT_MTIME", "u64", KORU_STAT_MTIME);
+    konst("KORU_STAT_CTIME", "u64", KORU_STAT_CTIME);
+    konst("KORU_STAT_BTIME", "u64", KORU_STAT_BTIME);
+    konst("KORU_STAT_ALL", "u64", KORU_STAT_ALL);
 
 #define IOCTL(name)                                                     \
     do {                                                                \
@@ -150,6 +174,7 @@ int main()
     OPCODE(KORU_OP_WRITE);
     OPCODE(KORU_OP_ADOPT_FD);
     OPCODE(KORU_OP_POLL_ADD);
+    OPCODE(KORU_OP_STAT);
 #undef OPCODE
 
     {
@@ -209,6 +234,31 @@ int main()
         FIELD(koru_enter, submitted, "u32");
         FIELD(koru_enter, reserved, "u64[2]");
         END_FIELDS(koru_enter);
+    }
+    {
+        BEGIN_FIELDS();
+        FIELD(koru_stat, ino, "u64");
+        FIELD(koru_stat, size, "u64");
+        FIELD(koru_stat, blocks, "u64");
+        FIELD(koru_stat, blksize, "u64");
+        FIELD(koru_stat, nlink, "u64");
+        FIELD(koru_stat, mode, "u64");
+        FIELD(koru_stat, uid, "u64");
+        FIELD(koru_stat, gid, "u64");
+        FIELD(koru_stat, dev_major, "u64");
+        FIELD(koru_stat, dev_minor, "u64");
+        FIELD(koru_stat, rdev_major, "u64");
+        FIELD(koru_stat, rdev_minor, "u64");
+        FIELD(koru_stat, atime_sec, "i64");
+        FIELD(koru_stat, atime_nsec, "u64");
+        FIELD(koru_stat, mtime_sec, "i64");
+        FIELD(koru_stat, mtime_nsec, "u64");
+        FIELD(koru_stat, ctime_sec, "i64");
+        FIELD(koru_stat, ctime_nsec, "u64");
+        FIELD(koru_stat, btime_sec, "i64");
+        FIELD(koru_stat, btime_nsec, "u64");
+        FIELD(koru_stat, reserved, "u64[12]");
+        END_FIELDS(koru_stat);
     }
 
     // Evaluated vectors, so the const fns and the C macros are diffed too.

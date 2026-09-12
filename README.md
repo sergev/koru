@@ -183,17 +183,23 @@ on the virtio console of a VM, opening it a second time is refused, so a
 program printing straight onto that console prints nothing. Redirect it or
 pipe it.
 
-Next is the rest of the kernel surface — `POLL_ADD` first, because a socket
-wakes from softirq and that is the biggest unknown left, then stat, the path
-operations and `READDIR` — followed by the rest of the operation layer, the
-terminal, and the C++ binding that has to transcribe all of it.
+A socket can now be waited on: `POLL_ADD` arms a one-shot poll on the file's own
+waitqueue, and a wake arriving in softirq wins a token and hands the rest to a
+worker. `STAT` answers into the arena rather than into the completion, because a
+stat does not fit in sixteen bytes; it is where the file's ids are translated
+into the *submitting* task's user namespace, which a worker thread has no way to
+reach on its own.
+
+Next is the rest of the kernel surface — the path operations and `READDIR` —
+followed by the rest of the operation layer, the terminal, and the C++ binding
+that has to transcribe all of it.
 
 [doc/Notes.md](doc/Notes.md) has the design and the reasoning behind it.
 [doc/Plan.md](doc/Plan.md) has the remaining tasks, each with a test.
 
-Requires a Linux box running a kernel ≥6.16 built with `CONFIG_RUST=y` — and the
-full build tree, since distro `linux-headers` packages omit the Rust artifacts.
-Use a VM; early versions will panic it.
+Requires a Linux box running a kernel ≥6.16 built with `CONFIG_RUST=y` and
+`CONFIG_USER_NS=y` — and the full build tree, since distro `linux-headers`
+packages omit the Rust artifacts. Use a VM; early versions will panic it.
 
 ## License
 

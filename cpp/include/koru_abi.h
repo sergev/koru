@@ -92,9 +92,9 @@ struct koru_params {
 
 /* A submission queue entry. Fields an opcode does not read must be zero.
  *
- * off is a file offset on READ and WRITE, a within-slot offset on OPEN and
- * CHECKSUM, nanoseconds on DELAY_NS, the target's user_data on CANCEL, a file
- * descriptor on ADOPT_FD, and zero on NOP and CLOSE. */
+ * off is a file offset on READ and WRITE, a within-slot offset on OPEN,
+ * CHECKSUM and STAT, nanoseconds on DELAY_NS, the target's user_data on CANCEL,
+ * a file descriptor on ADOPT_FD, and zero on NOP and CLOSE. */
 struct koru_sqe {
     uint8_t opcode;     /* one of the KORU_OP_* constants */
     uint8_t flags;      /* outside KORU_SQE_FLAGS_ALL completes EINVAL */
@@ -112,7 +112,7 @@ struct koru_cqe {
     int64_t res;        /* >= 0 on success, negative errno on failure */
     uint32_t flags;     /* currently always zero; see KORU_CQE_F_MORE */
     uint32_t rsvd0;     /* must be zero */
-    uint64_t extra;     /* opcode-specific extra result; currently zero */
+    uint64_t extra;     /* opcode-specific; STAT's filled-field mask */
 };
 
 /* The ENTER ioctl argument. */
@@ -208,6 +208,11 @@ KORU_STATIC_ASSERT(KORU_IOC_ENTER == 0xc0406b02u, "ioctl ENTER");
 #define KORU_OP_WRITE    7
 #define KORU_OP_ADOPT_FD 8
 #define KORU_OP_POLL_ADD 9
+/* Stat handle into slot `slot` at slot offset `off`, a multiple of 8. `len` is
+ * the caller's buffer size and doubles as version negotiation: the kernel
+ * writes min(len, sizeof(struct koru_stat)) bytes and returns that in res.
+ * extra is the KORU_STAT_* mask of fields the filesystem reported. */
+#define KORU_OP_STAT 10
 
 KORU_STATIC_ASSERT(KORU_OP_NOP == 0, "op NOP");
 KORU_STATIC_ASSERT(KORU_OP_DELAY_NS == 1, "op DELAY_NS");
@@ -219,6 +224,7 @@ KORU_STATIC_ASSERT(KORU_OP_CHECKSUM == 6, "op CHECKSUM");
 KORU_STATIC_ASSERT(KORU_OP_WRITE == 7, "op WRITE");
 KORU_STATIC_ASSERT(KORU_OP_ADOPT_FD == 8, "op ADOPT_FD");
 KORU_STATIC_ASSERT(KORU_OP_POLL_ADD == 9, "op POLL_ADD");
+KORU_STATIC_ASSERT(KORU_OP_STAT == 10, "op STAT");
 
 /* Any bit set in an SQE's flags is rejected. */
 #define KORU_SQE_FLAGS_ALL 0u
@@ -258,6 +264,94 @@ KORU_STATIC_ASSERT(KORU_OP_POLL_ADD == 9, "op POLL_ADD");
 
 /* Multishot bit, reserved and never set. */
 #define KORU_CQE_F_MORE (1u << 0)
+
+/* File type, the top bits of koru_stat.mode. Unlike the open flags, these
+ * values are the same on every Linux architecture, so they pass through. */
+#define KORU_S_IFMT   0170000u
+#define KORU_S_IFIFO  0010000u
+#define KORU_S_IFCHR  0020000u
+#define KORU_S_IFDIR  0040000u
+#define KORU_S_IFBLK  0060000u
+#define KORU_S_IFREG  0100000u
+#define KORU_S_IFLNK  0120000u
+#define KORU_S_IFSOCK 0140000u
+
+/* Which koru_stat fields the kernel filled, returned in cqe.extra. koru's own
+ * bits, one per field and in this struct's field order, not statx's. blksize,
+ * dev and rdev have no statx bit because the VFS always fills them, and they
+ * get one here so the mask describes the whole struct. */
+#define KORU_STAT_INO     (1ull << 0)
+#define KORU_STAT_SIZE    (1ull << 1)
+#define KORU_STAT_BLOCKS  (1ull << 2)
+#define KORU_STAT_BLKSIZE (1ull << 3)
+#define KORU_STAT_NLINK   (1ull << 4)
+#define KORU_STAT_TYPE    (1ull << 5)
+#define KORU_STAT_MODE    (1ull << 6)
+#define KORU_STAT_UID     (1ull << 7)
+#define KORU_STAT_GID     (1ull << 8)
+#define KORU_STAT_DEV     (1ull << 9)
+#define KORU_STAT_RDEV    (1ull << 10)
+#define KORU_STAT_ATIME   (1ull << 11)
+#define KORU_STAT_MTIME   (1ull << 12)
+#define KORU_STAT_CTIME   (1ull << 13)
+#define KORU_STAT_BTIME   (1ull << 14)
+
+/* Everything STAT can report. A filesystem may report less; never more. */
+#define KORU_STAT_ALL                                                                              \
+    (KORU_STAT_INO | KORU_STAT_SIZE | KORU_STAT_BLOCKS | KORU_STAT_BLKSIZE | KORU_STAT_NLINK |     \
+     KORU_STAT_TYPE | KORU_STAT_MODE | KORU_STAT_UID | KORU_STAT_GID | KORU_STAT_DEV |             \
+     KORU_STAT_RDEV | KORU_STAT_ATIME | KORU_STAT_MTIME | KORU_STAT_CTIME | KORU_STAT_BTIME)
+
+/* What STAT writes into the slot. 256 bytes, every field 64 bits, no padding.
+ * Times are second-plus-nanosecond pairs and device numbers are explicit major
+ * and minor, so nothing here is a kernel-internal encoding. */
+struct koru_stat {
+    uint64_t ino;
+    uint64_t size;
+    uint64_t blocks;  /* 512-byte blocks allocated */
+    uint64_t blksize; /* preferred I/O size */
+    uint64_t nlink;
+    uint64_t mode; /* file type in KORU_S_IFMT, permissions below it */
+    uint64_t uid;  /* in the submitting task's user namespace */
+    uint64_t gid;
+    uint64_t dev_major;
+    uint64_t dev_minor;
+    uint64_t rdev_major;
+    uint64_t rdev_minor;
+    int64_t atime_sec; /* signed: a date before 1970 is a date */
+    uint64_t atime_nsec;
+    int64_t mtime_sec;
+    uint64_t mtime_nsec;
+    int64_t ctime_sec;
+    uint64_t ctime_nsec;
+    int64_t btime_sec; /* creation time; KORU_STAT_BTIME says if it is real */
+    uint64_t btime_nsec;
+    uint64_t reserved[12]; /* out: must read as zero */
+};
+
+KORU_STATIC_ASSERT(sizeof(struct koru_stat) == 256, "stat size");
+KORU_STATIC_ASSERT(KORU_ALIGNOF(struct koru_stat) == 8, "stat align");
+KORU_STATIC_ASSERT(offsetof(struct koru_stat, ino) == 0, "stat.ino");
+KORU_STATIC_ASSERT(offsetof(struct koru_stat, size) == 8, "stat.size");
+KORU_STATIC_ASSERT(offsetof(struct koru_stat, blocks) == 16, "stat.blocks");
+KORU_STATIC_ASSERT(offsetof(struct koru_stat, blksize) == 24, "stat.blksize");
+KORU_STATIC_ASSERT(offsetof(struct koru_stat, nlink) == 32, "stat.nlink");
+KORU_STATIC_ASSERT(offsetof(struct koru_stat, mode) == 40, "stat.mode");
+KORU_STATIC_ASSERT(offsetof(struct koru_stat, uid) == 48, "stat.uid");
+KORU_STATIC_ASSERT(offsetof(struct koru_stat, gid) == 56, "stat.gid");
+KORU_STATIC_ASSERT(offsetof(struct koru_stat, dev_major) == 64, "stat.dev_major");
+KORU_STATIC_ASSERT(offsetof(struct koru_stat, dev_minor) == 72, "stat.dev_minor");
+KORU_STATIC_ASSERT(offsetof(struct koru_stat, rdev_major) == 80, "stat.rdev_major");
+KORU_STATIC_ASSERT(offsetof(struct koru_stat, rdev_minor) == 88, "stat.rdev_minor");
+KORU_STATIC_ASSERT(offsetof(struct koru_stat, atime_sec) == 96, "stat.atime_sec");
+KORU_STATIC_ASSERT(offsetof(struct koru_stat, atime_nsec) == 104, "stat.atime_nsec");
+KORU_STATIC_ASSERT(offsetof(struct koru_stat, mtime_sec) == 112, "stat.mtime_sec");
+KORU_STATIC_ASSERT(offsetof(struct koru_stat, mtime_nsec) == 120, "stat.mtime_nsec");
+KORU_STATIC_ASSERT(offsetof(struct koru_stat, ctime_sec) == 128, "stat.ctime_sec");
+KORU_STATIC_ASSERT(offsetof(struct koru_stat, ctime_nsec) == 136, "stat.ctime_nsec");
+KORU_STATIC_ASSERT(offsetof(struct koru_stat, btime_sec) == 144, "stat.btime_sec");
+KORU_STATIC_ASSERT(offsetof(struct koru_stat, btime_nsec) == 152, "stat.btime_nsec");
+KORU_STATIC_ASSERT(offsetof(struct koru_stat, reserved) == 160, "stat.reserved");
 
 /* Handle encoding: index in the low half, generation in the high half. A
  * valid handle is never 0, because the generation starts at 1. */

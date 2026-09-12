@@ -292,6 +292,21 @@ int64_t r_write(struct koru_ring *r, uint32_t handle, uint32_t slot, uint64_t of
     return run_one(r->fd, &s);
 }
 
+int64_t r_stat(struct koru_ring *r, uint32_t handle, uint32_t slot, uint64_t off, uint32_t len,
+               uint64_t *extra)
+{
+    struct koru_sqe s;
+    struct koru_cqe c;
+    unsigned completed = 0;
+
+    sqe_stat(&s, handle, slot, off, len, 0x105);
+    if (submit(r->fd, &s, 1, &c, 1, 1, &completed) != 1 || completed != 1)
+        return INT64_MIN;
+    if (extra)
+        *extra = c.extra;
+    return c.res;
+}
+
 /* ------------------------------------------------------------------------- */
 
 void sqe_nop(struct koru_sqe *s, uint64_t user_data)
@@ -373,6 +388,18 @@ void sqe_write(struct koru_sqe *s, uint32_t handle, uint32_t slot, uint64_t off,
 {
     memset(s, 0, sizeof(*s));
     s->opcode    = KORU_OP_WRITE;
+    s->handle    = handle;
+    s->slot      = slot;
+    s->off       = off;
+    s->len       = len;
+    s->user_data = user_data;
+}
+
+void sqe_stat(struct koru_sqe *s, uint32_t handle, uint32_t slot, uint64_t off, uint32_t len,
+              uint64_t user_data)
+{
+    memset(s, 0, sizeof(*s));
+    s->opcode    = KORU_OP_STAT;
     s->handle    = handle;
     s->slot      = slot;
     s->off       = off;

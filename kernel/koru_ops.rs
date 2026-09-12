@@ -5,6 +5,7 @@
 
 use kernel::{
     bindings,
+    cred::Credential,
     error::from_err_ptr,
     fs::{File, LocalFile},
     impl_has_delayed_work, new_delayed_work,
@@ -17,6 +18,7 @@ use kernel::{
         Arc, ArcBorrow,
     },
     time::{msecs_to_jiffies, Jiffies},
+    transmute::AsBytes,
     types::Opaque,
     workqueue::{self, DelayedWork, HasWork, Work, WorkItem},
 };
@@ -49,6 +51,9 @@ pub(crate) struct OpWork {
     /// Resolved at submit time, so a `CLOSE` racing this op cannot free it.
     /// Dropped with the work item, whether it ran or not.
     file: Option<ARef<File>>,
+    /// The submitter's credentials, and through them its user namespace.
+    /// `current_cred()` in a kworker is `init_cred`; see doc/Notes.md.
+    cred: ARef<Credential>,
     /// `POLL_ADD`'s arm. Idle in every other op, which costs them the space
     /// rather than a second allocation; see doc/Notes.md.
     #[pin]
@@ -128,7 +133,7 @@ impl OpWork {
     /// `CANCEL` must free exactly what `run` would have.
     fn held_slot(sqe: &Sqe) -> Option<u32> {
         match sqe.opcode {
-            KORU_OP_CHECKSUM | KORU_OP_READ | KORU_OP_WRITE => Some(sqe.slot),
+            KORU_OP_CHECKSUM | KORU_OP_READ | KORU_OP_WRITE | KORU_OP_STAT => Some(sqe.slot),
             _ => None,
         }
     }
@@ -252,20 +257,23 @@ impl WorkItem for OpWork {
     /// Runs in a kworker: no user memory, and the submitting task may be gone.
     fn run(this: Arc<OpWork>) {
         let sqe = &this.sqe;
-        let res = match sqe.opcode {
-            KORU_OP_DELAY_NS => 0,
-            KORU_OP_CHECKSUM => this
-                .ring
-                .checksum(sqe)
-                .unwrap_or_else(|e| i64::from(e.to_errno())),
+        // `STAT` is the first opcode to set `extra`, so every arm carries one.
+        let failed = |e: Error| (i64::from(e.to_errno()), 0u64);
+        let (res, extra) = match sqe.opcode {
+            KORU_OP_DELAY_NS => (0, 0),
+            KORU_OP_CHECKSUM => this.ring.checksum(sqe).map_or_else(failed, |r| (r, 0)),
             KORU_OP_READ => this
                 .ring
                 .do_read(sqe, this.file.as_deref())
-                .unwrap_or_else(|e| i64::from(e.to_errno())),
+                .map_or_else(failed, |r| (r, 0)),
             KORU_OP_WRITE => this
                 .ring
                 .do_write(sqe, this.file.as_deref())
-                .unwrap_or_else(|e| i64::from(e.to_errno())),
+                .map_or_else(failed, |r| (r, 0)),
+            KORU_OP_STAT => this
+                .ring
+                .do_stat(sqe, this.file.as_deref(), &this.cred)
+                .unwrap_or_else(failed),
             // Only a fired poll reaches here, once: the callback won the token
             // before queueing. Off the waitqueue first.
             KORU_OP_POLL_ADD => {
@@ -280,12 +288,15 @@ impl WorkItem for OpWork {
                     // SAFETY: the file is alive for as long as the op is.
                     unsafe { poll_mask_now(&this) }
                 };
-                i64::from(poll_to_koru(mask & (this.poll.interest | POLL_ALWAYS)))
+                (
+                    i64::from(poll_to_koru(mask & (this.poll.interest | POLL_ALWAYS))),
+                    0,
+                )
             }
-            _ => i64::from(EINVAL.to_errno()),
+            _ => (i64::from(EINVAL.to_errno()), 0),
         };
         this.ring
-            .complete(RingCtx::cqe(sqe, res), OpWork::held_slot(sqe));
+            .complete(RingCtx::cqe_extra(sqe, res, extra), OpWork::held_slot(sqe));
 
         // Unregister *after* completing, so a `CANCEL` arriving while this ran
         // still finds the entry and reports `EALREADY` rather than `ENOENT`.
@@ -333,6 +344,7 @@ impl RingCtx {
             KORU_OP_WRITE => RingCtx::write_op(me, sqe),
             KORU_OP_ADOPT_FD => Some(me.adopt_op(ring, sqe)),
             KORU_OP_POLL_ADD => RingCtx::poll_op(me, sqe),
+            KORU_OP_STAT => RingCtx::stat_op(me, sqe),
             KORU_OP_CANCEL => Some(me.cancel_op(sqe)),
             KORU_OP_CHECKSUM => {
                 if sqe.handle != 0 {
@@ -688,6 +700,124 @@ impl RingCtx {
         Ok(done as i64)
     }
 
+    /// Copy `buf` into the arena at `pos`, splitting at page boundaries.
+    ///
+    /// Never call this with anything that can reach the VFS still to come: it
+    /// holds the arena mutex, which `do_read` records the rule for.
+    fn write_slot(&self, mut pos: usize, buf: &[u8]) -> Result<()> {
+        let arena = self.arena.lock();
+        let mut done = 0;
+
+        while done < buf.len() {
+            let page = arena.pages.get(pos / PAGE_SIZE).ok_or(EINVAL)?;
+            let in_page = pos % PAGE_SIZE;
+            let n = core::cmp::min(buf.len() - done, PAGE_SIZE - in_page);
+
+            // SAFETY: `buf[done..]` is valid for `n` bytes and `in_page + n <=
+            // PAGE_SIZE`. The slot is claimed for the life of this op, so
+            // nothing else touches the page.
+            unsafe { page.write_raw(buf[done..].as_ptr(), in_page, n)? };
+
+            pos += n;
+            done += n;
+        }
+        Ok(())
+    }
+
+    /// `STAT`: deferred, because `vfs_getattr` blocks on NFS and FUSE. Like
+    /// `READ` it holds its slot, so it is in `held_slot`.
+    fn stat_op(me: ArcBorrow<'_, RingCtx>, sqe: &Sqe) -> Option<i64> {
+        let file = match RingCtx::stat_validate(&me, sqe) {
+            Ok(file) => file,
+            Err(e) => return Some(i64::from(e.to_errno())),
+        };
+        if !me.state.lock().slot_try_acquire(sqe.slot) {
+            return Some(i64::from(EBUSY.to_errno()));
+        }
+        RingCtx::defer_holding_slot(me, sqe, Some(file))
+    }
+
+    /// Everything `STAT` can reject before it costs a work item.
+    fn stat_validate(&self, sqe: &Sqe) -> Result<ARef<File>> {
+        // `off` is a within-slot offset here, as on `OPEN` and `CHECKSUM`, so
+        // `check_range` is the right check — unlike on `READ` and `WRITE`.
+        self.check_range(sqe)?;
+        // Every field is 64 bits. Refusing an unaligned destination is what
+        // lets userspace read the struct in place instead of copying it out.
+        if sqe.off % 8 != 0 {
+            return Err(EINVAL);
+        }
+        // A stat that reports nothing can only be a caller bug, as an empty
+        // `POLL_ADD` mask is.
+        if sqe.len == 0 {
+            return Err(EINVAL);
+        }
+        // No readability or file-type gate: a stat transfers no file data, and
+        // `vfs_getattr` is defined on every type.
+        self.handles.lock().resolve(sqe.handle)
+    }
+
+    /// Runs in a kworker. Returns the bytes written and the mask of fields the
+    /// filesystem actually reported.
+    fn do_stat(&self, sqe: &Sqe, file: Option<&File>, cred: &Credential) -> Result<(i64, u64)> {
+        let file = file.ok_or(EINVAL)?;
+        let pos = self.slot_offset(sqe)?;
+        let mut ks = bindings::kstat::default();
+
+        // SAFETY: the op holds an `ARef<File>`, so `f_path` is live, and `ks`
+        // is our own. The arena mutex is not held: this reaches the VFS.
+        // `f_path` sits in an anonymous union bindgen names for us.
+        let ret = unsafe {
+            bindings::vfs_getattr(
+                &raw const (*file.as_ptr()).__bindgen_anon_1.f_path,
+                &mut ks,
+                STAT_REQUEST_MASK,
+                bindings::AT_STATX_SYNC_AS_STAT,
+            )
+        };
+        if ret < 0 {
+            return Err(Error::from_errno(ret));
+        }
+
+        // SAFETY: `cred` holds a reference, so its `user_ns` is live.
+        let ns = unsafe { (*cred.as_ptr()).user_ns };
+        // Every field is named, `reserved` explicitly zero, so the copy below
+        // cannot show the caller its own stale bytes back as kernel values.
+        let out = KoruStat {
+            ino: ks.ino,
+            size: ks.size as u64,
+            blocks: ks.blocks,
+            blksize: u64::from(ks.blksize),
+            nlink: u64::from(ks.nlink),
+            mode: u64::from(ks.mode),
+            // Munged, as `stat(2)` is: an id with no mapping in `ns` reports
+            // `overflowuid` rather than a raw `(uid_t)-1` nothing else uses.
+            // SAFETY: `ns` is live and these are plain value translations.
+            uid: u64::from(unsafe { bindings::from_kuid_munged(ns, ks.uid) }),
+            // SAFETY: as above.
+            gid: u64::from(unsafe { bindings::from_kgid_munged(ns, ks.gid) }),
+            dev_major: u64::from(ks.dev >> MINORBITS),
+            dev_minor: u64::from(ks.dev & MINORMASK),
+            rdev_major: u64::from(ks.rdev >> MINORBITS),
+            rdev_minor: u64::from(ks.rdev & MINORMASK),
+            atime_sec: ks.atime.tv_sec,
+            atime_nsec: ks.atime.tv_nsec as u64,
+            mtime_sec: ks.mtime.tv_sec,
+            mtime_nsec: ks.mtime.tv_nsec as u64,
+            ctime_sec: ks.ctime.tv_sec,
+            ctime_nsec: ks.ctime.tv_nsec as u64,
+            btime_sec: ks.btime.tv_sec,
+            btime_nsec: ks.btime.tv_nsec as u64,
+            reserved: [0; 12],
+        };
+
+        // `len` is the caller's buffer size and its version negotiation: an
+        // older binary asks for less and gets exactly that much.
+        let n = core::cmp::min(sqe.len as usize, core::mem::size_of::<KoruStat>());
+        self.write_slot(pos, &out.as_bytes()[..n])?;
+        Ok((n as i64, statx_to_koru(ks.result_mask)))
+    }
+
     /// `ADOPT_FD`: a handle for an already-open descriptor.
     ///
     /// Inline, for a different reason from `OPEN`: `fget` resolves against
@@ -782,6 +912,16 @@ impl RingCtx {
         // the drop impl always has a reference to release.
         module_get_live();
 
+        // Ioctl context, so `current` is the submitter. Taken for every
+        // deferred op rather than only for `STAT`: an op resolves everything it
+        // needs at submit time, and a kworker has no way back to this task.
+        // SAFETY: `current->cred` is replaced only by the task itself, so
+        // reading it in that task's own ioctl needs no RCU.
+        let cred = unsafe {
+            let task = bindings::get_current();
+            ARef::from(Credential::from_ptr((*task).cred))
+        };
+
         let op = match Arc::pin_init(
             pin_init!(OpWork {
                 work <- new_delayed_work!("OpWork::work"),
@@ -789,6 +929,7 @@ impl RingCtx {
                 ring: Arc::from(me),
                 sqe: *sqe,
                 file: file,
+                cred: cred,
             }),
             GFP_KERNEL,
         ) {
@@ -994,6 +1135,45 @@ impl RingCtx {
         );
         0
     }
+}
+
+// ---------------------------------------------------------------------------
+// Stat
+// ---------------------------------------------------------------------------
+
+/// What `STAT` asks `vfs_getattr` for. `result_mask` says what came back.
+const STAT_REQUEST_MASK: u32 = bindings::STATX_BASIC_STATS | bindings::STATX_BTIME;
+
+// `MAJOR` and `MINOR` are macros, so not in the bindings. From
+// include/linux/kdev_t.h.
+const MINORBITS: u32 = 20;
+const MINORMASK: u32 = (1 << MINORBITS) - 1;
+
+/// `kstat::result_mask` to koru's own bits, which are one per `KoruStat` field
+/// and in that struct's order rather than statx's.
+fn statx_to_koru(mask: u32) -> u64 {
+    const PAIRS: [(u32, u64); 12] = [
+        (bindings::STATX_INO, KORU_STAT_INO),
+        (bindings::STATX_SIZE, KORU_STAT_SIZE),
+        (bindings::STATX_BLOCKS, KORU_STAT_BLOCKS),
+        (bindings::STATX_NLINK, KORU_STAT_NLINK),
+        (bindings::STATX_TYPE, KORU_STAT_TYPE),
+        (bindings::STATX_MODE, KORU_STAT_MODE),
+        (bindings::STATX_UID, KORU_STAT_UID),
+        (bindings::STATX_GID, KORU_STAT_GID),
+        (bindings::STATX_ATIME, KORU_STAT_ATIME),
+        (bindings::STATX_MTIME, KORU_STAT_MTIME),
+        (bindings::STATX_CTIME, KORU_STAT_CTIME),
+        (bindings::STATX_BTIME, KORU_STAT_BTIME),
+    ];
+    // No statx bit: `generic_fillattr` fills these from the inode every time.
+    let mut out = KORU_STAT_BLKSIZE | KORU_STAT_DEV | KORU_STAT_RDEV;
+    for (statx, koru) in PAIRS {
+        if mask & statx != 0 {
+            out |= koru;
+        }
+    }
+    out
 }
 
 // Poll masks. Not in the bindings either: the `EPOLL*` constants carry the

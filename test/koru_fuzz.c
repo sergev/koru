@@ -89,13 +89,22 @@ static void fail(const char *what)
     atomic_store(&stop, 1);
 }
 
-/* There is only one Cqe constructor, so any deviation is a real bug. */
-static void check_cqe(const struct koru_cqe *c)
+/* `extra` stopped being blanket-zero at T23. Per-opcode from here, or the
+ * assertion goes green for the wrong reason. */
+static int extra_allowed(uint8_t opcode, const struct koru_cqe *c)
 {
-    if (c->flags != 0 || c->rsvd0 != 0 || c->extra != 0) {
-        note("cqe shape: flags %u rsvd0 %u extra %llu", c->flags, c->rsvd0,
-             (unsigned long long)c->extra);
-        fail("every CQE has zero flags, rsvd0 and extra");
+    if (opcode == KORU_OP_STAT)
+        return c->res >= 0 ? (c->extra & ~(uint64_t)KORU_STAT_ALL) == 0 : c->extra == 0;
+    return c->extra == 0;
+}
+
+/* There is only one Cqe constructor, so any deviation is a real bug. */
+static void check_cqe(const struct koru_cqe *c, uint8_t op)
+{
+    if (c->flags != 0 || c->rsvd0 != 0 || !extra_allowed(op, c)) {
+        note("cqe shape: op %u flags %u rsvd0 %u res %lld extra %llu", op, c->flags, c->rsvd0,
+             (long long)c->res, (unsigned long long)c->extra);
+        fail("every CQE has zero flags and rsvd0, and extra only where its opcode sets it");
     }
 }
 
@@ -132,6 +141,11 @@ static int res_allowed(uint8_t opcode, int64_t res)
          * rejection. EOPNOTSUPP needs two waitqueues, which none of these have. */
         return (res >= 0 && res <= KORU_POLL_EVENTS_ALL) || res == -EINVAL || res == -EBADF ||
                res == -ENOMEM || res == -ECANCELED;
+    case KORU_OP_STAT:
+        /* Never 0: a zero len is refused, so a success wrote something. */
+        return (res >= 1 && res <= (int64_t)sizeof(struct koru_stat)) || res == -EINVAL ||
+               res == -EBADF || res == -EBUSY || res == -ENOMEM || res == -EAGAIN ||
+               res == -ECANCELED;
     default:
         return res == -EINVAL;
     }
@@ -161,7 +175,7 @@ static void gen_valid(uint64_t *s, struct koru_sqe *q, uint64_t ud, uint32_t pat
 {
     uint32_t slot = rnd_below(s, F_SLOTS);
 
-    switch (rnd_below(s, 16)) {
+    switch (rnd_below(s, 17)) {
     case 0:
         sqe_nop(q, ud);
         break;
@@ -231,6 +245,12 @@ static void gen_valid(uint64_t *s, struct koru_sqe *q, uint64_t ud, uint32_t pat
          * FIFO stays out for the reason the OPEN arm does. */
         sqe_poll(q, one_in(s, 4) ? (uint32_t)rnd(s) : pool_pick(s),
                  one_in(s, 8) ? (uint32_t)rnd(s) : (1u + rnd_below(s, KORU_POLL_EVENTS_ALL)), ud);
+        break;
+    case 15:
+        /* Aligned by construction; the hostile generator's random off is what
+         * probes the rejection. */
+        sqe_stat(q, one_in(s, 4) ? (uint32_t)rnd(s) : pool_pick(s), slot, 8 * rnd_below(s, 8),
+                 1 + rnd_below(s, 512), ud);
         break;
     default:
         sqe_checksum(q, slot, 0, rnd_below(s, F_SLOT + 1), ud);
@@ -363,7 +383,7 @@ static void *worker(void *arg)
         for (i = 0; i < e.completed; i++) {
             uint8_t op = UD_OPCODE(cq[i].user_data);
 
-            check_cqe(&cq[i]);
+            check_cqe(&cq[i], op);
             if (cq[i].user_data > 0xffff) {
                 note("user_data %llu", (unsigned long long)cq[i].user_data);
                 fail("CQE user_data is echoed verbatim from its SQE");
@@ -587,7 +607,7 @@ static unsigned long long drain(void)
         }
         idle = 0;
         for (i = 0; i < e.completed; i++)
-            check_cqe(&cq[i]);
+            check_cqe(&cq[i], UD_OPCODE(cq[i].user_data));
         got += e.completed;
     }
     return got;
@@ -595,8 +615,8 @@ static unsigned long long drain(void)
 
 int fuzz_main(unsigned secs, uint64_t seed)
 {
-    static const char *names[11] = { "NOP",   "DELAY", "OPEN",  "READ",  "CLOSE", "CANCEL",
-                                     "CKSUM", "WRITE", "ADOPT", "POLL",  "other" };
+    static const char *names[12] = { "NOP",   "DELAY", "OPEN",  "READ",  "CLOSE", "CANCEL",
+                                     "CKSUM", "WRITE", "ADOPT", "POLL",  "STAT",  "other" };
     struct koru_ring m;
     pthread_t th[NWORKERS + 2];
     uint64_t seeds[NWORKERS + 2];
@@ -670,7 +690,7 @@ int fuzz_main(unsigned secs, uint64_t seed)
 
         note("%llu ENTERs, %llu SQEs consumed, %llu CQEs reaped (%llu at drain)",
              (unsigned long long)atomic_load(&total_ops), sub, rea, tail);
-        for (op = 0; op < 11; op++)
+        for (op = 0; op < 12; op++)
             note("%-6s %7llu completed, %7llu succeeded", names[op],
                  (unsigned long long)atomic_load(&op_total[op]),
                  (unsigned long long)atomic_load(&op_ok[op]));
@@ -683,7 +703,7 @@ int fuzz_main(unsigned secs, uint64_t seed)
         check(sub > SUB_FLOOR, "the fuzzer actually exercised the ring");
         /* Completion, not success: the tail sections carry that claim. */
         reached = 1;
-        for (op = 0; op <= KORU_OP_POLL_ADD; op++)
+        for (op = 0; op <= KORU_OP_STAT; op++)
             if (atomic_load(&op_total[op]) == 0) {
                 note("opcode %d never completed once", op);
                 reached = 0;

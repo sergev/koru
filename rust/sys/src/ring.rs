@@ -499,6 +499,20 @@ impl Sqe {
         }
     }
 
+    /// `off` is a within-slot offset and must be a multiple of 8; `len` is the
+    /// caller's buffer size, which the kernel clamps to `size_of::<KoruStat>()`.
+    pub fn stat(user_data: u64, handle: u32, slot: u32, off: u64, len: u32) -> Sqe {
+        Sqe {
+            opcode: KORU_OP_STAT,
+            len,
+            off,
+            user_data,
+            slot,
+            handle,
+            ..Sqe::default()
+        }
+    }
+
     /// `off` carries the descriptor; every other field must be zero.
     pub fn adopt_fd(user_data: u64, fd: i32) -> Sqe {
         Sqe {
@@ -539,5 +553,18 @@ impl Sqe {
             user_data,
             ..Sqe::default()
         }
+    }
+}
+
+impl KoruStat {
+    /// Decode a whole `KoruStat` out of a slot. `None` if there is not one
+    /// there, which is what a `len` short of the struct leaves behind.
+    pub fn read_from(bytes: &[u8]) -> Option<KoruStat> {
+        if bytes.len() < size_of::<KoruStat>() {
+            return None;
+        }
+        // SAFETY: every bit pattern is a valid `KoruStat`, the length is
+        // checked, and an unaligned read is allowed for.
+        Some(unsafe { std::ptr::read_unaligned(bytes.as_ptr().cast()) })
     }
 }

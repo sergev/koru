@@ -107,6 +107,22 @@ impl Mapped {
         self.run_one(&Sqe::adopt_fd(0x104, fd))
     }
 
+    /// `STAT`, with the CQE's `extra` mask beside its `res`.
+    pub fn stat_into(&self, handle: u32, slot: u32, off: u64, len: u32) -> (i64, u64) {
+        let mut cq = [Cqe::default(); 1];
+        let r = self
+            .ring
+            .enter(
+                &[Sqe::stat(0x105, handle, slot, off, len)],
+                &mut cq,
+                1,
+                None,
+            )
+            .expect("ENTER");
+        assert_eq!(r.progress.completed, 1, "STAT did not complete");
+        (cq[0].res, cq[0].extra)
+    }
+
     /// Assert nothing was left in flight.
     pub fn assert_quiesced(&self) {
         let left = self.ring.quiesce().expect("quiesce");

@@ -63,6 +63,7 @@ static const struct sec sections[] = {
     { "delay", sec_delay, 0 },
     { "cancel", sec_cancel, 0 },
     { "poll", sec_poll, 0 },
+    { "stat", sec_stat, 0 },
     { "signals", sec_signals, 0 },
     { "creds", sec_creds, 0 },
 };
@@ -383,10 +384,11 @@ void sec_mmap(void)
  * ------------------------------------------------------------------------ */
 
 /* Every opcode, plus two that do not exist. */
-static const uint8_t all_opcodes[] = { KORU_OP_NOP,      KORU_OP_DELAY_NS,  KORU_OP_OPEN,
-                                       KORU_OP_READ,     KORU_OP_CLOSE,     KORU_OP_CANCEL,
-                                       KORU_OP_CHECKSUM, KORU_OP_WRITE,     KORU_OP_ADOPT_FD,
-                                       9,                200 };
+static const uint8_t all_opcodes[] = { KORU_OP_NOP,      KORU_OP_DELAY_NS, KORU_OP_OPEN,
+                                       KORU_OP_READ,     KORU_OP_CLOSE,    KORU_OP_CANCEL,
+                                       KORU_OP_CHECKSUM, KORU_OP_WRITE,    KORU_OP_ADOPT_FD,
+                                       KORU_OP_POLL_ADD, KORU_OP_STAT,     11,
+                                       200 };
 
 /* Submit and never reap. Admission control must stop this at cq_entries. */
 static unsigned fill_cq(struct koru_ring *r, uint64_t delay_ns)

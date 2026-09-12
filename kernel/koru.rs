@@ -865,12 +865,18 @@ impl RingCtx {
     }
 
     pub(crate) fn cqe(sqe: &Sqe, res: i64) -> Cqe {
+        Self::cqe_extra(sqe, res, 0)
+    }
+
+    /// The only constructor that sets `extra`. `STAT` is the first opcode with
+    /// anything to put there; every other completion passes 0.
+    pub(crate) fn cqe_extra(sqe: &Sqe, res: i64, extra: u64) -> Cqe {
         Cqe {
             user_data: sqe.user_data,
             res,
             flags: 0,
             rsvd0: 0,
-            extra: 0,
+            extra,
         }
     }
 

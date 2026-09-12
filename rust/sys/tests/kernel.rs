@@ -55,7 +55,7 @@ fn smoke_the_device_is_there() {
 // ---------------------------------------------------------------------------
 
 /// Every opcode plus two that do not exist.
-const ALL_OPCODES: [u8; 11] = [
+const ALL_OPCODES: [u8; 13] = [
     KORU_OP_NOP,
     KORU_OP_DELAY_NS,
     KORU_OP_OPEN,
@@ -65,7 +65,9 @@ const ALL_OPCODES: [u8; 11] = [
     KORU_OP_CHECKSUM,
     KORU_OP_WRITE,
     KORU_OP_ADOPT_FD,
-    9,
+    KORU_OP_POLL_ADD,
+    KORU_OP_STAT,
+    11,
     200,
 ];
 
@@ -2669,5 +2671,262 @@ fn a_cancelled_poll_completes_once_and_never_again() {
     assert_eq!(after.progress.completed, 0, "no CQE at all");
 
     assert_eq!(m.close_handle(h as u32), 0);
+    m.assert_quiesced();
+}
+
+// ---------------------------------------------------------------------------
+// T23 - STAT into a slot
+// ---------------------------------------------------------------------------
+
+/// A byte no field of a real `KoruStat` is likely to be, pre-filled so an
+/// unwritten byte is visible.
+const POISON: u8 = 0xa5;
+
+// `st_dev` is `new_encode_dev`'d: minor's low eight bits, then major, then the
+// rest of minor. From include/linux/kdev_t.h.
+fn dev_major(dev: u64) -> u64 {
+    (dev >> 8) & 0xfff
+}
+
+fn dev_minor(dev: u64) -> u64 {
+    (dev & 0xff) | ((dev >> 12) & !0xff)
+}
+
+fn poison_slot(m: &Mapped, slot: u32) {
+    m.slot(slot)[..size_of::<KoruStat>() + 8].fill(POISON);
+}
+
+/// Every field against `fstat(2)`, and every other byte zero. A partly filled
+/// struct shows up here as poison read back as a kernel-reported value.
+#[test]
+fn stat_matches_fstat_field_for_field() {
+    use std::os::linux::fs::MetadataExt;
+
+    ensure_pattern_file();
+    let m = Mapped::shared();
+    let h = m.open_path(0, PATFILE, KORU_O_RDONLY) as u32;
+    assert!(h > 0, "OPEN");
+
+    poison_slot(&m, 1);
+    let (res, extra) = m.stat_into(h, 1, 0, size_of::<KoruStat>() as u32);
+    let md = std::fs::metadata(PATFILE).expect("metadata");
+    assert_eq!(res, size_of::<KoruStat>() as i64, "res is the whole struct");
+
+    let got = KoruStat::read_from(m.slot(1)).expect("a whole struct");
+    assert_eq!(got.ino, md.st_ino(), "ino");
+    assert_eq!(got.size, md.st_size(), "size");
+    assert_eq!(got.blocks, md.st_blocks(), "blocks");
+    assert_eq!(got.blksize, md.st_blksize(), "blksize");
+    assert_eq!(got.nlink, md.st_nlink(), "nlink");
+    assert_eq!(got.mode, u64::from(md.st_mode()), "mode");
+    assert_eq!(got.mode & KORU_S_IFMT, KORU_S_IFREG, "a regular file");
+    assert_eq!(got.uid, u64::from(md.st_uid()), "uid");
+    assert_eq!(got.gid, u64::from(md.st_gid()), "gid");
+    assert_eq!(got.dev_major, dev_major(md.st_dev()), "dev_major");
+    assert_eq!(got.dev_minor, dev_minor(md.st_dev()), "dev_minor");
+    assert_eq!(got.rdev_major, dev_major(md.st_rdev()), "rdev_major");
+    assert_eq!(got.rdev_minor, dev_minor(md.st_rdev()), "rdev_minor");
+    assert_eq!(got.atime_sec, md.st_atime(), "atime_sec");
+    assert_eq!(got.atime_nsec, md.st_atime_nsec() as u64, "atime_nsec");
+    assert_eq!(got.mtime_sec, md.st_mtime(), "mtime_sec");
+    assert_eq!(got.mtime_nsec, md.st_mtime_nsec() as u64, "mtime_nsec");
+    assert_eq!(got.ctime_sec, md.st_ctime(), "ctime_sec");
+    assert_eq!(got.ctime_nsec, md.st_ctime_nsec() as u64, "ctime_nsec");
+    assert_eq!(got.reserved, [0u64; 12], "reserved must read as zero");
+
+    // `extra` is the first non-zero one koru has ever posted.
+    assert_eq!(extra & !KORU_STAT_ALL, 0, "no bit outside KORU_STAT_ALL");
+    let basic = KORU_STAT_ALL & !KORU_STAT_BTIME;
+    assert_eq!(extra & basic, basic, "every field but btime was reported");
+    assert_ne!(extra & KORU_STAT_BTIME, 0, "tmpfs reports a creation time");
+    // The mask is koru's own; the statx one must not read as valid here.
+    assert_ne!(extra, 4095, "the statx mask passed through untranslated");
+
+    assert_eq!(m.close_handle(h), 0);
+    m.assert_quiesced();
+}
+
+/// A device node, where `rdev` and the type bits are not both zero.
+#[test]
+fn stat_reports_a_device_node() {
+    use std::os::linux::fs::MetadataExt;
+
+    let m = Mapped::shared();
+    let h = m.open_path(0, "/dev/null", KORU_O_RDONLY) as u32;
+    assert!(h > 0, "OPEN /dev/null");
+
+    poison_slot(&m, 1);
+    let (res, _) = m.stat_into(h, 1, 0, size_of::<KoruStat>() as u32);
+    assert_eq!(res, size_of::<KoruStat>() as i64);
+
+    let md = std::fs::metadata("/dev/null").expect("metadata");
+    let got = KoruStat::read_from(m.slot(1)).expect("a whole struct");
+    assert_eq!(got.mode & KORU_S_IFMT, KORU_S_IFCHR, "a character device");
+    assert_eq!(got.rdev_major, dev_major(md.st_rdev()), "rdev_major");
+    assert_eq!(got.rdev_minor, dev_minor(md.st_rdev()), "rdev_minor");
+    assert_ne!(got.rdev_major, 0, "and it is not the all-zero answer");
+
+    assert_eq!(m.close_handle(h), 0);
+    m.assert_quiesced();
+}
+
+/// `len` is the caller's buffer size and doubles as version negotiation.
+#[test]
+fn stat_clamps_to_len_and_writes_no_further() {
+    ensure_pattern_file();
+    let m = Mapped::shared();
+    let h = m.open_path(0, PATFILE, KORU_O_RDONLY) as u32;
+    assert!(h > 0, "OPEN");
+    let full = size_of::<KoruStat>();
+
+    poison_slot(&m, 1);
+    assert_eq!(m.stat_into(h, 1, 0, 64).0, 64, "a short len returns itself");
+    assert_eq!(m.slot(1)[64], POISON, "the byte after it is untouched");
+    assert_ne!(m.slot(1)[0], POISON, "and the prefix really was written");
+
+    poison_slot(&m, 1);
+    assert_eq!(m.stat_into(h, 1, 0, 4096).0, full as i64, "clamped");
+    assert_eq!(m.slot(1)[full], POISON, "nothing beyond the struct");
+
+    assert_eq!(m.close_handle(h), 0);
+    m.assert_quiesced();
+}
+
+/// Slots are whole pages, so a destination at 3968 spans two of them and
+/// `write_slot`'s split is what has to get it right.
+#[test]
+fn stat_crosses_a_page_boundary_intact() {
+    ensure_pattern_file();
+    let m = Mapped::shared();
+    let h = m.open_path(0, PATFILE, KORU_O_RDONLY) as u32;
+    assert!(h > 0, "OPEN");
+
+    poison_slot(&m, 1);
+    let flat = m.stat_into(h, 1, 0, size_of::<KoruStat>() as u32).0;
+    let want = KoruStat::read_from(m.slot(1)).expect("a whole struct");
+
+    const OFF: usize = 3968;
+    m.slot(2)[OFF..OFF + size_of::<KoruStat>() + 8].fill(POISON);
+    let split = m
+        .stat_into(h, 2, OFF as u64, size_of::<KoruStat>() as u32)
+        .0;
+    let got = KoruStat::read_from(&m.slot(2)[OFF..]).expect("a whole struct");
+
+    assert_eq!(flat, split, "the same count either side of a page boundary");
+    assert_eq!(got.ino, want.ino, "ino, written across the split");
+    assert_eq!(got.size, want.size, "size");
+    assert_eq!(got.reserved, [0u64; 12], "and the tail page too");
+
+    assert_eq!(m.close_handle(h), 0);
+    m.assert_quiesced();
+}
+
+#[test]
+fn stat_rejection_matrix() {
+    ensure_pattern_file();
+    let m = Mapped::shared();
+    let h = m.open_path(0, PATFILE, KORU_O_RDONLY) as u32;
+    assert!(h > 0, "OPEN");
+    let full = size_of::<KoruStat>() as u32;
+    let (bad, ebadf) = (-(EINVAL.0 as i64), -(EBADF.0 as i64));
+
+    let cases: [(&str, Sqe, i64); 8] = [
+        ("an unaligned off", Sqe::stat(0x600, h, 1, 4, full), bad),
+        ("a zero len", Sqe::stat(0x601, h, 1, 0, 0), bad),
+        (
+            "off + len past the slot",
+            Sqe::stat(0x602, h, 1, u64::from(m.slot_size() - 8), 16),
+            bad,
+        ),
+        (
+            "an off + len that overflows",
+            Sqe::stat(0x603, h, 1, u64::MAX & !7, 16),
+            bad,
+        ),
+        (
+            "a slot past the arena",
+            Sqe::stat(0x604, h, m.slot_count(), 0, 64),
+            bad,
+        ),
+        ("handle 0", Sqe::stat(0x605, 0, 1, 0, 64), ebadf),
+        (
+            "a stale generation",
+            Sqe::stat(0x606, h + (1 << 16), 1, 0, 64),
+            ebadf,
+        ),
+        (
+            "an index past the table",
+            Sqe::stat(0x607, m.handle_count() | (1 << 16), 1, 0, 64),
+            ebadf,
+        ),
+    ];
+    for (what, sqe, want) in cases {
+        assert_eq!(m.run_one(&sqe), want, "{what}");
+    }
+
+    assert_eq!(m.close_handle(h), 0);
+    assert_eq!(m.stat_into(h, 1, 0, 64).0, ebadf, "a closed handle");
+    m.assert_quiesced();
+}
+
+/// A whole-slot CHECKSUM is slow enough to still hold the slot when the STAT
+/// behind it is dispatched.
+#[test]
+fn stat_is_refused_a_slot_another_op_holds() {
+    ensure_pattern_file();
+    let m = Mapped::shared();
+    let h = m.open_path(0, PATFILE, KORU_O_RDONLY) as u32;
+    assert!(h > 0, "OPEN");
+    let n = m.slot_size();
+
+    let sq = [
+        Sqe::checksum(0x610, 5, 0, n),
+        Sqe::stat(0x611, h, 5, 0, size_of::<KoruStat>() as u32),
+    ];
+    let mut cq = [Cqe::default(); 2];
+    let r = m.ring.enter(&sq, &mut cq, 2, None).expect("ENTER");
+    assert_eq!(r.progress.completed, 2, "both complete");
+
+    let refused = find_cqe(&cq, 0x611);
+    assert_eq!(refused.res, -(EBUSY.0 as i64), "the STAT behind it");
+    assert_eq!(refused.extra, 0, "a refused STAT reports no mask");
+
+    assert_eq!(m.close_handle(h), 0);
+    m.assert_quiesced();
+}
+
+/// The only thing that says KORU_OP_STAT reached OpWork::held_slot.
+#[test]
+fn stat_releases_its_slot_when_cancelled() {
+    ensure_pattern_file();
+    let m = Mapped::shared();
+    let h = m.open_path(0, PATFILE, KORU_O_RDONLY) as u32;
+    assert!(h > 0, "OPEN");
+    let n = m.slot_size();
+
+    let r = m
+        .ring
+        .enter(
+            &[Sqe::stat(0x620, h, 6, 0, size_of::<KoruStat>() as u32)],
+            &mut [],
+            0,
+            None,
+        )
+        .expect("ENTER");
+    assert_eq!(r.consumed, 1, "the STAT is queued");
+
+    let mut cq = [Cqe::default(); 4];
+    let r = m
+        .ring
+        .enter(&[Sqe::cancel(0x621, 0x620)], &mut cq, 2, None)
+        .expect("ENTER");
+    assert_eq!(r.progress.completed, 2, "both complete");
+
+    // Not -EBUSY: the slot came back whether the cancel won or the stat ran.
+    assert!(
+        m.run_one(&Sqe::checksum(0x622, 6, 0, n)) >= 0,
+        "the cancelled STAT never released its slot"
+    );
+    assert_eq!(m.close_handle(h), 0);
     m.assert_quiesced();
 }

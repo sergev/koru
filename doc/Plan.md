@@ -79,12 +79,12 @@ Three obligations apply to every kernel task rather than being repeated in each:
   probes instead of submitting and watching for `-EINVAL`. This is what
   `features` was for. An opcode that is unconditionally present at this ABI
   version needs no bit and does not get one; T17 settled that for `WRITE`.
-- The fuzzer grows with each opcode: a per-opcode allowed-`res` set, a
-  per-opcode `extra` oracle replacing the blanket `extra == 0` assertion, and —
-  for anything touching the filesystem — a per-run temp directory plus a path
-  generator structurally unable to emit `..` or an absolute path. That
-  sandboxing is a property of the test, not the kernel, and it is the most
-  important safety property in the plan.
+- The fuzzer grows with each opcode: a per-opcode allowed-`res` set, an arm in
+  its `extra` oracle, which T23 made per-opcode, and — for anything touching the
+  filesystem — a per-run temp directory plus a path generator structurally
+  unable to emit `..` or an absolute path. That sandboxing is a property of the
+  test, not the kernel, and it is the most important safety property in the
+  plan.
 - Any new `#[repr(C)]` is mirrored in `koru_abi.h` and covered by T14's diff.
 
 No kernel task bumps `KORU_ABI_VERSION`. New opcodes are additive under the
@@ -92,49 +92,6 @@ existing "unimplemented completes `-EINVAL`" rule. A new bit in an existing
 `*_FLAGS_ALL` mask only relaxes a rejection, so it is safe in both directions.
 Per-opcode meanings for `Cqe::extra` are within its documented contract. New
 data-plane structs change no existing size or offset.
-
-### T23 [M] — `KORU_OP_STAT` by handle, and `KoruStat`
-
-`res` plus `extra` is sixteen bytes and a `kstat` is about a hundred and fifty,
-so the result goes in the slot. `slot` is the destination, `off` a within-slot
-offset, `len` the caller's buffer size — which doubles as version negotiation,
-since the kernel writes `min(len, sizeof(KoruStat))` and returns that in `res`.
-`extra` carries `kstat.result_mask`, the fields actually valid.
-
-`KoruStat` is a new `#[repr(C)]` in `koru_abi.rs`, held to the same offset
-assertions and `AsBytes`/`FromBytes` discipline as `Sqe`: fixed 64-bit fields,
-times as second-plus-nanosecond pairs, device numbers as explicit major and
-minor rather than the internal `dev_t`, and a `reserved` array the kernel zeroes
-so a later field is a carve-out exactly as `handle_count` was. Translate `kstat`
-field by field, never by `transmute` — it is kernel-internal, and the shortcut
-looks fine until a kernel bump.
-
-Deferred, because `vfs_getattr` blocks on NFS and FUSE. It holds a slot, so it
-joins `held_slot`: T17's trap, second instance.
-
-Two easy mistakes. The kernel must zero the whole destination before filling it,
-because `READ`'s "the rest of the slot is the caller's own data" argument does
-not transfer — a partially filled struct makes the caller read stale bytes as if
-they were kernel-reported values. And `kstat.uid` is a `kuid_t`, meaningful only
-through `from_kuid(current_user_ns(), ...)`; in a kworker that namespace is
-init's, so a deferred stat silently reports wrong numbers inside a container.
-Carry the submitter's user namespace in `OpWork` and translate in the worker;
-capturing it at submit time is impossible, since the stat has not happened yet.
-This is finding 3's quiet sibling — wrong numbers rather than a privilege
-escalation, so nothing catches it by accident.
-
-Done test: every field cross-checked against `fstat(2)` on the same path, which
-is the whole test and is cheap. A `len` smaller than the struct returns
-`res == len` and leaves a sentinel at `off + len` untouched. The rejection
-matrix, and two concurrent stats on one slot giving one `-EBUSY`. `extra` equals
-the returned mask. Zeroing: pre-fill the slot with a poison byte and assert
-every byte of the struct is a real field or a zero. The uid mapping is asserted
-against the caller's own view, with a comment saying plainly that this passes on
-the dev VM and would fail in a container if the namespace were not carried — a
-test that only fails where nobody runs it is not evidence.
-
-First opcode to set `extra`, so this is where the fuzzer's blanket `extra == 0`
-oracle becomes per-opcode. Forgetting makes the fuzz green for the wrong reason.
 
 ### T24 [R] — `kern_path` plumbing: `TRUNCATE`, `UTIMES`, `READLINK`
 

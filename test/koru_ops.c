@@ -7,6 +7,7 @@
 #include <fcntl.h>
 #include <grp.h>
 #include <pwd.h>
+#include <sched.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -16,6 +17,7 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -788,6 +790,308 @@ void sec_adopt(void)
     check(leaked < 64, "  and struct file allocations came back");
     if (leaked >= 64)
         note("file-nr leaked %ld", leaked);
+}
+
+/* T23: KORU_OP_STAT, whose result goes in the slot rather than in res. */
+
+#define STAT_SLOT  1u
+#define STAT_POISON 0xa5
+#define STATNS     "/tmp/koru-check-statns"
+
+/* What fstat(2) says the struct must contain. btime is copied through: fstat
+ * cannot report it, and `extra` is what says whether it was real. */
+static void stat_expect(const struct stat *sb, const struct koru_stat *got,
+                        struct koru_stat *want)
+{
+    memset(want, 0, sizeof(*want));
+    want->ino        = sb->st_ino;
+    want->size       = (uint64_t)sb->st_size;
+    want->blocks     = (uint64_t)sb->st_blocks;
+    want->blksize    = (uint64_t)sb->st_blksize;
+    want->nlink      = sb->st_nlink;
+    want->mode       = sb->st_mode;
+    want->uid        = sb->st_uid;
+    want->gid        = sb->st_gid;
+    want->dev_major  = major(sb->st_dev);
+    want->dev_minor  = minor(sb->st_dev);
+    want->rdev_major = major(sb->st_rdev);
+    want->rdev_minor = minor(sb->st_rdev);
+    want->atime_sec  = sb->st_atim.tv_sec;
+    want->atime_nsec = (uint64_t)sb->st_atim.tv_nsec;
+    want->mtime_sec  = sb->st_mtim.tv_sec;
+    want->mtime_nsec = (uint64_t)sb->st_mtim.tv_nsec;
+    want->ctime_sec  = sb->st_ctim.tv_sec;
+    want->ctime_nsec = (uint64_t)sb->st_ctim.tv_nsec;
+    want->btime_sec  = got->btime_sec;
+    want->btime_nsec = got->btime_nsec;
+}
+
+/* Poison the slot, stat `path` both ways, and require all 256 bytes to match:
+ * every byte is a field fstat(2) agrees with, or a zeroed reserved word. A
+ * partly filled struct shows up here as poison read back as a kernel value.
+ * Returns the CQE's mask, or 0 on failure. */
+static uint64_t stat_both_ways(const char *path, const char *what)
+{
+    struct koru_stat got, want;
+    struct stat sb;
+    uint8_t *slot  = R.arena + (size_t)STAT_SLOT * R.slot_size;
+    uint64_t extra = 0;
+    int64_t h, res;
+    char label[128];
+    int fd, ok;
+
+    fd = open(path, O_RDONLY);
+    h  = r_open(&R, PATH_SLOT, path, KORU_O_RDONLY);
+    snprintf(label, sizeof(label), "%s: OPEN it both ways", what);
+    check(fd >= 0 && h > 0, label);
+    if (fd < 0 || h <= 0) {
+        if (fd >= 0)
+            close(fd);
+        return 0;
+    }
+
+    memset(slot, STAT_POISON, sizeof(struct koru_stat) + 8);
+    res = r_stat(&R, (uint32_t)h, STAT_SLOT, 0, sizeof(struct koru_stat), &extra);
+    ok  = fstat(fd, &sb) == 0;
+    close(fd);
+    r_close(&R, (uint32_t)h);
+
+    snprintf(label, sizeof(label), "  res is the whole struct, and fstat(2) agrees");
+    if (res != (int64_t)sizeof(struct koru_stat) || !ok) {
+        check(0, label);
+        note("res %lld, fstat %d", (long long)res, ok);
+        return 0;
+    }
+    memcpy(&got, slot, sizeof(got));
+    stat_expect(&sb, &got, &want);
+    check(memcmp(&got, &want, sizeof(got)) == 0, label);
+    if (memcmp(&got, &want, sizeof(got)) != 0) {
+        note("ino %llu/%llu size %llu/%llu mode %llo/%llo uid %llu/%llu",
+             (unsigned long long)got.ino, (unsigned long long)want.ino,
+             (unsigned long long)got.size, (unsigned long long)want.size,
+             (unsigned long long)got.mode, (unsigned long long)want.mode,
+             (unsigned long long)got.uid, (unsigned long long)want.uid);
+    }
+
+    /* The sentinel past the struct: res says where the kernel stopped. */
+    snprintf(label, sizeof(label), "  and it wrote not one byte past res");
+    check(slot[sizeof(struct koru_stat)] == STAT_POISON, label);
+    return extra;
+}
+
+static void stat_rejections(int64_t h)
+{
+    struct koru_sqe s;
+
+    sqe_stat(&s, (uint32_t)h, STAT_SLOT, 4, sizeof(struct koru_stat), 0x600);
+    check_res(run_one(R.fd, &s), -EINVAL, "an unaligned off is EINVAL");
+    check_res(r_stat(&R, (uint32_t)h, STAT_SLOT, 0, 0, NULL), -EINVAL,
+              "a zero len is EINVAL");
+    check_res(r_stat(&R, (uint32_t)h, STAT_SLOT, R.slot_size - 8, 16, NULL), -EINVAL,
+              "an off + len past the slot is EINVAL");
+    check_res(r_stat(&R, (uint32_t)h, STAT_SLOT, UINT64_MAX & ~7ull, 16, NULL), -EINVAL,
+              "an off + len that overflows is EINVAL");
+    check_res(r_stat(&R, (uint32_t)h, R.slot_count, 0, 64, NULL), -EINVAL,
+              "a slot past the arena is EINVAL");
+    check_res(r_stat(&R, 0, STAT_SLOT, 0, 64, NULL), -EBADF, "handle 0 is EBADF");
+    check_res(r_stat(&R, (uint32_t)h + (1u << 16), STAT_SLOT, 0, 64, NULL), -EBADF,
+              "  a stale generation is EBADF");
+    check_res(r_stat(&R, R.handle_count | (1u << 16), STAT_SLOT, 0, 64, NULL), -EBADF,
+              "  an index past the table is EBADF");
+}
+
+static int write_file(const char *path, const char *text)
+{
+    ssize_t n = (ssize_t)strlen(text);
+    int fd    = open(path, O_WRONLY);
+
+    if (fd < 0)
+        return -1;
+    if (write(fd, text, (size_t)n) != n) {
+        close(fd);
+        return -1;
+    }
+    return close(fd);
+}
+
+/* In its own user namespace, root's files must stat as the shifted id, and
+ * koru must agree with fstat(2). The kernel translates in a kworker, where
+ * current_user_ns() is init's — so this is what proves OpWork carries the
+ * submitter's creds rather than the worker's. Delete that and every uid below
+ * comes back unshifted. */
+static int stat_ns_child(struct koru_ring *m)
+{
+    struct koru_stat ks;
+    struct stat sb;
+    int64_t h, res;
+    int fd;
+
+    if (ring_map(m) != 0)
+        return 2;
+    if (unshare(CLONE_NEWUSER) != 0)
+        return 3;
+    /* gid_map needs this unless we hold CAP_SETGID in the parent namespace,
+     * which unshare has just taken away. uid_map needs no equivalent: the
+     * single mapped id is our own. */
+    if (write_file("/proc/self/setgroups", "deny") != 0)
+        return 4;
+    if (write_file("/proc/self/uid_map", "100 0 1\n") != 0)
+        return 5;
+    if (write_file("/proc/self/gid_map", "200 0 1\n") != 0)
+        return 6;
+
+    fd = open(STATNS, O_RDONLY);
+    h  = r_open(m, 0, STATNS, KORU_O_RDONLY);
+    if (fd < 0 || h <= 0)
+        return 7;
+    res = r_stat(m, (uint32_t)h, 1, 0, sizeof(ks), NULL);
+    if (fstat(fd, &sb) != 0 || res != (int64_t)sizeof(ks))
+        return 8;
+    memcpy(&ks, m->arena + m->slot_size, sizeof(ks));
+    close(fd);
+    r_close(m, (uint32_t)h);
+
+    /* Shifted, and the same shift fstat(2) reports. */
+    if (sb.st_uid != 100 || sb.st_gid != 200)
+        return 9;
+    if (ks.uid != sb.st_uid || ks.gid != sb.st_gid)
+        return 10;
+    return 0;
+}
+
+static void stat_namespace(void)
+{
+    struct koru_ring m;
+    pid_t pid;
+    int st = 0, fd;
+
+    if (geteuid() != 0) {
+        printf("%-58s SKIP (not root)\n", "a stat in a user namespace reports the shifted uid");
+        return;
+    }
+    fd = open(STATNS, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0 || fchown(fd, 0, 0) != 0) {
+        printf("%-58s SKIP (cannot create " STATNS ")\n",
+               "a stat in a user namespace reports the shifted uid");
+        if (fd >= 0)
+            close(fd);
+        return;
+    }
+    close(fd);
+
+    /* VM_DONTCOPY: the parent leaves this ring unmapped, the child maps it. */
+    if (ring_open(&m, 32, 64, 8192, 4, 8) != 0) {
+        check(0, "a ring for the namespace child");
+        unlink(STATNS);
+        return;
+    }
+    pid = fork();
+    if (pid == 0)
+        _exit(stat_ns_child(&m));
+    if (pid < 0 || waitpid(pid, &st, 0) != pid) {
+        check(0, "fork the namespace child");
+    } else if (WIFEXITED(st) && WEXITSTATUS(st) == 3) {
+        printf("%-58s SKIP (no CONFIG_USER_NS)\n",
+               "a stat in a user namespace reports the shifted uid");
+    } else {
+        /* 4-6 map writes, 7 open, 8 stat, 9 fstat unshifted, 10 disagreed. */
+        check(WIFEXITED(st) && WEXITSTATUS(st) == 0,
+              "a stat in a user namespace reports the shifted uid");
+        if (WIFEXITED(st) && WEXITSTATUS(st) != 0)
+            note("child verdict %d", WEXITSTATUS(st));
+    }
+    ring_close(&m);
+    unlink(STATNS);
+}
+
+void sec_stat(void)
+{
+    struct koru_sqe sq[2];
+    struct koru_cqe cq[2];
+    const struct koru_cqe *a, *b;
+    uint8_t *slot = R.arena + (size_t)STAT_SLOT * R.slot_size;
+    unsigned completed = 0;
+    uint64_t extra;
+    int64_t h, res;
+
+    /* 1. Every field, against fstat(2), for three shapes of file. */
+    extra = stat_both_ways(PATFILE, "a regular file");
+    check((extra & ~(uint64_t)KORU_STAT_ALL) == 0, "  extra carries no bit outside KORU_STAT_ALL");
+    check((extra & (KORU_STAT_ALL & ~KORU_STAT_BTIME)) == (KORU_STAT_ALL & ~KORU_STAT_BTIME),
+          "  and every field but btime was reported");
+    check((extra & KORU_STAT_BTIME) != 0, "  tmpfs reports a creation time too");
+    /* The mask is koru's own, so the statx one must not read as valid here. */
+    check(extra != 4095, "  and it is not the statx mask passed through");
+
+    stat_both_ways("/etc", "a directory");
+    stat_both_ways("/dev/null", "a character device");
+
+    /* 2. len is the caller's buffer size, and its version negotiation. */
+    h = r_open(&R, PATH_SLOT, PATFILE, KORU_O_RDONLY);
+    check(h > 0, "OPEN the pattern file");
+    if (h <= 0)
+        return;
+
+    memset(slot, STAT_POISON, sizeof(struct koru_stat) + 8);
+    check_res(r_stat(&R, (uint32_t)h, STAT_SLOT, 0, 64, NULL), 64,
+              "a len short of the struct returns exactly that len");
+    check(slot[64] == STAT_POISON, "  and leaves the byte after it untouched");
+    check(slot[0] != STAT_POISON, "  while the prefix really was written");
+
+    memset(slot, STAT_POISON, sizeof(struct koru_stat) + 8);
+    check_res(r_stat(&R, (uint32_t)h, STAT_SLOT, 0, 4096, NULL), sizeof(struct koru_stat),
+              "a len past the struct is clamped to the struct");
+    check(slot[sizeof(struct koru_stat)] == STAT_POISON, "  and nothing beyond it is touched");
+
+    /* 3. A destination straddling a page boundary, which write_slot must split. */
+    {
+        struct koru_stat got, want;
+        struct stat sb;
+        int fd = open(PATFILE, O_RDONLY);
+
+        memset(slot + 3968, STAT_POISON, sizeof(struct koru_stat) + 8);
+        res = r_stat(&R, (uint32_t)h, STAT_SLOT, 3968, sizeof(struct koru_stat), NULL);
+        check(fd >= 0 && fstat(fd, &sb) == 0 && res == (int64_t)sizeof(struct koru_stat),
+              "a stat at slot offset 3968 crosses a page boundary");
+        if (fd >= 0)
+            close(fd);
+        memcpy(&got, slot + 3968, sizeof(got));
+        stat_expect(&sb, &got, &want);
+        check(memcmp(&got, &want, sizeof(got)) == 0, "  and lands intact on both pages");
+    }
+
+    /* 4. Rejections. */
+    stat_rejections(h);
+
+    /* 5. Slot exclusivity. A whole-slot CHECKSUM is slow enough to still hold
+     *    the slot when the STAT behind it is dispatched. */
+    sqe_checksum(&sq[0], STAT_SLOT, 0, R.slot_size, 0xd0);
+    sqe_stat(&sq[1], (uint32_t)h, STAT_SLOT, 0, sizeof(struct koru_stat), 0xd1);
+    submit(R.fd, sq, 2, cq, 2, 2, &completed);
+    a = find_cqe(cq, completed, 0xd0);
+    b = find_cqe(cq, completed, 0xd1);
+    check(completed == 2 && a && b, "a CHECKSUM and a STAT on one slot both complete");
+    if (a && b) {
+        check(a->res >= 0, "  the deferred CHECKSUM holds the slot");
+        check_res(b->res, -EBUSY, "  and the STAT behind it gets -EBUSY");
+        check(b->extra == 0, "  a refused STAT reports no mask");
+    }
+
+    /* 6. A cancelled STAT must release its slot: KORU_OP_STAT in held_slot is
+     *    the only thing that does it, and nothing else says so. */
+    sqe_stat(&sq[0], (uint32_t)h, STAT_SLOT, 0, sizeof(struct koru_stat), 0x70);
+    if (submit(R.fd, sq, 1, cq, 0, 0, &completed) == 1) {
+        sqe_cancel(&sq[0], 0x70, 0x71);
+        submit(R.fd, sq, 1, cq, 2, 2, &completed);
+        check(completed == 2, "a STAT and its CANCEL both complete");
+        sqe_checksum(&sq[0], STAT_SLOT, 0, R.slot_size, 0x72);
+        check(run_one(R.fd, &sq[0]) >= 0, "  and the cancelled STAT released its slot");
+    }
+
+    check_res(r_close(&R, (uint32_t)h), 0, "the handle closes");
+
+    /* 7. The ids are the submitter's, not the kworker's. */
+    stat_namespace();
 }
 
 void sec_delay(void)
