@@ -65,26 +65,6 @@ ABI.
 
 ## Phase 4 — the Rust binding
 
-### T14 [M] — ABI conformance and `abi_dump`
-
-Pulled ahead of the rest of the C++ work, because this is an ABI task rather
-than a C++ one, and it is the only thing that keeps `koru_abi.rs` and
-`koru_abi.h` in step while the kernel phases add eleven opcodes and two structs
-to both.
-
-Create `cpp/include/koru_abi.h` from `test/koru_abi.h`, with
-`static_assert` on every `sizeof`, `offsetof` and opcode value. The current
-mirror carries the structs but none of the `KORU_MAX_*` caps, the three
-`*_FLAGS_ALL` masks or `KORU_CQE_F_MORE`; add those. Then an `abi_dump` binary
-on each side, emitting a canonical text dump of the whole surface.
-
-`abi_dump` also emits `koru_sys::error::KORU_ERRNOS`, so the C++ transcription
-of that table at T39 is diffed rather than asserted. `rust/koru-sys/src/abi.rs`
-already carries the caps and masks the C mirror omits; take them from there.
-
-Done test: the `diff` of the two dumps is empty, and perturbing one field in
-either file makes it fail. Verify that, or the test proves nothing.
-
 ### T15 [R] — futures and executor
 
 Op slab keyed by `(index, generation)`, `Future` impls, and a single-threaded
@@ -1038,8 +1018,8 @@ lands:
 4. `cargo run --example read_file` — the Rust demo (T21).
 5. `cmake -B build -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined"`, then
    `cmake --build build`.
-6. `diff <(./build/abi_dump) <(cargo run -q --bin abi_dump)` — empty (T14), and
-   the same for the screen protocol's two dumps (T33).
+6. `scripts/abi.sh` — the two ABI dumps agree (T14). The screen protocol's two
+   dumps share the same runner (T33).
 7. `ctest --test-dir build` — the C++ matrix (T39), abandonment (T40),
    symmetric transfer (T41), drop safety (T43), the C++ surface (T44–T47) and
    the C++ screen client (T48), under ASan and UBSan.

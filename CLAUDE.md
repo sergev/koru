@@ -5,7 +5,7 @@ code in this repository.
 
 ## State of the repository
 
-**T0–T13 are done: the kernel side is finished and the Rust ABI layer exists.**
+**T0–T14 are done: the kernel side is finished and the Rust ABI layer exists.**
 The module registers `/dev/koru`, configures a ring with `SETUP`, and submits
 `NOP`, `DELAY_NS`, `CHECKSUM`, `OPEN`, `READ`, `CLOSE` and `CANCEL` through
 `ENTER`, which blocks for completions. The arena is mmap'd, with slot
@@ -19,6 +19,12 @@ T13 added `rust/koru-sys`: the ABI mirror, the ioctl wrappers, `Ring`, `Arena`,
 integration tests. It also moved the whole project onto rustup's rustc 1.98.1.
 Everything from here is userspace.
 
+T14 made the two userspace ABI mirrors a diff rather than a promise.
+`cpp/include/koru_abi.h` and `cpp/include/koru_errno.h` are the C mirrors,
+shared with `test/`, and an `abi_dump` on each side emits a canonical record
+dump that `scripts/abi.sh` compares. That is the repo's first CMake build and
+its fastest gate: no VM, no device, no module.
+
 - `doc/Notes.md` — the global picture: design, ABI invariants, research
   findings, accepted gaps, and what T0–T12 established. It records *why* several
   obvious-looking approaches are wrong. Read it before writing anything.
@@ -28,10 +34,12 @@ Everything from here is userspace.
 - `kernel/` — the out-of-tree Rust module. `koru_abi.rs` is the canonical wire
   format; `koru.rs` holds the device, the ring state and the `ENTER` path, and
   `koru_ops.rs` holds opcode dispatch, the op implementations and `OpWork`.
-- `test/` — `koru_check`, the one integrated test for the module. See Commands.
+- `test/` — `koru_check`, the one integrated test for the module. It includes
+  the C ABI mirror from `cpp/include/` and keeps no copy. See Commands.
 - `rust/` — the Cargo workspace. `koru-sys` is the raw binding; `koru` (the
-  futures, executor and Braam surface) joins at T15. C++ gets its own directory
-  beside it.
+  futures, executor and Braam surface) joins at T15.
+- `cpp/` — the C ABI mirrors and `abi_dump`, built by the top-level
+  `CMakeLists.txt`. The binding itself arrives at T39.
 - `scripts/` — the guest-side check and the host-side runner that boots the VM,
   plus the dev kernel's config fragment. It has its own README.
 
@@ -102,7 +110,7 @@ survived**.
 
 ## Commands
 
-These work today (T0 through T13):
+These work today (T0 through T14):
 
 ```sh
 KDIR=../kernel-dev/linux-source-7.1
@@ -135,16 +143,22 @@ KORU_SEED=12345 scripts/run.sh    # replay a fuzz failure
 (cd rust && cargo test -p koru-sys --no-run)   # build before the runner
 scripts/run-rust.sh
 scripts/run-rust.sh cancel read                # only matching test names
+
+# The ABI conformance diff. No VM, no device, no module: the fastest gate
+# there is. cmake -B build once, then rebuild whenever a mirror changes.
+cmake -B build && cmake --build build
+scripts/abi.sh
+ctest --test-dir build          # the same comparison, as a registered test
 ```
 
 `test/koru_check` is the entire test suite for the module: one binary, one
 shared ring, one process, plus the two `rmmod` races that need a second one.
-`test/koru_abi.h` is a hand-written mirror of `kernel/koru_abi.rs`, so **a
-change there means a matching change in that one place**, and its
-`_Static_assert`s are what catch you forgetting. T14 replaces that file with the
-real `cpp/include/koru_abi.h`. Since T13 there is a **third** copy,
-`rust/koru-sys/src/abi.rs`, so a wire-format change is three edits until T14
-makes the agreement a diff. The C++ suite comes at T39.
+`kernel/koru_abi.rs` is canonical and is copied into two userspace mirrors,
+`rust/koru-sys/src/abi.rs` and `cpp/include/koru_abi.h`, which `test/` includes
+rather than copying again. **A wire-format change is all three files**, and
+only the kernel one is unchecked: `scripts/abi.sh` diffs the other two, and the
+header's own `static_assert`s catch a layout slip at compile time. The C++
+suite comes at T39.
 
 `rust/koru-sys/tests/kernel.rs` is the Rust suite, T4–T11 plus the T3 matrices,
 run by `scripts/rust.sh` in its own VM boot. It does **not** supersede
@@ -307,12 +321,10 @@ editing a submodule alone. Inherent `impl RingCtx` blocks live in `koru_ops.rs`
 too, which is why `RingCtx` and its fields are `pub(crate)` rather than private.
 
 The rest of `doc/Plan.md`'s Verification sequence does not work yet; the
-load-bearing ones will be:
+load-bearing one will be:
 
 ```sh
 cargo run --example read_file   # Rust demo
-ctest --test-dir build          # C++ tests, under ASan+UBSan
-diff <(./build/abi_dump) <(cargo run -q --bin abi_dump)   # must be empty
 ```
 
 Add them here as they start working, rather than inventing them ahead of time.
@@ -387,10 +399,19 @@ wrappers.
 
 ## Cross-language ABI
 
-`kernel/koru_abi.rs` is canonical; `cpp/include/koru_abi.h` mirrors it.
-They are kept identical by a conformance test (T14) that diffs an `abi_dump`
-emitted by each side. When you touch either file, run that diff — and confirm
-the test actually fails when you perturb a field, or it proves nothing.
+`kernel/koru_abi.rs` is canonical; `rust/koru-sys/src/abi.rs` and
+`cpp/include/koru_abi.h` mirror it, and `cpp/include/koru_errno.h` mirrors
+`rust/koru-sys/src/error.rs`. The two mirrors are kept in step by
+`scripts/abi.sh`, which diffs an `abi_dump` emitted by each side. Touch any of
+them and run it — then confirm it actually fails when you perturb a field, or
+it proves nothing.
+
+Adding a field or a constant means editing **both** emitters, and a record
+missing from both diffs clean. That is why each struct declares its field count
+and each emitter checks that the field sizes sum to `sizeof`; keep new structs
+padding-free so that guard keeps working. The diff cannot see the kernel at
+all — the caps assertions in `rust/koru-sys/tests/kernel.rs` are the only thing
+tying a mirror to the canonical file, and they run in the VM.
 
 The two userspace bindings share no code. That is intentional: the second
 binding exists to demonstrate the ABI is language-neutral, so resist factoring

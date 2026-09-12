@@ -31,8 +31,12 @@ fi
 
 # Ask cargo where the binary is rather than globbing target/debug/deps, where
 # stale hashes accumulate and a newest-match would survive a failed build.
+# The abi_dump bin is emitted by this same command, in an order that varies,
+# so select the test target by kind: picking the bin runs nothing and exits 0.
+# Not "test":true, which a bin target also carries.
 BIN=$(cd "$ROOT/rust" && cargo test -p koru-sys --test kernel --no-run \
 	--message-format=json 2>/dev/null \
+	| grep -F '"kind":["test"]' \
 	| tr ',' '\n' \
 	| sed -n 's/.*"executable":"\([^"]*\)".*/\1/p' \
 	| tail -1)

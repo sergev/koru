@@ -786,10 +786,11 @@ unmapped descriptor, and the credentials test maps after forking.
 ### `koru_abi.h` split out
 
 The ABI mirror moved out of `test/koru_test.h` into `test/koru_abi.h` on its
-own. T14 creates `cpp/include/koru_abi.h` with exactly that content, so it
-becomes an include swap rather than surgery inside a header that also carries
-harness declarations, and the "change it in one place" rule now points at a file
-containing only the mirror.
+own, so that T14 could replace it with `cpp/include/koru_abi.h` as an include
+swap rather than surgery inside a header that also carries harness
+declarations. That is what happened: there is no copy under `test/` any more,
+`test/koru_test.h` includes the real mirror with angle brackets, and
+`test/Makefile` carries `-I../cpp/include`.
 
 ### What was verified, and how
 
@@ -1036,6 +1037,88 @@ once per thousand rounds, matching what the C suite measures. That is what makes
 the cancel refcount rule testable in both directions, so the count is printed
 rather than gated.
 
+## The ABI conformance diff
+
+T14 turned the agreement between the two userspace mirrors into a `diff`. Each
+side has an `abi_dump` that prints one record per line — constants, ioctl
+numbers, opcodes, every struct with every field, evaluated handle-encoding
+vectors, the fifteen vocabulary names and the twenty-nine errnos — and
+`scripts/abi.sh` compares them. It needs no VM, no device and no module, which
+makes it the fastest gate in the project.
+
+Four decisions inside that are not obvious.
+
+**Every number is decimal, ioctl request numbers included.** A hex format that
+differs between the two emitters fails the diff while carrying no ABI content
+at all. The hex forms stay where they are read by people: the header's own
+`static_assert`s and the canary in `sys.rs`.
+
+**Each field record carries a spelled-out type name.** Offsets and sizes cannot
+see `Cqe::res` turning from `i64` into `u64`, because nothing about the layout
+changes. The type column is hand-written on both sides, which is the mirror
+duty made visible.
+
+**A record dropped from both emitters at once diffs clean**, and that is the
+one failure the comparison cannot see by itself. So each struct's record
+declares its field count, and each emitter asserts that its field sizes sum to
+`sizeof`. All four structs are padding-free, so a field forgotten on both sides
+aborts the emitter rather than passing quietly.
+
+**A bare `diff <(a) <(b)` is not a gate.** It discards both exit statuses, so a
+C++ binary that dies before printing and a cargo build that fails compare two
+empty streams and report success — the same hole `WANT_PASSED` closes in
+`rust.sh`. `scripts/abi.sh` checks both exit statuses, both lengths and a
+`WANT_RECORDS` minimum before it diffs anything, and doc/Plan.md's verification
+step names the script rather than the one-liner it used to.
+
+The errno table's prose `produced_by` column is deliberately **not** dumped. It
+is provenance documentation rather than wire format, and diffing it would make
+a wording improvement a two-language edit while proving nothing; a miscopied
+row still shows up as a wrong errno or a wrong vocabulary name. The C++ side
+also had to carry the whole table at T14 rather than at T39, because the diff
+cannot be empty otherwise. T39 consumes `cpp/include/koru_errno.h`; it does not
+write it.
+
+### The limit, stated plainly
+
+**The diff compares two userspace mirrors and cannot see the kernel.**
+`kernel/koru_abi.rs` is canonical and is in neither dump. The only thing tying
+either mirror to it is `setup_get_params_works_before_setup`, which now asserts
+that every cap `GET_PARAMS` reports equals its `KORU_MAX_*` constant exactly,
+where it previously asserted only that they were non-zero, and that
+`handle_count` 0 becomes `KORU_DEFAULT_HANDLES`. That runs in the VM, not on
+the host.
+
+### What was verified, and how
+
+Six perturbations, each reverted, each proving a different mechanism.
+
+- `KORU_MAX_SLOT_COUNT` 4096 to 4095 in the C header. Compiles clean and
+  `scripts/abi.sh` fails, which is the case no `static_assert` can reach: a
+  constant is not a layout.
+- A `pad` field inserted before `koru_sqe.handle`. Fails at **compile time**,
+  in both the C++ build and `make -C test`, ten static assertions at once. A
+  layout fault therefore surfaces earlier than a constant fault, and never
+  reaches the diff.
+- `KORU_DEFAULT_HANDLES` 64 to 32 in `abi.rs`. The gate fails, so the diff has
+  teeth in the Rust direction and not only the C one.
+- `ECANCELED`'s kind from `Cancelled` to `Io` in `error.rs`. The gate fails, so
+  the errno half is genuinely compared rather than merely printed.
+- `KORU_MAX_HANDLES` 4096 to 2048 in the **kernel** file, rebuilt and run in
+  the VM. The strengthened cap assertion fails and `scripts/abi.sh` still
+  passes. That negative result is the point: it is what the limit above looks
+  like from the outside.
+- An `abi_dump` whose `main` returns 0 without printing. The gate fails on the
+  record count, which the process-substitution one-liner would not have done.
+
+One thing broke on the way, and it is worth not rediscovering. Adding a
+`[[bin]]` to `koru-sys` made `cargo test --test kernel --message-format=json`
+emit **two** executables, and `run-rust.sh` took the last one, which is
+`abi_dump`. It ran no tests, exited 0, and only the `WANT_PASSED` floor caught
+it — exactly the failure that gate exists for. Selecting on `"test":true` is
+not the fix either, because a bin target carries that field too; the runner now
+selects on the target kind.
+
 ## C++20 userspace binding
 
 The kernel side is **unchanged** — same device, same ioctls, same wire format,
@@ -1200,8 +1283,12 @@ arrive with their tasks.
   matrices. *exists*
 - `rust/koru/src/lib.rs` — op slab, `OpState` owning `BufSlot`, `Future` impls,
   executor.
-- `cpp/include/koru_abi.h` — the C mirror of `koru_abi.rs`, kept
-  byte-identical by the T14 conformance test.
+- `cpp/include/koru_abi.h` — the C mirror of `koru_abi.rs`, kept in step by
+  the T14 conformance diff. *exists*
+- `cpp/include/koru_errno.h` — the C mirror of `error.rs`'s vocabulary and
+  errno table, as X-macros. *exists*
+- `cpp/tools/abi_dump.cpp` and `rust/koru-sys/src/bin/abi_dump.rs` — the two
+  emitters `scripts/abi.sh` diffs. *exists*
 - `cpp/include/koru.hpp` — `Ring`, `BufPool`, move-only `BufSlot`,
   `result<T>`.
 - `cpp/include/koru/task.hpp` — `task<T>` promise type, symmetric transfer,
@@ -1212,10 +1299,11 @@ arrive with their tasks.
 
 `test/koru_check` stays the kernel's own check and is not superseded by the
 Rust suite: it owns the fuzz, the two `rmmod` races and the heavy-phase leak
-window. `test/koru_abi.h` is a hand-written mirror of `kernel/koru_abi.rs`, so a
-change there now means a matching change in **three** places — that header,
-`rust/koru-sys/src/abi.rs`, and the kernel file itself. T14 replaces the header
-with the real `cpp/include/koru_abi.h` and makes the agreement a diff.
+window. A wire-format change is still three files — `kernel/koru_abi.rs` and
+the two userspace mirrors, `rust/koru-sys/src/abi.rs` and
+`cpp/include/koru_abi.h` — but only the first of those three is now unchecked.
+`test/` includes the C mirror rather than keeping a fourth copy, and
+`scripts/abi.sh` diffs the two mirrors against each other.
 
 ## Why the tasks are ordered this way
 

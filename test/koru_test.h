@@ -6,7 +6,9 @@
 
 #include <stdint.h>
 
-#include "koru_abi.h"
+/* Angle brackets on purpose: with quotes this directory is searched first, so
+ * a stale local copy would silently shadow the real mirror. */
+#include <koru_abi.h>
 
 #define MS 1000000ull
 

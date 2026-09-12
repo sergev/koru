@@ -132,6 +132,11 @@ table. Its integration suite re-expresses the module's own tests against that
 API, so the two independent views of the wire format have to agree.
 `scripts/run-rust.sh` runs it in a VM. The futures and the executor are next.
 
+The wire format now exists in a C mirror as well, `cpp/include/koru_abi.h`,
+which the C test suite includes rather than copying. Each side prints a
+canonical dump of the whole surface and `scripts/abi.sh` diffs the two, so the
+agreement is checked rather than promised. It needs no VM and no device.
+
 Next is userspace, and the Braam decision reopens the kernel for one phase:
 there is no `WRITE` opcode yet, and `OPEN` refuses anything but regular files
 and directories on purpose, because a blocking read in a worker thread cannot be

@@ -3,7 +3,9 @@
 `test/koru_check` is the whole test suite for the kernel module: one binary, one
 shared ring, one process. `scripts/check.sh` runs it inside a virtme-ng guest
 along with the handful of checks that need a second process, and prints one
-verdict. `scripts/run.sh` boots that guest from the host.
+verdict. `scripts/run.sh` boots that guest from the host. Two more gates sit
+beside it: the Rust suite in its own guest, and the ABI diff, which needs no
+guest at all.
 
 Never load the module on the host. A module bug panics the machine, and this is
 somebody's desktop.
@@ -130,6 +132,32 @@ It pays a flat six-second kmemleak window instead of the stamp arithmetic
 below: libtest orders tests by name, so the suite cannot promise the heavy-first
 ordering that budget depends on. The kernel is unchanged, so leak coverage is
 still `koru_check`'s job.
+
+It picks the test binary out of `cargo`'s JSON by target **kind**. Since T14
+the package also has an `abi_dump` bin, which the same command emits, in an
+order that varies; taking the wrong one runs no tests and exits 0.
+
+## The ABI conformance diff
+
+`scripts/abi.sh` compares the two userspace ABI mirrors, C and Rust, by
+diffing a canonical record dump emitted from each. It needs no VM, no
+`/dev/koru` and no module, so it is the fastest gate here — run it whenever a
+mirror changes.
+
+```sh
+cmake -B build && cmake --build build   # once, and after a mirror changes
+scripts/abi.sh
+scripts/abi.sh --cpp build-asan/abi_dump
+ctest --test-dir build                  # the same script, as a ctest
+```
+
+Like the runners above it does not build; a missing `build/abi_dump` prints the
+`cmake` line and fails. A bare `diff` of the two would pass when both sides
+print nothing, so the script gates on both exit statuses, both lengths and a
+`WANT_RECORDS` floor before it compares anything. Raise that floor when the
+surface grows, for the reason `WANT_PASSED` exists.
+
+The verdict line is `KORU-ABI-PASS` or `KORU-ABI-FAIL`.
 
 ## Adding a check
 

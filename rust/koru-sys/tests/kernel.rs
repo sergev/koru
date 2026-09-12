@@ -1753,16 +1753,35 @@ fn setup_get_params_works_before_setup() {
     assert_eq!(p.abi_version, KORU_ABI_VERSION);
     assert_eq!(p.configured, 0);
     assert_eq!(p.handle_count, 0);
-    for (v, what) in [
-        (p.max_sq_entries as u64, "max_sq_entries"),
-        (p.max_cq_entries as u64, "max_cq_entries"),
-        (p.max_slot_size as u64, "max_slot_size"),
-        (p.max_slot_count as u64, "max_slot_count"),
-        (p.max_arena_bytes, "max_arena_bytes"),
-        (p.max_handles as u64, "max_handles"),
-        (p.max_delay_ns, "max_delay_ns"),
+    // Exact, not merely non-zero. scripts/abi.sh diffs the two userspace
+    // mirrors against each other and cannot see the kernel; this is the only
+    // assertion tying either of them to the canonical kernel/koru_abi.rs.
+    for (got, want, what) in [
+        (
+            p.max_sq_entries as u64,
+            KORU_MAX_SQ_ENTRIES as u64,
+            "max_sq_entries",
+        ),
+        (
+            p.max_cq_entries as u64,
+            KORU_MAX_CQ_ENTRIES as u64,
+            "max_cq_entries",
+        ),
+        (
+            p.max_slot_size as u64,
+            KORU_MAX_SLOT_SIZE as u64,
+            "max_slot_size",
+        ),
+        (
+            p.max_slot_count as u64,
+            KORU_MAX_SLOT_COUNT as u64,
+            "max_slot_count",
+        ),
+        (p.max_arena_bytes, KORU_MAX_ARENA_BYTES, "max_arena_bytes"),
+        (p.max_handles as u64, KORU_MAX_HANDLES as u64, "max_handles"),
+        (p.max_delay_ns, KORU_MAX_DELAY_NS, "max_delay_ns"),
     ] {
-        assert!(v > 0, "{what} is zero");
+        assert_eq!(got, want, "{what} disagrees with the ABI mirror");
     }
 }
 
@@ -1927,9 +1946,9 @@ fn setup_rejection_matrix() {
         "arena_size is slot_size * slot_count"
     );
     assert_eq!(p.configured, 1);
-    assert!(
-        p.handle_count > 0 && p.handle_count <= p.max_handles,
-        "handle_count 0 became the default"
+    assert_eq!(
+        p.handle_count, KORU_DEFAULT_HANDLES,
+        "handle_count 0 became the default the mirror names"
     );
 
     let q = r.get_params().expect("GET_PARAMS after SETUP");

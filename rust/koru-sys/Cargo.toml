@@ -12,3 +12,8 @@ description = "koru ABI structs, ioctl wrappers and the errno table"
 [[test]]
 name = "kernel"
 path = "tests/kernel.rs"
+
+# Declared rather than autodiscovered, like the test above.
+[[bin]]
+name = "abi_dump"
+path = "src/bin/abi_dump.rs"
