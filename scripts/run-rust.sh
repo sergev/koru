@@ -23,7 +23,13 @@ TIMEOUT=${TIMEOUT:-600}
 # package:test-target:minimum-passed, one per suite. The floor is per suite on
 # purpose: a single total would let one crate's growth mask a filter typo that
 # ran none of another's. Raise a floor when a test is added.
-SUITES=${SUITES:-"koru-sys:kernel:58 koru:runtime:16"}
+SUITES=${SUITES:-"koru-sys:kernel:58 koru:runtime:17"}
+
+# Race-loop knobs, forwarded into the guest. KORU_ITERS raises a loop's count
+# and KORU_SEED replays one; each test prints the values it used. The full
+# 100k T16 run needs a TIMEOUT well past the default.
+KORU_ITERS=${KORU_ITERS:-}
+KORU_SEED=${KORU_SEED:-}
 
 if [ ! -d "$KDIR" ]; then
 	echo "no kernel tree at $KDIR; set KDIR" >&2
@@ -62,7 +68,7 @@ done
 cd "$ROOT" || exit 1
 
 out=$(timeout "$TIMEOUT" vng --run "$KDIR" --user root --memory "$MEMORY" --cpus "$CPUS" \
-	--exec "SUITES='$spec' sh scripts/rust.sh $*" 2>&1)
+	--exec "SUITES='$spec' KORU_ITERS='$KORU_ITERS' KORU_SEED='$KORU_SEED' sh scripts/rust.sh $*" 2>&1)
 
 verdict=$(echo "$out" | grep -oE 'KORU-RUST-(PASS|FAIL)' | tail -1)
 case "$verdict" in

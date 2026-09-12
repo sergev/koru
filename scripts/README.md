@@ -123,7 +123,16 @@ device matrix, and `koru`'s `runtime`, which is the futures and the executor.
 (cd ../rust && cargo test --workspace --no-run)   # build first, as above
 scripts/run-rust.sh
 scripts/run-rust.sh cancel read                   # only matching test names
+KORU_SEED=12345 scripts/run-rust.sh               # replay a race loop
+KORU_ITERS=100000 TIMEOUT=2400 scripts/run-rust.sh drop_safety
 ```
+
+`KORU_ITERS` and `KORU_SEED` are forwarded into the guest, and every test that
+uses them prints the pair it ran with. A race loop's default count is low so
+the everyday gate stays fast; the last line above is T16's full hundred
+thousand rounds, which take about fourteen seconds of guest time and need a
+`TIMEOUT` past the 600-second default. Note that any name filter trips the
+per-suite floor below, so a filtered run always reports `TOO FEW TESTS RAN`.
 
 Two gates exist that `check.sh` does not need, because `cargo test` can succeed
 without running anything. A filter matching nothing exits 0, so each suite

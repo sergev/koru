@@ -9,9 +9,9 @@
 mod common;
 
 use common::*;
-use koru::{Errno, Handle, Kind};
+use koru::{Either, Errno, Handle, Kind, race};
 use koru_sys::abi::KORU_O_RDONLY;
-use koru_sys::error::{EBADF, EINVAL};
+use koru_sys::error::{EBADF, EBUSY, EINVAL};
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -205,6 +205,130 @@ fn dropping_a_live_future_cancels_it_and_holds_its_slot() {
     rt.drain();
     disarm_alarm();
     assert_eq!(rt.stats().inflight, 0);
+    assert_eq!(rt.pool().free_count(), SLOTS as usize);
+}
+
+/// The same two claims as the staged tests above, but under a real
+/// interleaving: a read and a timer race, and whichever loses is dropped
+/// wherever the kernel happened to leave it.
+///
+/// The failure this exists to catch is a slot back in the free pool while the
+/// kernel still holds its `slot_busy` claim. Nothing says so at the time: it
+/// surfaces as `-EBUSY` on the next op that names the index, which is why the
+/// probe below asserts that errno by name rather than just `is_ok`.
+///
+/// `KORU_ITERS` raises the count and `KORU_SEED` replays a jitter.
+#[test]
+fn drop_safety_under_a_race_holds_a_slot_until_its_completion() {
+    let n = iters(4000);
+    let s = seed();
+    arm_alarm(60 + n / 100);
+    ensure_big_file();
+    let rt = runtime();
+    println!("    KORU_ITERS={n} KORU_SEED={s}");
+
+    let (read_won, cancelled, uncancelled) = rt.block_on(async {
+        let slot = rt.acquire().expect("a slot");
+        let (h, slot) = rt.open(slot, BIGFILE, KORU_O_RDONLY).await;
+        let h = h.expect("open");
+        drop(slot);
+
+        // Reported, not asserted: it is what sets the sweep below.
+        const CAL: u32 = 16;
+        let t0 = std::time::Instant::now();
+        for _ in 0..CAL {
+            let slot = rt.acquire().expect("a slot");
+            let (res, _slot) = rt.read(h, slot, 0, SLOT).await;
+            assert_eq!(res.expect("calibration read"), BIGSIZE);
+        }
+        println!(
+            "    a whole-slot read takes about {} ns",
+            t0.elapsed().as_nanos() as u64 / u64::from(CAL)
+        );
+
+        let baseline = rt.pool().free_count();
+        let mut rng = Rng::new(s);
+        let (mut read_won, mut cancelled, mut uncancelled) = (0u32, 0u32, 0u32);
+
+        for _ in 0..n {
+            let slot = rt.acquire().expect("a slot");
+            let index = slot.index();
+            let before = rt.stats().cancels_submitted;
+            // Delays round up to whole milliseconds, so only 0 races a read.
+            let ns = if rng.below(4) == 0 { MS } else { 0 };
+
+            // Timer first, so its work item queues ahead of the read's.
+            match race(rt.delay(ns), rt.read(h, slot, 0, SLOT)).await {
+                // The read lost and was dropped; its slot is the one at risk.
+                Either::A(res) => {
+                    res.expect("delay");
+                    let cancels = rt.stats().cancels_submitted - before;
+                    if cancels == 1 {
+                        // Live: the entry keeps the slot until the CQE lands.
+                        assert_eq!(
+                            rt.pool().free_count(),
+                            baseline - 1,
+                            "the slot came back before the read's completion"
+                        );
+                        let mut spins = 0;
+                        while rt.pool().free_count() < baseline {
+                            rt.nop().await.expect("nop");
+                            spins += 1;
+                            assert!(spins < 1000, "the cancelled read's slot never came back");
+                        }
+                        cancelled += 1;
+                    } else {
+                        // Already complete: a CANCEL would answer -ENOENT.
+                        assert_eq!(cancels, 0, "one drop, more than one CANCEL");
+                        assert_eq!(rt.pool().free_count(), baseline);
+                        uncancelled += 1;
+                    }
+
+                    // The assertion the task is named for.
+                    let again = rt.acquire().expect("a slot");
+                    assert_eq!(again.index(), index, "the free list is LIFO");
+                    let (res, again) = rt.checksum(again, 0, 4096).await;
+                    if let Err(e) = res {
+                        assert_ne!(
+                            e.raw(),
+                            EBUSY,
+                            "slot {index} was freed while the kernel still held its claim"
+                        );
+                        panic!("an op on the reused slot failed: {e:?}");
+                    }
+                    drop(again);
+                }
+                // The read won; the dropped timer holds no slot to probe.
+                Either::B((res, slot)) => {
+                    res.expect("read");
+                    drop(slot);
+                    read_won += 1;
+                }
+            }
+            // An entry never discarded would grow this without bound.
+            assert!(rt.stats().slab_live < 64, "slab entries are accumulating");
+        }
+        (read_won, cancelled, uncancelled)
+    });
+
+    rt.drain();
+    disarm_alarm();
+    println!("    read won {read_won}, cancelled {cancelled}, already done {uncancelled}");
+
+    // One arm reached proves nothing about the other. The in-flight arm runs
+    // about 2.8%, so its floor sits well under that, not beside it.
+    assert!(read_won >= n / 2, "the read won only {read_won} of {n}");
+    assert!(
+        cancelled >= n / 100,
+        "only {cancelled} of {n} drops caught the read in flight"
+    );
+
+    // C1 end to end, and what stands in for ASan here: an op whose completion
+    // never arrived breaks the equality.
+    let st = rt.stats();
+    assert_eq!(st.inflight, 0);
+    assert_eq!(st.slab_live, 0, "a slab entry outlived its completion");
+    assert_eq!(st.cqes_reaped, st.sqes_submitted, "C1: one CQE per SQE");
     assert_eq!(rt.pool().free_count(), SLOTS as usize);
 }
 

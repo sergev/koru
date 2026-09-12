@@ -63,26 +63,6 @@ surface is built first and the C++ surface transcribes it, because the design
 will churn and churning it twice is the same mistake this plan avoids for the
 ABI.
 
-## Phase 4 — the Rust binding
-
-### T16 [R] — drop safety
-
-T15 built the mechanism and asserted it once each way; this task is its
-falsification under a race. It also needs a `race` combinator, which T15 did
-not build: `join` was not required by its own done test.
-
-Settle before starting what "under ASan" means here. Rust's is
-`-Zsanitizer=address` on nightly and this project is pinned to stable 1.98.1,
-so either the suite gains a nightly toolchain or the equivalent is the crate's
-`forbid(unsafe_code)` plus the kernel's KASAN plus the pool and slab
-accounting `Stats` already exposes. Decide it rather than discover it at the
-hundred-thousandth iteration.
-
-Done test: race a `read` future against a timer and drop it mid-flight. Assert
-that a `CANCEL` is submitted, that the slot is *not* back in the free pool until
-the target's CQE lands, and that a later op on that index does not get `-EBUSY`.
-100k iterations under ASan.
-
 ## Phase 5 — kernel: reaching stdout
 
 The kernel reopens for a reason. Braam's hello world is

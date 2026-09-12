@@ -25,6 +25,11 @@ pub const MS: u64 = 1_000_000;
 pub const DATAFILE: &str = "/tmp/koru-rt-data";
 pub const DATASIZE: usize = 8192;
 
+/// A whole slot, so a deferred READ runs long enough for a race window to be
+/// wide. The same reason the koru-sys suite uses 64 KB slots.
+pub const BIGFILE: &str = "/tmp/koru-rt-big";
+pub const BIGSIZE: usize = SLOT as usize;
+
 pub fn config() -> SetupConfig {
     SetupConfig::new(SQ, CQ, SLOT, SLOTS, HANDLES)
 }
@@ -45,6 +50,68 @@ pub fn ensure_data_file() {
         let buf: Vec<u8> = (0..DATASIZE).map(pattern_byte).collect();
         std::fs::write(DATAFILE, &buf).expect("data file");
     });
+}
+
+/// Create the big data file once per process.
+pub fn ensure_big_file() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let buf: Vec<u8> = (0..BIGSIZE).map(pattern_byte).collect();
+        std::fs::write(BIGFILE, &buf).expect("big data file");
+    });
+}
+
+/// The runner forwards these unconditionally, so empty means unset.
+fn env_num(name: &str) -> Option<u64> {
+    let v = std::env::var(name).ok()?;
+    let v = v.trim();
+    if v.is_empty() {
+        return None;
+    }
+    Some(
+        v.parse()
+            .unwrap_or_else(|_| panic!("{name} is not a number")),
+    )
+}
+
+/// Iteration count for a race loop. Low by default so the everyday gate stays
+/// fast; `KORU_ITERS=100000` is the full count T16's done test names.
+pub fn iters(default: u32) -> u32 {
+    env_num("KORU_ITERS").map_or(default, |n| n as u32)
+}
+
+/// Seed for a race loop's jitter, echoed by the caller so a failure replays.
+pub fn seed() -> u64 {
+    env_num("KORU_SEED").unwrap_or_else(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| u64::from(d.subsec_nanos()) | 1)
+            .unwrap_or(1)
+    })
+}
+
+/// xorshift64*. Deterministic given the seed, which is the whole point.
+pub struct Rng(u64);
+
+impl Rng {
+    pub fn new(seed: u64) -> Rng {
+        Rng(if seed == 0 { 1 } else { seed })
+    }
+
+    pub fn next(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.0 = x;
+        x.wrapping_mul(0x2545_f491_4f6c_dd1d)
+    }
+
+    /// Uniform in `0..n`, which is close enough for a jitter.
+    pub fn below(&mut self, n: u64) -> u64 {
+        if n == 0 { 0 } else { self.next() % n }
+    }
 }
 
 /// Must match the kernel's exactly, mask included.

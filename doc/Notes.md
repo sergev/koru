@@ -1293,6 +1293,122 @@ The demo needs no perturbation to have teeth: the timers are armed 30, 10, 20
 and asserted to resolve 10, 20, 30, so an executor that ran them serially would
 record submission order and fail.
 
+## Drop safety under a race
+
+T16 added `race`, the crate's first combinator, and one integration test that
+drops a `READ` future mid-flight tens of thousands of times. T15's drop tests
+stage the state they want with `PollOnce` and a forcing `nop`; this one lets
+the kernel decide, which is what turns an asserted mechanism into a falsified
+one. Nothing in the state machine changed: every perturbation below broke
+something that was already there.
+
+### What "under ASan" means here, decided rather than discovered
+
+Rust's AddressSanitizer is `-Zsanitizer=address` on nightly and the project is
+pinned to stable 1.98.1. **No nightly toolchain was added.** The `koru` crate is
+`#![forbid(unsafe_code)]`, so there is no Rust-side undefined behaviour for ASan
+to find; every unsafe block in the userspace stack is in `koru-sys`, which T13
+covered. The substitute is the one the plan named: the kernel's KASAN, the
+dmesg gate `scripts/rust.sh` already applies to the whole run, and the pool,
+slab and inflight accounting `Stats` exposes. The accounting half is asserted
+as `cqes_reaped == sqes_submitted` with `inflight` and `slab_live` at zero,
+which is C1 end to end — an op whose completion never arrived breaks it.
+
+This is a statement about Rust only. T43 is the C++ mirror of this task and
+keeps its real ASan requirement, because a dangling coroutine frame is a
+genuine use-after-free there.
+
+### `race` drops its loser, and that is the whole mechanism
+
+`race` is an `async fn` holding both futures in `pin!` locals and polling them
+through `poll_fn`. No `Unpin` bound, no allocation, no unsafe: it takes async
+blocks as readily as the op futures. When it returns, the frame drops and the
+loser with it, which runs `abandon_on_drop!` and hence `Inner::abandon`.
+
+Two properties that are not decoration. Both sides are polled before it
+suspends, or one starves. And **which side is polled first alternates**: with a
+fixed order, a race between two futures that are both already `Ready` always
+resolves the same way, and the test's own numbers show what that costs —
+pinning the order sent the "read was already complete" bucket from 0 to 2,905
+of 4,000 and the read-won bucket from 97% to 25%.
+
+The drop lands inside the caller's poll with no slab borrow held, because
+`poll_task` takes the future out of its slot first. `abandon` then takes `slab`
+and `pending` in that order, which is the existing lock order. The combinator
+introduced no new one.
+
+### A timer cannot fire inside a read, which shapes the whole test
+
+`delay_jiffies` rounds a delay **up to whole milliseconds** and a whole-slot
+64 KB read takes about 120 µs on the dev VM. So every sub-millisecond delay
+waits a full jiffy and the read always wins: a nanosecond-granularity sweep
+straddles nothing. The first version of the test swept 0 to twice the measured
+read latency and recorded 400 read wins out of 400.
+
+Only `ns == 0` races, because `enqueue_delayed` with zero jiffies queues the
+work immediately. Two further findings followed:
+
+- **Submission order decides which kworker item runs first.** With
+  `race(read, delay)` the read's SQE is first in the batch, so its work item is
+  queued first and the timer runs behind it; both completions then land in one
+  `ENTER` and the read is found `Ready`, never in flight. Putting the timer
+  first — `race(delay, read)` — sends that bucket to zero and makes the
+  in-flight drop reachable at all.
+- **The in-flight arm is rare by an order of magnitude**, about 2.8%: 2,650 of
+  100,000. That is not a defect in the test, it is the shape of the race, and
+  it is the same lopsidedness the kernel suite's cancel races already assert
+  floors against. Background load on the workqueue was tried and rejected: it
+  moved a 120 µs read to 150 µs against a 1 ms floor, which is not a gap load
+  can close.
+
+The floors are therefore set well under the measured rates, not near them, and
+the sweep spends three rounds in four at `ns == 0`.
+
+### What the race test asserts, per round
+
+The slot under test is reacquired after every round, and the free list is LIFO,
+so it is the same index. The three buckets are told apart by the
+`cancels_submitted` delta alone.
+
+When the read was live, its slot must **not** be in the free pool, the entry
+holds it until the target's own CQE lands, and the op that follows on that
+index must not get `-EBUSY`. **That errno is asserted by name**, because it is
+the only symptom a prematurely freed slot ever produces, and a bare `is_ok`
+would report it as something else entirely.
+
+### Shown to fail
+
+Five perturbations, each reverted.
+
+- Return the slot to the pool in `abandon`'s `Cancel` arm. Fails on the free
+  count first, which is T15's assertion; with that one relaxed it reaches the
+  probe and fails with `EBUSY(16)` by name. Both halves were run, because the
+  `-EBUSY` claim is the one T16 adds and a perturbation caught earlier proves
+  nothing about it.
+- Make the cancel name the probe as its own target rather than the read. Fails
+  straight through to the `-EBUSY` probe with no assertion relaxed, which is
+  the cleanest demonstration the probe has teeth.
+- Make the op future's `Drop` abandon nothing. No `CANCEL` is submitted, so the
+  round is classified as already-complete and fails on the free count there.
+- Stop alternating which side `race` polls first. Caught twice: the host unit
+  test for alternation, and the integration test's read-won floor.
+- **Drop the `CANCEL` push entirely, and T16's test still passes.** A read
+  completes on its own in about 120 µs, so the slot comes back regardless; the
+  cancel is not load-bearing when the target self-completes. What catches it is
+  T15's `a_cancelled_op_is_dequeued_rather_than_waited_out`, whose target is an
+  hour-long delay, and it catches it as a hang. Worth recording rather than
+  quietly counting as a sixth success: the two tests cover different halves of
+  the same rule, and neither subsumes the other.
+
+### Cost
+
+The full 100,000 rounds take 14 seconds of the guest's time and pass. The
+everyday gate runs 4,000, which is under a second and still yields about a
+hundred in-flight drops. `KORU_ITERS` raises the count, `KORU_SEED` replays a
+jitter, both forwarded into the guest by `scripts/run-rust.sh`, and each test
+prints the pair it used. The full run needs a `TIMEOUT` past the runner's
+600-second default.
+
 ## C++20 userspace binding
 
 The kernel side is **unchanged** — same device, same ioctls, same wire format,
@@ -1465,6 +1581,8 @@ arrive with their tasks.
   `block_on`. *exists*
 - `rust/koru/src/future.rs` — one future per opcode and their shared drop.
   *exists*
+- `rust/koru/src/combinator.rs` — `race` and `Either`, and the only place a
+  koru future is dropped for you. *exists*
 - `rust/koru/tests/runtime.rs` — the device suite for all of it. *exists*
 - `cpp/include/koru_abi.h` — the C mirror of `koru_abi.rs`, kept in step by
   the T14 conformance diff. *exists*

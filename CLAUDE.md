@@ -24,6 +24,13 @@ single-threaded executor whose park is `ENTER`. An async block now reads a file
 through the ring while timers complete out of order. The crate is
 `#![forbid(unsafe_code)]` and depends on nothing but `koru-sys`.
 
+T16 added `race`, the crate's first combinator, and falsified the drop path
+under it: a `READ` dropped mid-flight keeps its slot until the target's CQE
+lands, and the op that reuses that index must not get `-EBUSY`. "Under ASan"
+was settled as no nightly toolchain — `forbid(unsafe_code)` plus the kernel's
+KASAN plus the `Stats` accounting. doc/Notes.md has the reasoning and the five
+perturbations, one of which this test does **not** catch.
+
 T14 made the two userspace ABI mirrors a diff rather than a promise.
 `cpp/include/koru_abi.h` and `cpp/include/koru_errno.h` are the C mirrors,
 shared with `test/`, and an `abi_dump` on each side emits a canonical record
@@ -149,6 +156,8 @@ KORU_SEED=12345 scripts/run.sh    # replay a fuzz failure
 (cd rust && cargo test --workspace --no-run)   # build before the runner
 scripts/run-rust.sh
 scripts/run-rust.sh cancel read                # only matching test names
+KORU_SEED=12345 scripts/run-rust.sh            # replay a race loop
+KORU_ITERS=100000 TIMEOUT=2400 scripts/run-rust.sh drop_safety
 
 # The ABI conformance diff. No VM, no device, no module: the fastest gate
 # there is. cmake -B build once, then rebuild whenever a mirror changes.

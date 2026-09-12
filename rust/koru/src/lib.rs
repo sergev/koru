@@ -8,12 +8,14 @@
 
 #![forbid(unsafe_code)]
 
+mod combinator;
 mod exec;
 mod future;
 mod op;
 mod reactor;
 mod slab;
 
+pub use combinator::{Either, race};
 pub use exec::Runtime;
 pub use future::{BufResult, Checksum, Close, Delay, Handle, Nop, Open, Read};
 pub use reactor::Stats;
