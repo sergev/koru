@@ -18,6 +18,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
+#include <time.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -1092,6 +1093,381 @@ void sec_stat(void)
 
     /* 7. The ids are the submitter's, not the kworker's. */
     stat_namespace();
+}
+
+/* T24: TRUNCATE, UTIMES and READLINK, the kern_path plumbing. */
+
+#define TRFILE   "/tmp/koru-check-trunc"
+#define TRLINK   "/tmp/koru-check-trunclink"
+#define PLINK    "/tmp/koru-check-plink"
+#define PLINK2   "/tmp/koru-check-plink2"
+#define LONGLINK "/run/koru-check-longlink"
+/* Exactly eight characters, so a path op can name it from a slot offset that
+ * leaves no room for the argument after it. */
+#define SHORTPATH "/run/abc"
+#define CREDSDIR  "/tmp/koru-check-credsdir"
+#define CREDSLINK CREDSDIR "/link"
+/* Longer than tmpfs's SHORT_SYMLINK_LEN, so the target is page-backed and
+ * vfs_get_link arms a delayed call. A short one arms none and leaks nothing. */
+#define LONGTARGET                                                                                 \
+    "/tmp/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/"                      \
+    "cccccccccccccccccccccccccccccccc/dddddddddddddddddddddddddddddddd/target"
+
+static int64_t r_truncate(struct koru_ring *r, uint32_t slot, const char *path, uint64_t size)
+{
+    return r_path(r, KORU_OP_TRUNCATE, slot, path, &size, sizeof(size));
+}
+
+static int64_t r_utimes(struct koru_ring *r, uint32_t slot, const char *path,
+                        const struct koru_times *t)
+{
+    return r_path(r, KORU_OP_UTIMES, slot, path, t, sizeof(*t));
+}
+
+static int64_t r_readlink(struct koru_ring *r, uint32_t slot, const char *path)
+{
+    return r_path(r, KORU_OP_READLINK, slot, path, NULL, 0);
+}
+
+/* st_size of `path`, or -1. */
+static int64_t path_size(const char *path)
+{
+    struct stat sb;
+
+    return stat(path, &sb) == 0 ? (int64_t)sb.st_size : -1;
+}
+
+static int make_file(const char *path, size_t n)
+{
+    uint8_t buf[4096];
+    size_t done = 0;
+    int fd      = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+
+    if (fd < 0)
+        return -1;
+    memset(buf, 0x5a, sizeof(buf));
+    while (done < n) {
+        size_t want = n - done < sizeof(buf) ? n - done : sizeof(buf);
+
+        if (write(fd, buf, want) != (ssize_t)want) {
+            close(fd);
+            return -1;
+        }
+        done += want;
+    }
+    return close(fd);
+}
+
+static void path_truncate(void)
+{
+    struct koru_sqe s;
+    uint64_t size;
+
+    if (make_file(TRFILE, 8192) != 0) {
+        check(0, "create the TRUNCATE target");
+        return;
+    }
+
+    check_res(r_truncate(&R, 1, TRFILE, 100), 0, "TRUNCATE shrinks a file");
+    check(path_size(TRFILE) == 100, "  and stat(2) agrees");
+    check_res(r_truncate(&R, 1, TRFILE, 1 << 20), 0, "  it extends one too");
+    check(path_size(TRFILE) == (1 << 20), "  and stat(2) agrees again");
+    check_res(r_truncate(&R, 1, TRFILE, 0), 0, "  and truncates to nothing");
+    check(path_size(TRFILE) == 0, "  leaving an empty file");
+
+    /* A final symlink is followed, as truncate(2) follows it. */
+    unlink(TRLINK);
+    if (symlink(TRFILE, TRLINK) == 0) {
+        check_res(r_truncate(&R, 1, TRLINK, 4096), 0, "TRUNCATE follows a final symlink");
+        check(path_size(TRFILE) == 4096, "  and the target is what changed");
+        unlink(TRLINK);
+    } else {
+        printf("%-58s SKIP (cannot symlink)\n", "TRUNCATE follows a final symlink");
+    }
+
+    /* Rejections. vfs_truncate owns the first two. */
+    check_res(r_truncate(&R, 1, "/etc", 0), -EISDIR, "TRUNCATE of a directory is EISDIR");
+    check_res(r_truncate(&R, 1, "/dev/null", 0), -EINVAL, "  of a device node is EINVAL");
+    check_res(r_truncate(&R, 1, "/no/such/path", 0), -ENOENT, "  of a missing path is ENOENT");
+    check_res(r_truncate(&R, 1, TRFILE, (uint64_t)1 << 63), -EINVAL,
+              "  a negative new length is EINVAL");
+
+    size = 0;
+    memcpy(R.arena + R.slot_size + arg_offset(0, 8), &size, sizeof(size));
+    sqe_path(&s, KORU_OP_TRUNCATE, 1, 0, 0, 0x700);
+    check_res(run_one(R.fd, &s), -EINVAL, "  a zero-length path is EINVAL");
+    put_path(R.arena, R.slot_size, 1, TRFILE);
+    sqe_path(&s, KORU_OP_TRUNCATE, 1, 0, (uint32_t)strlen(TRFILE), 0x701);
+    s.handle = 1;
+    check_res(run_one(R.fd, &s), -EINVAL, "  a non-zero handle is EINVAL");
+    sqe_path(&s, KORU_OP_TRUNCATE, R.slot_count, 0, 8, 0x702);
+    check_res(run_one(R.fd, &s), -EINVAL, "  a slot past the arena is EINVAL");
+
+    /* The argument has to fit after the path, not merely the path itself. The
+     * path here is real and in range, so only the argument bound can refuse. */
+    if (make_file(SHORTPATH, 0) == 0) {
+        memcpy(R.arena + R.slot_size + R.slot_size - 12, SHORTPATH, 8);
+        sqe_path(&s, KORU_OP_TRUNCATE, 1, R.slot_size - 12, 8, 0x703);
+        check_res(run_one(R.fd, &s), -EINVAL, "  an argument past the slot end is EINVAL");
+        unlink(SHORTPATH);
+    } else {
+        check(0, "  an argument past the slot end is EINVAL");
+    }
+
+    unlink(TRFILE);
+}
+
+static void path_utimes(void)
+{
+    struct koru_times t;
+    struct stat sb;
+    time_t before;
+
+    if (make_file(TRFILE, 64) != 0) {
+        check(0, "create the UTIMES target");
+        return;
+    }
+
+    memset(&t, 0, sizeof(t));
+    t.atime_sec  = 1000000000;
+    t.atime_nsec = 123456789;
+    t.mtime_sec  = 1100000000;
+    t.mtime_nsec = 987654321;
+    check_res(r_utimes(&R, 1, TRFILE, &t), 0, "UTIMES sets both timestamps");
+    if (stat(TRFILE, &sb) == 0) {
+        check(sb.st_atim.tv_sec == t.atime_sec && sb.st_atim.tv_nsec == t.atime_nsec,
+              "  stat(2) reports the exact atime");
+        check(sb.st_mtim.tv_sec == t.mtime_sec && sb.st_mtim.tv_nsec == t.mtime_nsec,
+              "  and the exact mtime");
+    } else {
+        check(0, "  stat(2) reports the exact atime");
+    }
+
+    /* OMIT leaves one alone; the kernel's own sentinel, checked by vfs_utimes. */
+    t.atime_nsec = KORU_UTIME_OMIT;
+    t.mtime_sec  = 1200000000;
+    t.mtime_nsec = 1;
+    check_res(r_utimes(&R, 1, TRFILE, &t), 0, "UTIME_OMIT is accepted");
+    if (stat(TRFILE, &sb) == 0) {
+        check(sb.st_atim.tv_sec == 1000000000 && sb.st_atim.tv_nsec == 123456789,
+              "  and the atime is untouched");
+        check(sb.st_mtim.tv_sec == 1200000000 && sb.st_mtim.tv_nsec == 1,
+              "  while the mtime moved");
+    } else {
+        check(0, "  and the atime is untouched");
+    }
+
+    before       = time(NULL);
+    t.atime_nsec = KORU_UTIME_NOW;
+    t.mtime_nsec = KORU_UTIME_OMIT;
+    check_res(r_utimes(&R, 1, TRFILE, &t), 0, "UTIME_NOW is accepted");
+    if (stat(TRFILE, &sb) == 0) {
+        check(sb.st_atim.tv_sec >= before && sb.st_atim.tv_sec <= before + 5,
+              "  and the atime is now");
+        check(sb.st_mtim.tv_sec == 1200000000, "  while the omitted mtime stayed");
+    } else {
+        check(0, "  and the atime is now");
+    }
+
+    /* vfs_utimes validates the nanoseconds itself. */
+    t.atime_nsec = 1000000000;
+    t.mtime_nsec = 0;
+    check_res(r_utimes(&R, 1, TRFILE, &t), -EINVAL, "a nanosecond field past 999999999 is EINVAL");
+    t.atime_nsec = -1;
+    check_res(r_utimes(&R, 1, TRFILE, &t), -EINVAL, "  and a negative one too");
+
+    t.atime_nsec = 0;
+    check_res(r_utimes(&R, 1, "/no/such/path", &t), -ENOENT, "UTIMES of a missing path is ENOENT");
+
+    unlink(TRFILE);
+}
+
+/* The slot's bytes at `off` must be `want` followed by a NUL. */
+static int link_matches(uint32_t slot, uint64_t off, const char *want)
+{
+    const char *p = (const char *)R.arena + (size_t)slot * R.slot_size + off;
+    size_t n      = strlen(want);
+
+    return memcmp(p, want, n) == 0 && p[n] == 0;
+}
+
+static void path_readlink(void)
+{
+    struct koru_sqe s;
+    char want[512];
+    ssize_t n;
+    uint32_t plen;
+
+    unlink(PLINK);
+    unlink(PLINK2);
+    if (symlink(PLINK2, PLINK) != 0 || symlink("/etc/hostname", PLINK2) != 0) {
+        printf("%-58s SKIP (cannot symlink)\n", "READLINK reproduces readlink(2)");
+        return;
+    }
+
+    n = readlink(PLINK, want, sizeof(want) - 1);
+    check(n > 0, "readlink(2) reads the first link");
+    if (n > 0) {
+        want[n] = 0;
+        check_res(r_readlink(&R, 1, PLINK), n, "READLINK returns the length without the NUL");
+        check(link_matches(1, 0, want), "  and the slot holds what readlink(2) gave");
+        /* PLINK points at PLINK2, which points at a file. Following would give
+         * neither of these answers. */
+        check(strcmp(want, PLINK2) == 0, "  which is the first target, not the last");
+    }
+
+    check_res(r_readlink(&R, 1, "/etc/hostname"), -EINVAL, "READLINK of a regular file is EINVAL");
+    check_res(r_readlink(&R, 1, "/etc"), -EINVAL, "  of a directory is EINVAL");
+    check_res(r_readlink(&R, 1, "/no/such/path"), -ENOENT, "  of a missing path is ENOENT");
+
+    /* The answer replaces the path, so the room is the rest of the slot.
+     * Truncating silently is how a wrong path gets used. */
+    unlink(LONGLINK);
+    if (symlink(LONGTARGET, LONGLINK) == 0) {
+        check_res(r_readlink(&R, 1, LONGLINK), (int64_t)strlen(LONGTARGET),
+                  "READLINK of a page-backed symlink works");
+        check(link_matches(1, 0, LONGTARGET), "  and reproduces the long target");
+
+        plen = put_path(R.arena, R.slot_size, 1, LONGLINK);
+        memmove(R.arena + R.slot_size + R.slot_size - 64, R.arena + R.slot_size, plen);
+        sqe_path(&s, KORU_OP_READLINK, 1, R.slot_size - 64, plen, 0x710);
+        check_res(run_one(R.fd, &s), -ENAMETOOLONG, "  and a target that does not fit is refused");
+        unlink(LONGLINK);
+    } else {
+        printf("%-58s SKIP (cannot symlink)\n", "READLINK of a page-backed symlink works");
+    }
+
+    put_path(R.arena, R.slot_size, 1, PLINK);
+    sqe_path(&s, KORU_OP_READLINK, 1, 0, (uint32_t)strlen(PLINK), 0x711);
+    s.handle = 1;
+    check_res(run_one(R.fd, &s), -EINVAL, "READLINK with a non-zero handle is EINVAL");
+
+    unlink(PLINK);
+    unlink(PLINK2);
+}
+
+/* The whole inline-because-of-creds rule, for something other than OPEN.
+ * Deferred to a kworker every one of these would run as root in the initial
+ * namespaces, and each EACCES below would become a success. */
+static int path_creds_child(struct koru_ring *m)
+{
+    struct passwd *pw = getpwnam("nobody");
+    uid_t nobody      = pw ? pw->pw_uid : 65534;
+    gid_t nogroup     = pw ? pw->pw_gid : 65534;
+    struct koru_times t;
+
+    if (ring_map(m) != 0)
+        return 2;
+    if (setgroups(0, NULL) != 0 || setresgid(nogroup, nogroup, nogroup) != 0 ||
+        setresuid(nobody, nobody, nobody) != 0)
+        return 3;
+    if (geteuid() == 0)
+        return 4;
+
+    if (r_truncate(m, 0, TRFILE, 0) != -EACCES)
+        return 5;
+    /* Explicit times need ownership, so setattr_prepare gives EPERM. */
+    memset(&t, 0, sizeof(t));
+    t.atime_sec = 1;
+    t.mtime_sec = 1;
+    if (r_utimes(m, 0, TRFILE, &t) != -EPERM)
+        return 6;
+    /* Both UTIME_NOW is a touch, which needs only write: EACCES instead. */
+    t.atime_nsec = KORU_UTIME_NOW;
+    t.mtime_nsec = KORU_UTIME_NOW;
+    if (r_utimes(m, 0, TRFILE, &t) != -EACCES)
+        return 7;
+    /* The link itself is world-readable; the directory it sits in is not. */
+    if (r_readlink(m, 0, CREDSLINK) != -EACCES)
+        return 8;
+    return 0;
+}
+
+static void path_creds(void)
+{
+    struct koru_ring m;
+    pid_t pid;
+    int st = 0;
+
+    if (geteuid() != 0) {
+        printf("%-58s SKIP (not root)\n", "an unprivileged TRUNCATE is EACCES");
+        return;
+    }
+    if (make_file(TRFILE, 64) != 0 || chmod(TRFILE, 0600) != 0) {
+        check(0, "create the root-owned target");
+        return;
+    }
+    unlink(CREDSLINK);
+    rmdir(CREDSDIR);
+    if (mkdir(CREDSDIR, 0700) != 0 || symlink("/etc/hostname", CREDSLINK) != 0) {
+        check(0, "create the root-only directory");
+        unlink(TRFILE);
+        return;
+    }
+
+    /* VM_DONTCOPY: the parent leaves this ring unmapped, the child maps it. */
+    if (ring_open(&m, 32, 64, 8192, 4, 8) != 0) {
+        check(0, "a ring for the path creds child");
+    } else {
+        pid = fork();
+        if (pid == 0)
+            _exit(path_creds_child(&m));
+        if (pid < 0 || waitpid(pid, &st, 0) != pid) {
+            check(0, "fork the path creds child");
+        } else {
+            /* 5 truncate, 6 utimes, 7 touch, 8 readlink. */
+            check(WIFEXITED(st) && WEXITSTATUS(st) == 0,
+                  "an unprivileged TRUNCATE, UTIMES and READLINK are refused");
+            if (WIFEXITED(st) && WEXITSTATUS(st) != 0)
+                note("child verdict %d", WEXITSTATUS(st));
+        }
+        ring_close(&m);
+    }
+    unlink(CREDSLINK);
+    rmdir(CREDSDIR);
+    unlink(TRFILE);
+}
+
+/* Heavy: a page-backed symlink's get_link takes a folio reference and the
+ * delayed call is the only thing that puts it back. kmemleak cannot see that —
+ * the page is still referenced, just for ever — so the instrument is MemFree,
+ * with each link unlinked so its page would otherwise be freed. */
+#define LEAKLINKS 4000u
+
+static void path_readlink_leak(void)
+{
+    char path[64];
+    long before, after;
+    unsigned i, made = 0;
+    int ok = 1;
+
+    before = mem_free_kb();
+    for (i = 0; i < LEAKLINKS; i++) {
+        snprintf(path, sizeof(path), "%s-%u", LONGLINK, i);
+        unlink(path);
+        if (symlink(LONGTARGET, path) != 0)
+            break;
+        made++;
+        if (r_readlink(&R, 1, path) != (int64_t)strlen(LONGTARGET))
+            ok = 0;
+        unlink(path);
+    }
+    check(made == LEAKLINKS && ok, "4,000 readlinks of page-backed symlinks");
+
+    /* Each leak is one page; the loop's own churn is the noise floor. */
+    after = mem_free_kb();
+    note("MemFree %ld -> %ld kB (%ld)", before, after, before - after);
+    check(before > 0 && after > 0 && before - after < (long)LEAKLINKS * 2,
+          "  and every target page came back");
+}
+
+void sec_path(void)
+{
+    path_truncate();
+    path_utimes();
+    path_readlink();
+    path_creds();
+    path_readlink_leak();
 }
 
 void sec_delay(void)

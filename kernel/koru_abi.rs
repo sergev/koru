@@ -37,6 +37,12 @@ pub(crate) fn eopnotsupp() -> Error {
     Error::from_errno(-(kernel::uapi::EOPNOTSUPP as i32))
 }
 
+/// `ENAMETOOLONG`: a `READLINK` answer longer than the slot has room for.
+/// Not in `error::code`.
+pub(crate) fn enametoolong() -> Error {
+    Error::from_errno(-(kernel::uapi::ENAMETOOLONG as i32))
+}
+
 /// Set by userspace in [`KoruParams::magic`]. Spells "koru" little-endian.
 pub(crate) const KORU_MAGIC: u32 = 0x7572_6f6b;
 
@@ -220,6 +226,24 @@ pub(crate) const KORU_OP_POLL_ADD: u8 = 9; // T22
 /// returns that count in `res`. `extra` is the [`KORU_STAT_*`](KORU_STAT_INO)
 /// mask of fields the filesystem actually reported.
 pub(crate) const KORU_OP_STAT: u8 = 10; // T23
+
+// Path operations. Every one of them names its path the way `OPEN` does:
+// `len` bytes at `off` in slot `slot`, with `handle` zero. An argument that
+// does not fit in the SQE follows the path in the same slot, at the first
+// 8-aligned offset at or after its end.
+
+/// Set the length of the file the path names. The argument is a `u64`, the new
+/// length; `res` is 0. Follows a final symlink, as `truncate(2)` does.
+pub(crate) const KORU_OP_TRUNCATE: u8 = 11; // T24
+/// Set the access and modification times of the file the path names. The
+/// argument is a [`KoruTimes`]; `res` is 0. Follows a final symlink.
+pub(crate) const KORU_OP_UTIMES: u8 = 12; // T24
+/// Read the symlink the path names. No argument: the target **replaces the
+/// path it was given**, NUL-terminated, at `off` in the same slot, and `res` is
+/// its length without the NUL. Does not follow a final symlink, which is the
+/// entire point. `ENAMETOOLONG` if it does not fit in the rest of the slot —
+/// truncating a path silently is how a wrong path gets used.
+pub(crate) const KORU_OP_READLINK: u8 = 13; // T24
 
 /// Any bit set is rejected.
 pub(crate) const KORU_SQE_FLAGS_ALL: u8 = 0;
@@ -465,6 +489,35 @@ pub(crate) struct KoruStat {
     pub(crate) reserved: [u64; 12],
 }
 
+// ---------------------------------------------------------------------------
+// Times
+// ---------------------------------------------------------------------------
+
+// Nanosecond sentinels, checked by `vfs_utimes` itself. Same values on every
+// architecture, so they pass through like the `S_IF*` ones.
+
+/// Set this timestamp to now, ignoring the seconds field. `vfs_utimes` reads
+/// it, so the kernel side never names it.
+#[expect(dead_code)]
+pub(crate) const KORU_UTIME_NOW: i64 = (1 << 30) - 1;
+/// Leave this timestamp alone. As above.
+#[expect(dead_code)]
+pub(crate) const KORU_UTIME_OMIT: i64 = (1 << 30) - 2;
+
+/// `UTIMES`' argument, two `(seconds, nanoseconds)` pairs. 32 bytes, no
+/// padding. Mirrors `struct timespec64` field for field, which is what the
+/// sentinels above are expressed in; the kernel translates pair by pair.
+#[repr(C)]
+#[derive(Copy, Clone, Default)]
+pub(crate) struct KoruTimes {
+    /// Seconds since the epoch; signed, because a date before 1970 is a date.
+    pub(crate) atime_sec: i64,
+    /// Nanoseconds, or one of the `KORU_UTIME_*` sentinels.
+    pub(crate) atime_nsec: i64,
+    pub(crate) mtime_sec: i64,
+    pub(crate) mtime_nsec: i64,
+}
+
 // Size alone would not catch two fields being swapped, so assert every offset.
 kernel::static_assert!(core::mem::size_of::<Sqe>() == 32);
 kernel::static_assert!(core::mem::align_of::<Sqe>() == 8);
@@ -522,9 +575,18 @@ kernel::static_assert!(core::mem::offset_of!(KoruStat, btime_sec) == 144);
 kernel::static_assert!(core::mem::offset_of!(KoruStat, btime_nsec) == 152);
 kernel::static_assert!(core::mem::offset_of!(KoruStat, reserved) == 160);
 
+kernel::static_assert!(core::mem::size_of::<KoruTimes>() == 32);
+kernel::static_assert!(core::mem::align_of::<KoruTimes>() == 8);
+kernel::static_assert!(core::mem::offset_of!(KoruTimes, atime_sec) == 0);
+kernel::static_assert!(core::mem::offset_of!(KoruTimes, atime_nsec) == 8);
+kernel::static_assert!(core::mem::offset_of!(KoruTimes, mtime_sec) == 16);
+kernel::static_assert!(core::mem::offset_of!(KoruTimes, mtime_nsec) == 24);
+
 // SAFETY: `repr(C)`, integers only, so every bit pattern is valid. No interior
 // mutability.
 unsafe impl FromBytes for Sqe {}
+// SAFETY: as above. This is what lets `UTIMES` decode its argument.
+unsafe impl FromBytes for KoruTimes {}
 // SAFETY: as above.
 unsafe impl FromBytes for Cqe {}
 // SAFETY: as above.

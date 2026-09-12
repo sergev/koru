@@ -1004,6 +1004,137 @@ never overlap, so the check pairs a whole-slot `CHECKSUM` with a `STAT` instead,
 which is the idiom `OPEN` and `READ` already use and tests the same property
 deterministically.
 
+### Path operations, and one shape for all of them
+
+T24 added `TRUNCATE`, `UTIMES` and `READLINK`: the first ops that name a file by
+path rather than by handle since `OPEN`, and the first to need `kern_path`.
+
+**One encoding covers every path op**, and it is `OPEN`'s: the path is `len`
+bytes at `off` in slot `slot`, with `handle` zero. An argument that does not fit
+in the SQE follows the path in the same slot, at the first 8-aligned offset at
+or after its end. `TRUNCATE`'s is a `u64` new length, `UTIMES`' is a
+`KoruTimes`, and `READLINK` has none.
+
+The plan proposed putting `TRUNCATE`'s new length in `off` instead, since `off`
+is a file offset everywhere else. That was not taken. A file length has to be 64
+bits, so `off` is the only field that can hold it, and spending it would leave
+the path with no offset — a second path encoding, for one opcode, where T25 to
+T28 all say they reuse `do_open`'s recipe verbatim. One rule that covers five
+opcodes is worth more than saving the caller an eight-byte store. What the plan
+was right about is that `len` cannot be the truncate length; it just is not free
+either.
+
+`READLINK`'s answer **replaces the path it was given** and `res` is its length
+without the NUL. An answer that does not fit in the rest of the slot is
+`ENAMETOOLONG`, not a truncated path: `readlink(2)` truncates silently, and a
+silently truncated path is a wrong path that looks like a right one.
+
+**All three are inline, permanently**, for `OPEN`'s reason and with more force:
+`vfs_truncate` and `vfs_utimes` permission-check with `current_cred()`, and
+`kern_path` resolves a relative path against `current->fs`. In a kworker both
+are init's. Finding 3 again, and T24 is where it finally got a regression test —
+see below.
+
+#### `kernel/koru_path.rs`, and what nothing checks
+
+`linux/namei.h` is not in `rust/bindings/bindings_helper.h`, so `kern_path` and
+every `LOOKUP_*` are missing from `bindings::` even though the symbol is a plain
+`EXPORT_SYMBOL`. `do_delayed_call` is a static inline, so there is no symbol at
+all and it is reimplemented in Rust over the bound two-field struct.
+
+Everything of that kind lives in one file, each item quoting the header it came
+from. **Nothing checks these**: no `static_assert` reaches a C declaration, and
+the ABI diff cannot see the kernel. Re-reading that file against the source is
+an obligation of every kernel bump, and it is the only such obligation in the
+tree.
+
+`vfs_truncate`, `vfs_utimes`, `vfs_get_link`, `path_put`, `mnt_want_write` and
+`mnt_drop_write` all turned out to be in `bindings::` already, because
+`linux/fs.h` is in the helper header. Only the namei half was missing.
+
+Declaring `kern_path` needs `#[allow(improper_ctypes)]`: `struct path` reaches a
+bindgen struct this config leaves empty, and the `bindings` crate allows the
+same lint crate-wide for the same reason.
+
+#### Two guards, and the one the plan asked for that is not needed
+
+`Lookup` holds a `struct path` and calls `path_put` on drop; `Link` holds
+`vfs_get_link`'s answer and makes its delayed call on drop. Both exist because a
+`?` that skipped the teardown would leak silently, which is one of the few
+places Rust's `Drop` genuinely earns its keep here.
+
+The plan also asked for a `mnt_want_write`/`mnt_drop_write` guard, warning that
+an early return skipping the drop pins the filesystem against read-only remount
+until reboot. **No T24 op needs it.** `vfs_truncate` and `vfs_utimes` are the
+wrappers that take and drop the write count themselves — that is the difference
+between them and the `vfs_mkdir` family — and `READLINK` writes nothing. Writing
+the guard now would have meant a `Drop` impl no test could reach. It belongs to
+T26, where `vfs_mkdir` and `vfs_symlink` need it and the write-count balance
+assertion the plan describes can actually fail.
+
+#### kmemleak is the wrong instrument for `do_delayed_call`
+
+The plan expected 2,000 readlinks with the delayed call dropped to make kmemleak
+report. It does not, and the reason is worth keeping: `shmem_put_link` is
+`folio_mark_accessed` plus `folio_put`, and `page_put_link` is the same shape.
+The delayed call releases a **reference**, not an allocation. The page stays
+referenced — for ever — so kmemleak, which looks for unreferenced objects, sees
+a perfectly healthy page.
+
+What does see it is `MemFree`, once each symlink is unlinked so its page would
+otherwise be freed. The check makes 4,000 distinct page-backed symlinks, reads
+each and unlinks it: correct, `MemFree` falls by about 5.9 MB of ordinary churn;
+with the delayed call dropped, by about 22 MB — the same churn plus 4,000 pages.
+The threshold is two kilobytes per link, which sits between them with room to
+spare.
+
+**The probe only works outside an overlay.** `/tmp` in the guest is an overlayfs
+whose upper layer is tmpfs, and there the leak is invisible: with the delayed
+call dropped the measurement is indistinguishable from a correct run. The links
+therefore live in `/run`, which is plain tmpfs. A test that cannot fail where it
+runs is worse than no test, and this one nearly was one.
+
+The target has to be longer than tmpfs's `SHORT_SYMLINK_LEN` of 128 bytes, or
+the symlink is stored inline, `simple_get_link` arms no delayed call, and
+dropping the call changes nothing.
+
+#### What was verified, and how
+
+Seven perturbations, each applied and reverted, all seven fail.
+
+- **Drop `do_delayed_call` from `Link`'s drop.** The `MemFree` probe fails, at
+  22 MB against a 8 MB threshold. kmemleak still reports nothing, which is the
+  finding above.
+- **Drop `path_put` from `Lookup`'s drop.** The same probe fails: a leaked
+  dentry reference keeps the unlinked inode, and its page, alive.
+- **Give `READLINK` `LOOKUP_FOLLOW`.** Six assertions fail. The two-deep symlink
+  is what separates "followed" from "not followed"; one link would have returned
+  the same answer either way.
+- **Take `LOOKUP_FOLLOW` away from `TRUNCATE`.** Truncating through a symlink
+  gives `-EINVAL`, because the symlink itself is not a regular file.
+- **Defer `TRUNCATE` to the workqueue.** The unprivileged child's truncate of a
+  root-owned file succeeds instead of `-EACCES`. This is the plan's most
+  valuable assertion and the first regression test the inline-because-of-creds
+  rule has ever had for anything but `OPEN`.
+- **Replace the `ENAMETOOLONG` guard with truncation.** `READLINK` returns a
+  63-byte prefix of a 143-byte path and calls it success.
+- **Delete the argument bound in `arg_offset`.** `TRUNCATE` reads its new length
+  out of the *next slot* and succeeds. This one needed the test fixed first: the
+  original case put the argument exactly at the slot end, which is legal, and
+  the one after it was refused by the path scan rather than the bound. The
+  assertion now names a real eight-character path so only the bound can refuse.
+
+The creds child also distinguishes two refusals the VFS gives for `UTIMES`:
+named times need ownership and give `-EPERM` from `setattr_prepare`, while both
+nanoseconds set to `UTIME_NOW` is a touch, which needs only write permission and
+gives `-EACCES`. Asserting one of them would have passed for the wrong reason.
+
+The fuzzer grew an arm for all three, reaching each about 1,600 times per run
+with a few hundred succeeding. **It names only its own scratch file, its own
+symlink and a path that resolves nowhere.** A random path reaching `TRUNCATE`
+would destroy whatever it named; that sandboxing is a property of the test, not
+of the kernel, and it is the most important line in the fuzzer.
+
 ### Cancellation
 
 `CANCEL` names its target by `user_data` in `off`. A duplicate `user_data`

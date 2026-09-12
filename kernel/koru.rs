@@ -13,6 +13,7 @@
 
 mod koru_abi;
 mod koru_ops;
+mod koru_path;
 
 use kernel::{
     bindings,

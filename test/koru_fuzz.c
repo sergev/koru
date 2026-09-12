@@ -20,8 +20,10 @@
 
 #include "koru_check.h"
 
-/* The only path the fuzzer ever opens for writing. */
+/* The only path the fuzzer ever opens for writing, truncates or touches. */
 #define FUZZWRFILE "/tmp/koru-fuzz-write"
+/* Its own symlink, the only one it ever reads. */
+#define FUZZLINK "/tmp/koru-fuzz-link"
 
 #define F_SQ      64u
 #define F_CQ      128u
@@ -146,6 +148,16 @@ static int res_allowed(uint8_t opcode, int64_t res)
         return (res >= 1 && res <= (int64_t)sizeof(struct koru_stat)) || res == -EINVAL ||
                res == -EBADF || res == -EBUSY || res == -ENOMEM || res == -EAGAIN ||
                res == -ECANCELED;
+    case KORU_OP_TRUNCATE:
+    case KORU_OP_UTIMES:
+        /* Inline, so never cancelled and never deferred. */
+        return res == 0 || res == -EINVAL || res == -EBUSY || res == -ENOMEM ||
+               res == -ENOENT || res == -ENOTDIR || res == -EISDIR || res == -EACCES ||
+               res == -EPERM || res == -ELOOP || res == -ENAMETOOLONG;
+    case KORU_OP_READLINK:
+        return (res >= 1 && res < F_SLOT) || res == -EINVAL || res == -EBUSY ||
+               res == -ENOMEM || res == -ENOENT || res == -ENOTDIR || res == -EACCES ||
+               res == -ELOOP || res == -ENAMETOOLONG;
     default:
         return res == -EINVAL;
     }
@@ -175,7 +187,7 @@ static void gen_valid(uint64_t *s, struct koru_sqe *q, uint64_t ud, uint32_t pat
 {
     uint32_t slot = rnd_below(s, F_SLOTS);
 
-    switch (rnd_below(s, 17)) {
+    switch (rnd_below(s, 20)) {
     case 0:
         sqe_nop(q, ud);
         break;
@@ -252,6 +264,34 @@ static void gen_valid(uint64_t *s, struct koru_sqe *q, uint64_t ud, uint32_t pat
         sqe_stat(q, one_in(s, 4) ? (uint32_t)rnd(s) : pool_pick(s), slot, 8 * rnd_below(s, 8),
                  1 + rnd_below(s, 512), ud);
         break;
+    case 16:
+    case 17: {
+        /* Only ever the fuzzer's own scratch file, its own symlink, or a path
+         * that resolves nowhere. A random path here would truncate or touch
+         * whatever it named; that sandboxing is a property of this test. */
+        static const char *const paths[] = { FUZZWRFILE, FUZZLINK, "/tmp/koru-fuzz-no-such" };
+        const char *path = paths[rnd_below(s, 3)];
+        uint32_t n       = put_path(arena, F_SLOT, path_slot, path);
+        uint8_t op = one_in(s, 3) ? KORU_OP_READLINK
+                                  : (one_in(s, 2) ? KORU_OP_TRUNCATE : KORU_OP_UTIMES);
+        uint64_t at = arg_offset(0, n);
+
+        if (op == KORU_OP_TRUNCATE) {
+            uint64_t size = rnd_below(s, F_SLOT);
+
+            memcpy(arena + (size_t)path_slot * F_SLOT + at, &size, sizeof(size));
+        } else if (op == KORU_OP_UTIMES) {
+            struct koru_times t;
+
+            t.atime_sec  = (int64_t)rnd(s);
+            t.atime_nsec = one_in(s, 4) ? (int64_t)rnd(s) : (int64_t)rnd_below(s, 1000000000);
+            t.mtime_sec  = (int64_t)rnd(s);
+            t.mtime_nsec = one_in(s, 4) ? KORU_UTIME_NOW : KORU_UTIME_OMIT;
+            memcpy(arena + (size_t)path_slot * F_SLOT + at, &t, sizeof(t));
+        }
+        sqe_path(q, op, path_slot, 0, n, ud);
+        break;
+    }
     default:
         sqe_checksum(q, slot, 0, rnd_below(s, F_SLOT + 1), ud);
         break;
@@ -615,8 +655,9 @@ static unsigned long long drain(void)
 
 int fuzz_main(unsigned secs, uint64_t seed)
 {
-    static const char *names[12] = { "NOP",   "DELAY", "OPEN",  "READ",  "CLOSE", "CANCEL",
-                                     "CKSUM", "WRITE", "ADOPT", "POLL",  "STAT",  "other" };
+    static const char *names[15] = { "NOP",   "DELAY", "OPEN",  "READ",  "CLOSE",
+                                     "CANCEL", "CKSUM", "WRITE", "ADOPT", "POLL",
+                                     "STAT",  "TRUNC", "UTIMES", "RDLINK", "other" };
     struct koru_ring m;
     pthread_t th[NWORKERS + 2];
     uint64_t seeds[NWORKERS + 2];
@@ -634,6 +675,11 @@ int fuzz_main(unsigned secs, uint64_t seed)
 
     if (make_pattern_file(FUZZWRFILE, F_SLOT) != 0) {
         fail("create the fuzzer's scratch file");
+        return failures;
+    }
+    unlink(FUZZLINK);
+    if (symlink(FUZZWRFILE, FUZZLINK) != 0) {
+        fail("create the fuzzer's symlink");
         return failures;
     }
     adoptable = open(PATFILE, O_RDONLY);
@@ -690,7 +736,7 @@ int fuzz_main(unsigned secs, uint64_t seed)
 
         note("%llu ENTERs, %llu SQEs consumed, %llu CQEs reaped (%llu at drain)",
              (unsigned long long)atomic_load(&total_ops), sub, rea, tail);
-        for (op = 0; op < 12; op++)
+        for (op = 0; op < 15; op++)
             note("%-6s %7llu completed, %7llu succeeded", names[op],
                  (unsigned long long)atomic_load(&op_total[op]),
                  (unsigned long long)atomic_load(&op_ok[op]));
@@ -703,7 +749,7 @@ int fuzz_main(unsigned secs, uint64_t seed)
         check(sub > SUB_FLOOR, "the fuzzer actually exercised the ring");
         /* Completion, not success: the tail sections carry that claim. */
         reached = 1;
-        for (op = 0; op <= KORU_OP_STAT; op++)
+        for (op = 0; op <= KORU_OP_READLINK; op++)
             if (atomic_load(&op_total[op]) == 0) {
                 note("opcode %d never completed once", op);
                 reached = 0;
@@ -716,6 +762,7 @@ int fuzz_main(unsigned secs, uint64_t seed)
 
     ring_close(&m);
     close(adoptable);
+    unlink(FUZZLINK);
     unlink(FUZZWRFILE);
     return failures;
 }

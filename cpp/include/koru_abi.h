@@ -213,6 +213,18 @@ KORU_STATIC_ASSERT(KORU_IOC_ENTER == 0xc0406b02u, "ioctl ENTER");
  * writes min(len, sizeof(struct koru_stat)) bytes and returns that in res.
  * extra is the KORU_STAT_* mask of fields the filesystem reported. */
 #define KORU_OP_STAT 10
+/* Path operations. Every one names its path the way OPEN does: len bytes at off
+ * in slot `slot`, with handle zero. An argument that does not fit in the SQE
+ * follows the path in the same slot, at the first 8-aligned offset at or after
+ * its end.
+ *
+ * TRUNCATE's argument is a uint64_t new length and res is 0; UTIMES' is a
+ * struct koru_times and res is 0; READLINK has none and its target replaces the
+ * path it was given, NUL-terminated at off, with res the length without the
+ * NUL. TRUNCATE and UTIMES follow a final symlink; READLINK does not. */
+#define KORU_OP_TRUNCATE 11
+#define KORU_OP_UTIMES   12
+#define KORU_OP_READLINK 13
 
 KORU_STATIC_ASSERT(KORU_OP_NOP == 0, "op NOP");
 KORU_STATIC_ASSERT(KORU_OP_DELAY_NS == 1, "op DELAY_NS");
@@ -225,6 +237,9 @@ KORU_STATIC_ASSERT(KORU_OP_WRITE == 7, "op WRITE");
 KORU_STATIC_ASSERT(KORU_OP_ADOPT_FD == 8, "op ADOPT_FD");
 KORU_STATIC_ASSERT(KORU_OP_POLL_ADD == 9, "op POLL_ADD");
 KORU_STATIC_ASSERT(KORU_OP_STAT == 10, "op STAT");
+KORU_STATIC_ASSERT(KORU_OP_TRUNCATE == 11, "op TRUNCATE");
+KORU_STATIC_ASSERT(KORU_OP_UTIMES == 12, "op UTIMES");
+KORU_STATIC_ASSERT(KORU_OP_READLINK == 13, "op READLINK");
 
 /* Any bit set in an SQE's flags is rejected. */
 #define KORU_SQE_FLAGS_ALL 0u
@@ -352,6 +367,26 @@ KORU_STATIC_ASSERT(offsetof(struct koru_stat, ctime_nsec) == 136, "stat.ctime_ns
 KORU_STATIC_ASSERT(offsetof(struct koru_stat, btime_sec) == 144, "stat.btime_sec");
 KORU_STATIC_ASSERT(offsetof(struct koru_stat, btime_nsec) == 152, "stat.btime_nsec");
 KORU_STATIC_ASSERT(offsetof(struct koru_stat, reserved) == 160, "stat.reserved");
+
+/* Nanosecond sentinels, checked by the kernel itself. Same values everywhere,
+ * so they pass through like the S_IF* ones. */
+#define KORU_UTIME_NOW  ((int64_t)((1 << 30) - 1)) /* set this time to now */
+#define KORU_UTIME_OMIT ((int64_t)((1 << 30) - 2)) /* leave this time alone */
+
+/* UTIMES' argument, two (seconds, nanoseconds) pairs. 32 bytes, no padding. */
+struct koru_times {
+    int64_t atime_sec; /* signed: a date before 1970 is a date */
+    int64_t atime_nsec; /* nanoseconds, or a KORU_UTIME_* sentinel */
+    int64_t mtime_sec;
+    int64_t mtime_nsec;
+};
+
+KORU_STATIC_ASSERT(sizeof(struct koru_times) == 32, "times size");
+KORU_STATIC_ASSERT(KORU_ALIGNOF(struct koru_times) == 8, "times align");
+KORU_STATIC_ASSERT(offsetof(struct koru_times, atime_sec) == 0, "times.atime_sec");
+KORU_STATIC_ASSERT(offsetof(struct koru_times, atime_nsec) == 8, "times.atime_nsec");
+KORU_STATIC_ASSERT(offsetof(struct koru_times, mtime_sec) == 16, "times.mtime_sec");
+KORU_STATIC_ASSERT(offsetof(struct koru_times, mtime_nsec) == 24, "times.mtime_nsec");
 
 /* Handle encoding: index in the low half, generation in the high half. A
  * valid handle is never 0, because the generation starts at 1. */

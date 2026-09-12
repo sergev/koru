@@ -93,45 +93,6 @@ existing "unimplemented completes `-EINVAL`" rule. A new bit in an existing
 Per-opcode meanings for `Cqe::extra` are within its documented contract. New
 data-plane structs change no existing size or offset.
 
-### T24 [R] — `kern_path` plumbing: `TRUNCATE`, `UTIMES`, `READLINK`
-
-Three simple path operations, chosen to land the shared infrastructure before
-anything runs under a dentry lock. All inline, permanently.
-
-`linux/namei.h` is absent from `rust/bindings/bindings_helper.h`, so `kern_path`
-and every `LOOKUP_*` are missing from `bindings::` even though they are
-exported. New `kernel/koru_path.rs` holds every hand-declared
-`unsafe extern "C"` prototype in one place, each with its C signature quoted
-verbatim above it. Nothing checks these — no `static_assert` can help — so the
-file carries a written obligation to re-check on every kernel bump, and Notes
-records it.
-
-Guard types with `Drop` for `mnt_want_write`/`mnt_drop_write` and for
-`path_put`. An early return through `?` that skips `mnt_drop_write` pins the
-filesystem against read-only remount until reboot. One of the few places Rust
-genuinely helps; take it.
-
-`TRUNCATE` puts the new length in `off`, since it is a file offset and there is
-no ambiguity, and requires `len` to be zero; `vfs_truncate` does its own
-`mnt_want_write` and permission check. `UTIMES` reads a two-timespec struct from
-the slot immediately after the path, reusing the kernel's own `UTIME_NOW` and
-`UTIME_OMIT` sentinels, which `vfs_utimes` checks directly.
-
-`READLINK` is **not** `vfs_readlink`, whose buffer is a `char __user *` and
-which would both violate the central invariant read literally and fault. It is
-`kern_path` without `LOOKUP_FOLLOW` — the entire point — then `vfs_get_link`,
-then `do_delayed_call`, whose omission leaks a page per page-backed symlink.
-NUL-terminate in the slot and return the length excluding the NUL.
-
-Done test: each cross-checked against its libc equivalent — `st_size` after
-truncate, `st_atim` and `st_mtim` after utimes, `readlink(2)` against the slot.
-Then the creds test, never written for anything but `OPEN`: a child dropped to
-nobody truncates a root-owned file and gets `-EACCES`, after which the op is
-deliberately deferred to the workqueue and must be seen to succeed as root. That
-is the regression test for the whole inline-because-of-creds rule and it is the
-most valuable assertion in the plan. Then 2,000 readlinks of a long symlink in
-the heavy phase with `do_delayed_call` dropped, which kmemleak must report.
-
 ### T25 [M] — `KORU_OP_STATX_AT`
 
 Stat by path: `kern_path` with `LOOKUP_FOLLOW`, the same `vfs_getattr` and
@@ -169,6 +130,11 @@ interior NUL, split there, append our own NUL to the second, reject either side
 empty. A different parse, not a relaxation of the embedded-NUL rule. Factor it
 into one helper, since T28 needs it. Do not use `off` as a second length — it
 collides with `off`'s within-slot meaning.
+
+**The `mnt_want_write`/`mnt_drop_write` guard lands here**, not at T24 as the
+plan once said: `vfs_truncate` and `vfs_utimes` take the write count themselves,
+`vfs_mkdir` and `vfs_symlink` do not. Notes has the reasoning; `koru_path.rs` is
+where the guard goes, beside `Lookup` and `Link`.
 
 Pass NULL for `delegated_inode` throughout T26 to T28. `try_break_deleg` with
 NULL returns `-EWOULDBLOCK` without taking a reference, so there is no `iput`

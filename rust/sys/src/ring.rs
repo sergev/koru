@@ -513,6 +513,19 @@ impl Sqe {
         }
     }
 
+    /// A path op: the path is `len` bytes at `off`, and the opcode's argument
+    /// follows it in the slot. `handle` must be zero.
+    pub fn path(opcode: u8, user_data: u64, slot: u32, off: u64, len: u32) -> Sqe {
+        Sqe {
+            opcode,
+            len,
+            off,
+            user_data,
+            slot,
+            ..Sqe::default()
+        }
+    }
+
     /// `off` carries the descriptor; every other field must be zero.
     pub fn adopt_fd(user_data: u64, fd: i32) -> Sqe {
         Sqe {
@@ -567,4 +580,17 @@ impl KoruStat {
         // checked, and an unaligned read is allowed for.
         Some(unsafe { std::ptr::read_unaligned(bytes.as_ptr().cast()) })
     }
+}
+
+impl KoruTimes {
+    pub fn as_bytes(&self) -> [u8; size_of::<KoruTimes>()] {
+        // SAFETY: `repr(C)`, integers only, no padding.
+        unsafe { std::mem::transmute_copy(self) }
+    }
+}
+
+/// Where a path op's argument goes: the first 8-aligned offset at or after the
+/// end of the path. The kernel computes the same thing.
+pub const fn arg_offset(off: u64, len: u32) -> u64 {
+    (off + len as u64 + 7) & !7
 }

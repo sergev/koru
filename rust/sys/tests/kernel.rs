@@ -55,7 +55,7 @@ fn smoke_the_device_is_there() {
 // ---------------------------------------------------------------------------
 
 /// Every opcode plus two that do not exist.
-const ALL_OPCODES: [u8; 13] = [
+const ALL_OPCODES: [u8; 16] = [
     KORU_OP_NOP,
     KORU_OP_DELAY_NS,
     KORU_OP_OPEN,
@@ -67,7 +67,10 @@ const ALL_OPCODES: [u8; 13] = [
     KORU_OP_ADOPT_FD,
     KORU_OP_POLL_ADD,
     KORU_OP_STAT,
-    11,
+    KORU_OP_TRUNCATE,
+    KORU_OP_UTIMES,
+    KORU_OP_READLINK,
+    14,
     200,
 ];
 
@@ -2929,4 +2932,315 @@ fn stat_releases_its_slot_when_cancelled() {
     );
     assert_eq!(m.close_handle(h), 0);
     m.assert_quiesced();
+}
+
+// ---------------------------------------------------------------------------
+// T24 - TRUNCATE, UTIMES and READLINK
+// ---------------------------------------------------------------------------
+
+/// A path op on slot 1: path at offset 0, argument after it.
+fn path_op(m: &Mapped, opcode: u8, path: &str, arg: &[u8]) -> i64 {
+    let n = m.put_path(1, path);
+    let at = koru_sys::ring::arg_offset(0, n) as usize;
+    m.slot(1)[at..at + arg.len()].copy_from_slice(arg);
+    m.run_one(&Sqe::path(opcode, 0x700, 1, 0, n))
+}
+
+fn truncate(m: &Mapped, path: &str, size: u64) -> i64 {
+    path_op(m, KORU_OP_TRUNCATE, path, &size.to_ne_bytes())
+}
+
+fn utimes(m: &Mapped, path: &str, t: &KoruTimes) -> i64 {
+    path_op(m, KORU_OP_UTIMES, path, &t.as_bytes())
+}
+
+fn readlink(m: &Mapped, path: &str) -> i64 {
+    path_op(m, KORU_OP_READLINK, path, &[])
+}
+
+/// A symlink removed when the guard drops.
+struct Symlink(String);
+
+impl Symlink {
+    fn new(tag: &str, target: &str) -> Option<Symlink> {
+        let path = format!("/tmp/koru-check-rs-link-{tag}");
+        let _ = std::fs::remove_file(&path);
+        std::os::unix::fs::symlink(target, &path).ok()?;
+        Some(Symlink(path))
+    }
+
+    fn path(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Drop for Symlink {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+#[test]
+fn truncate_sets_the_length_stat_reports() {
+    let f = Scratch::new("truncate");
+    std::fs::write(f.path(), vec![0x5au8; 8192]).expect("fill");
+    let m = Mapped::shared();
+
+    assert_eq!(truncate(&m, f.path(), 100), 0, "shrink");
+    assert_eq!(f.bytes().len(), 100, "stat(2) agrees");
+    assert_eq!(truncate(&m, f.path(), 1 << 20), 0, "extend");
+    let got = f.bytes();
+    assert_eq!(got.len(), 1 << 20, "stat(2) agrees again");
+    assert!(got[..100].iter().all(|&b| b == 0x5a), "the head survived");
+    assert!(
+        got[100..].iter().all(|&b| b == 0),
+        "the hole reads as zeros"
+    );
+    assert_eq!(truncate(&m, f.path(), 0), 0, "and down to nothing");
+    assert!(f.bytes().is_empty());
+    m.assert_quiesced();
+}
+
+#[test]
+fn truncate_follows_a_final_symlink() {
+    let f = Scratch::new("trunclink");
+    std::fs::write(f.path(), vec![1u8; 4096]).expect("fill");
+    let Some(link) = Symlink::new("trunc", f.path()) else {
+        skip("truncate", "cannot symlink");
+        return;
+    };
+    let m = Mapped::shared();
+
+    assert_eq!(truncate(&m, link.path(), 64), 0, "through the link");
+    assert_eq!(f.bytes().len(), 64, "the target is what changed");
+    m.assert_quiesced();
+}
+
+#[test]
+fn truncate_rejection_matrix() {
+    let f = Scratch::new("truncbad");
+    let m = Mapped::shared();
+    let bad = -(EINVAL.0 as i64);
+
+    // The first two are `vfs_truncate`'s own.
+    assert_eq!(truncate(&m, "/etc", 0), -(EISDIR.0 as i64), "a directory");
+    assert_eq!(truncate(&m, "/dev/null", 0), bad, "a device node");
+    assert_eq!(
+        truncate(&m, "/no/such/path", 0),
+        -(ENOENT.0 as i64),
+        "a missing path"
+    );
+    assert_eq!(truncate(&m, f.path(), 1 << 63), bad, "a negative length");
+
+    let n = m.put_path(1, f.path());
+    let mut s = Sqe::path(KORU_OP_TRUNCATE, 0x710, 1, 0, n);
+    s.handle = 1;
+    assert_eq!(m.run_one(&s), bad, "a non-zero handle");
+    assert_eq!(
+        m.run_one(&Sqe::path(KORU_OP_TRUNCATE, 0x711, 1, 0, 0)),
+        bad,
+        "a zero-length path"
+    );
+    assert_eq!(
+        m.run_one(&Sqe::path(KORU_OP_TRUNCATE, 0x712, m.slot_count(), 0, 8)),
+        bad,
+        "a slot past the arena"
+    );
+    // The argument has to fit after the path, not merely the path itself. The
+    // path here is real and in range, so only the argument bound can refuse.
+    // "/run/xyz" is exactly eight characters.
+    std::fs::write("/run/xyz", b"").expect("short path");
+    let off = u64::from(m.slot_size() - 12);
+    let at = off as usize;
+    m.slot(1)[at..at + 8].copy_from_slice(b"/run/xyz");
+    assert_eq!(
+        m.run_one(&Sqe::path(KORU_OP_TRUNCATE, 0x713, 1, off, 8)),
+        bad,
+        "an argument past the slot end"
+    );
+    let _ = std::fs::remove_file("/run/xyz");
+    m.assert_quiesced();
+}
+
+#[test]
+fn utimes_sets_the_times_stat_reports() {
+    use std::os::linux::fs::MetadataExt;
+
+    let f = Scratch::new("utimes");
+    std::fs::write(f.path(), b"x").expect("fill");
+    let m = Mapped::shared();
+
+    let t = KoruTimes {
+        atime_sec: 1_000_000_000,
+        atime_nsec: 123_456_789,
+        mtime_sec: 1_100_000_000,
+        mtime_nsec: 987_654_321,
+    };
+    assert_eq!(utimes(&m, f.path(), &t), 0, "UTIMES");
+    let md = std::fs::metadata(f.path()).expect("metadata");
+    assert_eq!(md.st_atime(), t.atime_sec, "atime seconds");
+    assert_eq!(md.st_atime_nsec(), t.atime_nsec, "atime nanoseconds");
+    assert_eq!(md.st_mtime(), t.mtime_sec, "mtime seconds");
+    assert_eq!(md.st_mtime_nsec(), t.mtime_nsec, "mtime nanoseconds");
+
+    // The kernel's own sentinels, checked by `vfs_utimes`.
+    let omit = KoruTimes {
+        atime_nsec: KORU_UTIME_OMIT,
+        mtime_sec: 1_200_000_000,
+        mtime_nsec: 1,
+        ..t
+    };
+    assert_eq!(utimes(&m, f.path(), &omit), 0, "UTIME_OMIT");
+    let md = std::fs::metadata(f.path()).expect("metadata");
+    assert_eq!(md.st_atime_nsec(), t.atime_nsec, "the atime is untouched");
+    assert_eq!(md.st_mtime(), 1_200_000_000, "while the mtime moved");
+
+    let bad = KoruTimes {
+        atime_nsec: 1_000_000_000,
+        ..omit
+    };
+    assert_eq!(
+        utimes(&m, f.path(), &bad),
+        -(EINVAL.0 as i64),
+        "a nanosecond field past 999999999"
+    );
+    assert_eq!(
+        utimes(&m, "/no/such/path", &t),
+        -(ENOENT.0 as i64),
+        "a missing path"
+    );
+    m.assert_quiesced();
+}
+
+#[test]
+fn readlink_reproduces_readlink_2_without_following() {
+    // Two links deep: following would give neither answer.
+    let Some(inner) = Symlink::new("inner", "/etc/hostname") else {
+        skip("readlink", "cannot symlink");
+        return;
+    };
+    let Some(outer) = Symlink::new("outer", inner.path()) else {
+        skip("readlink", "cannot symlink");
+        return;
+    };
+    let m = Mapped::shared();
+
+    let want = std::fs::read_link(outer.path()).expect("readlink(2)");
+    let want = want.to_str().expect("utf8").as_bytes();
+    let res = readlink(&m, outer.path());
+    assert_eq!(res, want.len() as i64, "res is the length without the NUL");
+    assert_eq!(&m.slot(1)[..want.len()], want, "and the slot holds it");
+    assert_eq!(m.slot(1)[want.len()], 0, "NUL-terminated");
+    assert_eq!(
+        want,
+        inner.path().as_bytes(),
+        "the first target, not the last"
+    );
+    m.assert_quiesced();
+}
+
+#[test]
+fn readlink_rejection_matrix() {
+    let m = Mapped::shared();
+    let bad = -(EINVAL.0 as i64);
+
+    assert_eq!(readlink(&m, "/etc/hostname"), bad, "a regular file");
+    assert_eq!(readlink(&m, "/etc"), bad, "a directory");
+    assert_eq!(
+        readlink(&m, "/no/such/path"),
+        -(ENOENT.0 as i64),
+        "a missing path"
+    );
+
+    // Longer than tmpfs's inline limit, so the target is page-backed too.
+    let long: String = std::iter::repeat_n("/abcdefgh", 24).collect();
+    let Some(link) = Symlink::new("reject", &long) else {
+        skip("readlink", "cannot symlink");
+        return;
+    };
+    let n = m.put_path(1, link.path());
+    let mut s = Sqe::path(KORU_OP_READLINK, 0x720, 1, 0, n);
+    s.handle = 1;
+    assert_eq!(m.run_one(&s), bad, "a non-zero handle");
+
+    // The answer replaces the path, so the room is the rest of the slot.
+    // Truncating a path silently is how a wrong path gets used.
+    let off = u64::from(m.slot_size()) - 64;
+    let at = off as usize;
+    m.slot(1)[at..at + link.path().len()].copy_from_slice(link.path().as_bytes());
+    assert_eq!(
+        m.run_one(&Sqe::path(KORU_OP_READLINK, 0x721, 1, off, n)),
+        -(ENAMETOOLONG.0 as i64),
+        "a target that does not fit"
+    );
+    m.assert_quiesced();
+}
+
+/// The whole inline-because-of-creds rule, for something other than `OPEN`.
+/// Deferred to a kworker every one of these would run as root in the initial
+/// namespaces and each refusal below would become a success.
+#[test]
+fn creds_an_unprivileged_path_op_is_refused() {
+    if !is_root() {
+        skip("path creds", "not root");
+        return;
+    }
+    let f = Scratch::new("pathcreds");
+    std::fs::write(f.path(), b"x").expect("fill");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(f.path(), PermissionsExt::from_mode(0o600)).expect("chmod");
+    }
+
+    let (uid, gid) = nobody_ids();
+    // The arena is VM_DONTCOPY, so the child maps it after the fork.
+    let ring = Ring::with_config(&SetupConfig::new(32, 64, 8192, 4, 8)).expect("SETUP");
+    let path = f.path().to_string();
+
+    let pid = unsafe { sys::fork() };
+    assert!(pid >= 0, "fork");
+    if pid == 0 {
+        let code = unsafe {
+            match ring.mmap() {
+                Err(_) => 2,
+                Ok(arena) => {
+                    sys::setgroups(0, std::ptr::null());
+                    if sys::setresgid(gid, gid, gid) != 0 || sys::setresuid(uid, uid, uid) != 0 {
+                        3
+                    } else if sys::geteuid() == 0 {
+                        4
+                    } else {
+                        let m = Mapped { ring, arena };
+                        let touch = KoruTimes {
+                            atime_nsec: KORU_UTIME_NOW,
+                            mtime_nsec: KORU_UTIME_NOW,
+                            ..KoruTimes::default()
+                        };
+                        let named = KoruTimes {
+                            atime_sec: 1,
+                            mtime_sec: 1,
+                            ..KoruTimes::default()
+                        };
+                        if truncate(&m, &path, 0) != -(EACCES.0 as i64) {
+                            5
+                        // Named times need ownership; a touch needs only write.
+                        } else if utimes(&m, &path, &named) != -(EPERM.0 as i64) {
+                            6
+                        } else if utimes(&m, &path, &touch) != -(EACCES.0 as i64) {
+                            7
+                        } else {
+                            0
+                        }
+                    }
+                }
+            }
+        };
+        unsafe { sys::_exit(code) };
+    }
+
+    let mut status = 0;
+    unsafe { sys::waitpid(pid, &mut status, 0) };
+    assert!(sys::wifexited(status), "the child died");
+    // 5 truncate, 6 named utimes, 7 touch.
+    assert_eq!(sys::wexitstatus(status), 0, "child verdict");
 }

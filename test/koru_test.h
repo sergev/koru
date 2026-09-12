@@ -84,6 +84,13 @@ void sqe_write(struct koru_sqe *s, uint32_t handle, uint32_t slot, uint64_t off,
                uint64_t user_data);
 void sqe_stat(struct koru_sqe *s, uint32_t handle, uint32_t slot, uint64_t off, uint32_t len,
               uint64_t user_data);
+/* A path op: path at (off, len), argument after it. `opcode` is one of
+ * KORU_OP_TRUNCATE, KORU_OP_UTIMES, KORU_OP_READLINK. */
+void sqe_path(struct koru_sqe *s, uint8_t opcode, uint32_t slot, uint64_t off, uint32_t len,
+              uint64_t user_data);
+/* Where a path op's argument goes: the first 8-aligned offset at or after the
+ * end of the path. The kernel computes the same thing. */
+uint64_t arg_offset(uint64_t off, uint32_t len);
 /* `target` is the user_data of the op to cancel. */
 void sqe_cancel(struct koru_sqe *s, uint64_t target, uint64_t user_data);
 
@@ -95,6 +102,13 @@ uint8_t pattern_byte(size_t i);
 /* Copy a path into a slot, without its NUL. Returns its length. */
 uint32_t put_path(uint8_t *arena, uint32_t slot_size, uint32_t slot, const char *path);
 
+/* Run one path op on a mapped ring: put `path` at slot offset 0, copy `arg`
+ * after it, submit, return its res. `arg` may be NULL. */
+int64_t r_path(struct koru_ring *r, uint8_t opcode, uint32_t slot, const char *path,
+               const void *arg, size_t argsize);
+
+/* MemFree from /proc/meminfo, in KB, or -1. */
+long mem_free_kb(void);
 /* Field 1 of /proc/sys/fs/file-nr: allocated struct file. */
 long file_nr(void);
 /* fput can be deferred to task work, so let it settle before sampling. */

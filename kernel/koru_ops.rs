@@ -7,6 +7,7 @@ use kernel::{
     bindings,
     cred::Credential,
     error::from_err_ptr,
+    ffi,
     fs::{File, LocalFile},
     impl_has_delayed_work, new_delayed_work,
     page::PAGE_SIZE,
@@ -18,7 +19,7 @@ use kernel::{
         Arc, ArcBorrow,
     },
     time::{msecs_to_jiffies, Jiffies},
-    transmute::AsBytes,
+    transmute::{AsBytes, FromBytes},
     types::Opaque,
     workqueue::{self, DelayedWork, HasWork, Work, WorkItem},
 };
@@ -27,6 +28,7 @@ use core::mem::offset_of;
 use core::ptr::NonNull;
 
 use crate::koru_abi::*;
+use crate::koru_path::{Link, Lookup, LOOKUP_FOLLOW};
 use crate::{module_get_live, module_put, RingCtx};
 
 /// Nanoseconds to jiffies, rounded up so a sub-millisecond delay still waits.
@@ -345,6 +347,8 @@ impl RingCtx {
             KORU_OP_ADOPT_FD => Some(me.adopt_op(ring, sqe)),
             KORU_OP_POLL_ADD => RingCtx::poll_op(me, sqe),
             KORU_OP_STAT => RingCtx::stat_op(me, sqe),
+            // Inline for `OPEN`'s reason, and permanently. See `path_op`.
+            KORU_OP_TRUNCATE | KORU_OP_UTIMES | KORU_OP_READLINK => Some(me.path_op(sqe)),
             KORU_OP_CANCEL => Some(me.cancel_op(sqe)),
             KORU_OP_CHECKSUM => {
                 if sqe.handle != 0 {
@@ -386,13 +390,18 @@ impl RingCtx {
     /// Byte offset of `sqe.off` within slot `sqe.slot`. Caller has already run
     /// [`check_range`](Self::check_range).
     fn slot_offset(&self, sqe: &Sqe) -> Result<usize> {
+        self.slot_pos(sqe.slot, sqe.off)
+    }
+
+    /// Byte offset of `off` within `slot`. Caller has bounds-checked both.
+    fn slot_pos(&self, slot: u32, off: u64) -> Result<usize> {
         let Some(cfg) = *self.config.lock() else {
             return Err(EINVAL);
         };
-        let base = u64::from(sqe.slot)
+        let base = u64::from(slot)
             .checked_mul(u64::from(cfg.slot_size))
             .ok_or(EINVAL)?
-            .checked_add(sqe.off)
+            .checked_add(off)
             .ok_or(EINVAL)?;
         usize::try_from(base).map_err(|_| EINVAL)
     }
@@ -455,6 +464,63 @@ impl RingCtx {
         Ok((hash & 0x7fff_ffff_ffff_ffff) as i64)
     }
 
+    /// Bounds-check a path argument, returning its arena offset. Before any
+    /// claim: `slot_try_acquire` does not bounds-check its own index.
+    fn path_validate(&self, sqe: &Sqe) -> Result<usize> {
+        self.check_range(sqe)?;
+        // Notes' second clamp: check_range only bounds by slot_size.
+        if sqe.len == 0 || sqe.len >= bindings::PATH_MAX {
+            return Err(EINVAL);
+        }
+        self.slot_offset(sqe)
+    }
+
+    /// Copy a path out of an already-claimed slot, terminate our own copy and
+    /// reject an embedded NUL. Never strlen in place, and never hand the VFS a
+    /// pointer into a mapped page.
+    fn copy_path(&self, pos: usize, len: usize) -> Result<KVec<u8>> {
+        let mut path = KVec::with_capacity(len + 1, GFP_KERNEL)?;
+        self.read_slot(pos, len, &mut path)?;
+        path.push(0u8, GFP_KERNEL)?;
+        CStr::from_bytes_with_nul(&path).map_err(|_| EINVAL)?;
+        Ok(path)
+    }
+
+    /// Where a path op's argument block starts: the first 8-aligned slot offset
+    /// at or after the end of the path. `EINVAL` if `size` bytes do not fit.
+    fn arg_offset(&self, sqe: &Sqe, size: usize) -> Result<u64> {
+        let Some(cfg) = *self.config.lock() else {
+            return Err(EINVAL);
+        };
+        let end = sqe.off.checked_add(u64::from(sqe.len)).ok_or(EINVAL)?;
+        let at = end.checked_add(7).ok_or(EINVAL)? & !7u64;
+        if at.checked_add(size as u64).ok_or(EINVAL)? > u64::from(cfg.slot_size) {
+            return Err(EINVAL);
+        }
+        Ok(at)
+    }
+
+    /// One claim over a path op's path and the argument after it, so the two
+    /// halves are one snapshot.
+    fn path_and_arg(&self, sqe: &Sqe, size: usize) -> Result<(KVec<u8>, KVec<u8>)> {
+        // Every path op names its file by path alone.
+        if sqe.handle != 0 {
+            return Err(EINVAL);
+        }
+        let pos = self.path_validate(sqe)?;
+        let apos = self.slot_pos(sqe.slot, self.arg_offset(sqe, size)?)?;
+
+        if !self.state.lock().slot_try_acquire(sqe.slot) {
+            return Err(EBUSY);
+        }
+        let mut arg = KVec::new();
+        let taken = self
+            .copy_path(pos, sqe.len as usize)
+            .and_then(|path| self.read_slot(apos, size, &mut arg).map(|()| path));
+        self.state.lock().slot_release(sqe.slot);
+        Ok((taken?, arg))
+    }
+
     /// `OPEN`: the path is `len` bytes at `off` in slot `slot`, and `handle`
     /// carries the `KORU_O_*` flags. Returns the new handle in `res`.
     fn open_op(&self, sqe: &Sqe) -> i64 {
@@ -466,27 +532,16 @@ impl RingCtx {
 
     fn do_open(&self, sqe: &Sqe) -> Result<u32> {
         let flags = open_flags(sqe.handle)?;
-
-        self.check_range(sqe)?;
-        // Notes' second clamp: check_range only bounds by slot_size.
-        if sqe.len == 0 || sqe.len >= bindings::PATH_MAX {
-            return Err(EINVAL);
-        }
-        let pos = self.slot_offset(sqe)?;
+        let pos = self.path_validate(sqe)?;
 
         // Claim the slot so nothing writes the page mid-copy, and release it as
         // soon as the snapshot is taken: filp_open can block on disk.
         if !self.state.lock().slot_try_acquire(sqe.slot) {
             return Err(EBUSY);
         }
-        let mut path = KVec::with_capacity(sqe.len as usize + 1, GFP_KERNEL)?;
-        let copied = self.read_slot(pos, sqe.len as usize, &mut path);
+        let path = self.copy_path(pos, sqe.len as usize);
         self.state.lock().slot_release(sqe.slot);
-        copied?;
-
-        // Terminate our own copy, then scan it. Never strlen in place, and
-        // never hand a pointer into a mapped page to the VFS.
-        path.push(0u8, GFP_KERNEL)?;
+        let path = path?;
         let cpath = CStr::from_bytes_with_nul(&path).map_err(|_| EINVAL)?;
 
         // SAFETY: `cpath` is NUL-terminated and lives across the call. Runs in
@@ -816,6 +871,112 @@ impl RingCtx {
         let n = core::cmp::min(sqe.len as usize, core::mem::size_of::<KoruStat>());
         self.write_slot(pos, &out.as_bytes()[..n])?;
         Ok((n as i64, statx_to_koru(ks.result_mask)))
+    }
+
+    /// The three path ops. `res` is 0, or a length for `READLINK`.
+    ///
+    /// **Inline, permanently**: in a kworker `current_cred()` is `init_cred`
+    /// and `current->fs` is the init root, and `override_creds` is not
+    /// exported. doc/Notes.md's finding 3.
+    fn path_op(&self, sqe: &Sqe) -> i64 {
+        let res = match sqe.opcode {
+            KORU_OP_TRUNCATE => self.do_truncate(sqe).map(|()| 0),
+            KORU_OP_UTIMES => self.do_utimes(sqe).map(|()| 0),
+            _ => self.do_readlink(sqe),
+        };
+        res.unwrap_or_else(|e| i64::from(e.to_errno()))
+    }
+
+    fn do_truncate(&self, sqe: &Sqe) -> Result<()> {
+        let (path, arg) = self.path_and_arg(sqe, core::mem::size_of::<u64>())?;
+        let length = u64::from_bytes_copy(&arg).ok_or(EINVAL)?;
+        // `loff_t` is signed; a negative length is not a length. Same rule as
+        // `READ` and `WRITE` apply to their file offsets.
+        if length > i64::MAX as u64 {
+            return Err(EINVAL);
+        }
+        let cpath = CStr::from_bytes_with_nul(&path).map_err(|_| EINVAL)?;
+        let p = Lookup::new(cpath, LOOKUP_FOLLOW)?;
+
+        // SAFETY: `p` holds the path across the call. No `mnt_want_write`:
+        // `vfs_truncate` takes it, and permission-checks, itself.
+        let ret = unsafe { bindings::vfs_truncate(p.as_ptr(), length as i64) };
+        if ret < 0 {
+            return Err(Error::from_errno(ret));
+        }
+        Ok(())
+    }
+
+    fn do_utimes(&self, sqe: &Sqe) -> Result<()> {
+        let (path, arg) = self.path_and_arg(sqe, core::mem::size_of::<KoruTimes>())?;
+        let t = KoruTimes::from_bytes_copy(&arg).ok_or(EINVAL)?;
+
+        // Pair by pair, never a transmute: `tv_nsec` is a `long`.
+        let mut times = [
+            bindings::timespec64 {
+                tv_sec: t.atime_sec,
+                tv_nsec: ffi::c_long::try_from(t.atime_nsec).map_err(|_| EINVAL)?,
+            },
+            bindings::timespec64 {
+                tv_sec: t.mtime_sec,
+                tv_nsec: ffi::c_long::try_from(t.mtime_nsec).map_err(|_| EINVAL)?,
+            },
+        ];
+
+        let cpath = CStr::from_bytes_with_nul(&path).map_err(|_| EINVAL)?;
+        let p = Lookup::new(cpath, LOOKUP_FOLLOW)?;
+
+        // SAFETY: `p` holds the path and `times` outlives the call.
+        // `vfs_utimes` validates the nanoseconds, sentinels included, and takes
+        // `mnt_want_write` itself.
+        let ret = unsafe { bindings::vfs_utimes(p.as_ptr(), times.as_mut_ptr()) };
+        if ret < 0 {
+            return Err(Error::from_errno(ret));
+        }
+        Ok(())
+    }
+
+    /// `READLINK`. Not `vfs_readlink`, whose buffer is a `char __user *`.
+    fn do_readlink(&self, sqe: &Sqe) -> Result<i64> {
+        if sqe.handle != 0 {
+            return Err(EINVAL);
+        }
+        let pos = self.path_validate(sqe)?;
+        let Some(cfg) = *self.config.lock() else {
+            return Err(EINVAL);
+        };
+        // The answer replaces the path, so the room is the rest of the slot.
+        let room = (u64::from(cfg.slot_size) - sqe.off) as usize;
+
+        // Held for the whole op, unlike `OPEN`'s: the answer goes back into
+        // the slot the path came out of.
+        if !self.state.lock().slot_try_acquire(sqe.slot) {
+            return Err(EBUSY);
+        }
+        let done = self.readlink_held(sqe, pos, room);
+        self.state.lock().slot_release(sqe.slot);
+        done
+    }
+
+    fn readlink_held(&self, sqe: &Sqe, pos: usize, room: usize) -> Result<i64> {
+        let path = self.copy_path(pos, sqe.len as usize)?;
+        let cpath = CStr::from_bytes_with_nul(&path).map_err(|_| EINVAL)?;
+
+        // No `LOOKUP_FOLLOW`: following the final symlink is what this op
+        // must not do.
+        let p = Lookup::new(cpath, 0)?;
+        let link = Link::get(p.dentry())?;
+        let target = link.bytes();
+
+        // Truncating a path silently is how a wrong path gets used.
+        if target.len() + 1 > room {
+            return Err(enametoolong());
+        }
+        let mut out = KVec::with_capacity(target.len() + 1, GFP_KERNEL)?;
+        out.extend_from_slice(target, GFP_KERNEL)?;
+        out.push(0u8, GFP_KERNEL)?;
+        self.write_slot(pos, &out)?;
+        Ok(target.len() as i64)
     }
 
     /// `ADOPT_FD`: a handle for an already-open descriptor.

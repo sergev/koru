@@ -148,6 +148,8 @@ int main()
     konst("KORU_STAT_CTIME", "u64", KORU_STAT_CTIME);
     konst("KORU_STAT_BTIME", "u64", KORU_STAT_BTIME);
     konst("KORU_STAT_ALL", "u64", KORU_STAT_ALL);
+    konst("KORU_UTIME_NOW", "i64", (unsigned long long)KORU_UTIME_NOW);
+    konst("KORU_UTIME_OMIT", "i64", (unsigned long long)KORU_UTIME_OMIT);
 
 #define IOCTL(name)                                                     \
     do {                                                                \
@@ -175,6 +177,9 @@ int main()
     OPCODE(KORU_OP_ADOPT_FD);
     OPCODE(KORU_OP_POLL_ADD);
     OPCODE(KORU_OP_STAT);
+    OPCODE(KORU_OP_TRUNCATE);
+    OPCODE(KORU_OP_UTIMES);
+    OPCODE(KORU_OP_READLINK);
 #undef OPCODE
 
     {
@@ -259,6 +264,14 @@ int main()
         FIELD(koru_stat, btime_nsec, "u64");
         FIELD(koru_stat, reserved, "u64[12]");
         END_FIELDS(koru_stat);
+    }
+    {
+        BEGIN_FIELDS();
+        FIELD(koru_times, atime_sec, "i64");
+        FIELD(koru_times, atime_nsec, "i64");
+        FIELD(koru_times, mtime_sec, "i64");
+        FIELD(koru_times, mtime_nsec, "i64");
+        END_FIELDS(koru_times);
     }
 
     // Evaluated vectors, so the const fns and the C macros are diffed too.

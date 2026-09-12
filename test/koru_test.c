@@ -292,6 +292,18 @@ int64_t r_write(struct koru_ring *r, uint32_t handle, uint32_t slot, uint64_t of
     return run_one(r->fd, &s);
 }
 
+int64_t r_path(struct koru_ring *r, uint8_t opcode, uint32_t slot, const char *path,
+               const void *arg, size_t argsize)
+{
+    struct koru_sqe s;
+    uint32_t n = put_path(r->arena, r->slot_size, slot, path);
+
+    if (arg && argsize)
+        memcpy(r->arena + (size_t)slot * r->slot_size + arg_offset(0, n), arg, argsize);
+    sqe_path(&s, opcode, slot, 0, n, 0x106);
+    return run_one(r->fd, &s);
+}
+
 int64_t r_stat(struct koru_ring *r, uint32_t handle, uint32_t slot, uint64_t off, uint32_t len,
                uint64_t *extra)
 {
@@ -407,6 +419,22 @@ void sqe_stat(struct koru_sqe *s, uint32_t handle, uint32_t slot, uint64_t off, 
     s->user_data = user_data;
 }
 
+void sqe_path(struct koru_sqe *s, uint8_t opcode, uint32_t slot, uint64_t off, uint32_t len,
+              uint64_t user_data)
+{
+    memset(s, 0, sizeof(*s));
+    s->opcode    = opcode;
+    s->slot      = slot;
+    s->off       = off;
+    s->len       = len;
+    s->user_data = user_data;
+}
+
+uint64_t arg_offset(uint64_t off, uint32_t len)
+{
+    return (off + len + 7) & ~(uint64_t)7;
+}
+
 void sqe_cancel(struct koru_sqe *s, uint64_t target, uint64_t user_data)
 {
     memset(s, 0, sizeof(*s));
@@ -455,6 +483,21 @@ uint32_t put_path(uint8_t *arena, uint32_t slot_size, uint32_t slot, const char 
     memset(arena + (size_t)slot * slot_size, 0, slot_size);
     memcpy(arena + (size_t)slot * slot_size, path, n);
     return (uint32_t)n;
+}
+
+long mem_free_kb(void)
+{
+    char line[256];
+    FILE *f   = fopen("/proc/meminfo", "r");
+    long kb   = -1;
+
+    if (!f)
+        return -1;
+    while (fgets(line, sizeof(line), f))
+        if (sscanf(line, "MemFree: %ld kB", &kb) == 1)
+            break;
+    fclose(f);
+    return kb;
 }
 
 long file_nr(void)

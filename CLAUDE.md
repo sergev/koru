@@ -5,15 +5,15 @@ code in this repository.
 
 ## State of the repository
 
-**T0–T23 are done: Braam's hello world runs through koru, and the ring can
+**T0–T24 are done: Braam's hello world runs through koru, and the ring can
 wait for a descriptor.** The module registers `/dev/koru`, configures a ring
 with `SETUP`, and submits `NOP`, `DELAY_NS`, `CHECKSUM`, `OPEN`, `READ`,
-`WRITE`, `CLOSE`, `CANCEL`, `ADOPT_FD`, `POLL_ADD` and `STAT` through `ENTER`,
-which blocks for completions. The arena is mmap'd, with slot exclusivity
-enforced by the kernel. Open files live in a generational handle table. A queued
-op can be genuinely dequeued, and `close(fd)` cancels whatever is still queued.
-The whole validation surface has been fuzzed under KASAN, lockdep and
-kmemleak.
+`WRITE`, `CLOSE`, `CANCEL`, `ADOPT_FD`, `POLL_ADD`, `STAT`, `TRUNCATE`,
+`UTIMES` and `READLINK` through `ENTER`, which blocks for completions. The arena
+is mmap'd, with slot exclusivity enforced by the kernel. Open files live in a
+generational handle table. A queued op can be genuinely dequeued, and
+`close(fd)` cancels whatever is still queued. The whole validation surface has
+been fuzzed under KASAN, lockdep and kmemleak.
 
 T13 added `rust/sys`: the ABI mirror, the ioctl wrappers, `Ring`, `Arena`,
 `BufPool` and the errno table, with the T4–T11 matrix re-expressed as Rust
@@ -90,6 +90,19 @@ into `scripts/koru-debug.config`: with it off, `from_kgid` is unreachable from
 Rust and the namespace handling cannot be shown to be wrong. doc/Notes.md has
 the nine perturbations, one of which passed until the mask was redesigned.
 
+T24 added the path operations `TRUNCATE`, `UTIMES` and `READLINK`, and
+`kernel/koru_path.rs` with them: `kern_path` and the `LOOKUP_*` flags are
+missing from `bindings::` and `do_delayed_call` is a static inline, so that file
+holds every hand-declared prototype, each quoting its header. **Nothing checks
+it** — re-read it on every kernel bump. All three ops are inline for `OPEN`'s
+creds reason, and deferring one to the workqueue is now a regression test rather
+than an argument. Every path op names its path the way `OPEN` does, with any
+argument following it in the slot 8-aligned; the plan's `off`-is-the-length idea
+was not taken. `Lookup` and `Link` are `Drop` guards for `path_put` and
+`do_delayed_call`; the `mnt_want_write` guard the plan asked for is not needed
+until T26. doc/Notes.md has the seven perturbations and why kmemleak is the
+wrong instrument for the one leak here.
+
 T14 made the two userspace ABI mirrors a diff rather than a promise.
 `cpp/include/koru_abi.h` and `cpp/include/koru_errno.h` are the C mirrors,
 shared with `test/`, and an `abi_dump` on each side emits a canonical record
@@ -103,8 +116,10 @@ its fastest gate: no VM, no device, no module.
   tasks are deleted from it, not marked.
 - `README.md` — the short explanation of the idea.
 - `kernel/` — the out-of-tree Rust module. `koru_abi.rs` is the canonical wire
-  format; `koru.rs` holds the device, the ring state and the `ENTER` path, and
-  `koru_ops.rs` holds opcode dispatch, the op implementations and `OpWork`.
+  format; `koru.rs` holds the device, the ring state and the `ENTER` path,
+  `koru_ops.rs` holds opcode dispatch, the op implementations and `OpWork`, and
+  `koru_path.rs` holds the hand-declared C prototypes and the `Drop` guards the
+  path operations need.
 - `test/` — `koru_check`, the one integrated test for the module. It includes
   the C ABI mirror from `cpp/include/` and keeps no copy. See Commands.
 - `rust/` — the Cargo workspace. **Directories are named by role and packages
@@ -191,7 +206,7 @@ survived**.
 
 ## Commands
 
-These work today (T0 through T23):
+These work today (T0 through T24):
 
 ```sh
 KDIR=../kernel-dev/linux-source-7.1

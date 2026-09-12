@@ -138,6 +138,23 @@ pub const KORU_OP_POLL_ADD: u8 = 9;
 /// fields the filesystem actually reported.
 pub const KORU_OP_STAT: u8 = 10;
 
+// Path operations. Every one names its path the way `OPEN` does: `len` bytes at
+// `off` in slot `slot`, with `handle` zero. An argument that does not fit in the
+// SQE follows the path in the same slot, at the first 8-aligned offset at or
+// after its end.
+
+/// Set the length of the file the path names. The argument is a `u64`, the new
+/// length; `res` is 0. Follows a final symlink, as `truncate(2)` does.
+pub const KORU_OP_TRUNCATE: u8 = 11;
+/// Set the access and modification times of the file the path names. The
+/// argument is a [`KoruTimes`]; `res` is 0. Follows a final symlink.
+pub const KORU_OP_UTIMES: u8 = 12;
+/// Read the symlink the path names. No argument: the target **replaces the path
+/// it was given**, NUL-terminated, at `off` in the same slot, and `res` is its
+/// length without the NUL. Does not follow a final symlink. `ENAMETOOLONG` if it
+/// does not fit in the rest of the slot.
+pub const KORU_OP_READLINK: u8 = 13;
+
 /// Any bit set is rejected.
 pub const KORU_SQE_FLAGS_ALL: u8 = 0;
 
@@ -405,6 +422,37 @@ const _: () = assert!(core::mem::offset_of!(KoruStat, ctime_nsec) == 136);
 const _: () = assert!(core::mem::offset_of!(KoruStat, btime_sec) == 144);
 const _: () = assert!(core::mem::offset_of!(KoruStat, btime_nsec) == 152);
 const _: () = assert!(core::mem::offset_of!(KoruStat, reserved) == 160);
+
+// ---------------------------------------------------------------------------
+// Times
+// ---------------------------------------------------------------------------
+
+// Nanosecond sentinels, checked by the kernel itself. Same values everywhere,
+// so they pass through like the `S_IF*` ones.
+
+/// Set this timestamp to now, ignoring the seconds field.
+pub const KORU_UTIME_NOW: i64 = (1 << 30) - 1;
+/// Leave this timestamp alone.
+pub const KORU_UTIME_OMIT: i64 = (1 << 30) - 2;
+
+/// `UTIMES`' argument, two `(seconds, nanoseconds)` pairs. 32 bytes, no padding.
+#[repr(C)]
+#[derive(Copy, Clone, Default, Debug, PartialEq, Eq)]
+pub struct KoruTimes {
+    /// Seconds since the epoch; signed, because a date before 1970 is a date.
+    pub atime_sec: i64,
+    /// Nanoseconds, or one of the `KORU_UTIME_*` sentinels.
+    pub atime_nsec: i64,
+    pub mtime_sec: i64,
+    pub mtime_nsec: i64,
+}
+
+const _: () = assert!(size_of::<KoruTimes>() == 32);
+const _: () = assert!(align_of::<KoruTimes>() == 8);
+const _: () = assert!(core::mem::offset_of!(KoruTimes, atime_sec) == 0);
+const _: () = assert!(core::mem::offset_of!(KoruTimes, atime_nsec) == 8);
+const _: () = assert!(core::mem::offset_of!(KoruTimes, mtime_sec) == 16);
+const _: () = assert!(core::mem::offset_of!(KoruTimes, mtime_nsec) == 24);
 
 // ---------------------------------------------------------------------------
 // Handles
