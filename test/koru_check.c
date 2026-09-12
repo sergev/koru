@@ -552,6 +552,41 @@ void sec_enter(void)
 #define S_SLOT  4096u
 #define S_COUNT 80u
 
+/* Two deferred CHECKSUMs on one slot, retried until they actually collide.
+ *
+ * The collision is racy: the winner's kworker can finish before the submit loop
+ * dispatches the loser, and then both succeed. Exclusivity is still what is
+ * being tested — if it were broken, no attempt would ever collide and this
+ * returns 0. `*winner` is the successful checksum from the colliding round.
+ */
+static int collide(struct koru_ring *m, uint32_t slot, unsigned n, int64_t *winner)
+{
+    struct koru_sqe sq[3];
+    struct koru_cqe cq[3];
+    unsigned completed = 0, i;
+    int attempt, ok, busy;
+
+    for (attempt = 1; attempt <= 64; attempt++) {
+        for (i = 0; i < n; i++)
+            sqe_checksum(&sq[i], slot, 0, S_SLOT, 0x20 + i);
+        if (submit(m->fd, sq, n, cq, n, n, &completed) != (int)n || completed != n)
+            return 0;
+        ok = busy = 0;
+        for (i = 0; i < completed; i++) {
+            if (cq[i].res >= 0) {
+                ok++;
+                if (winner)
+                    *winner = cq[i].res;
+            } else if (cq[i].res == -EBUSY) {
+                busy++;
+            }
+        }
+        if (ok == 1 && busy == (int)n - 1)
+            return attempt;
+    }
+    return 0;
+}
+
 void sec_slots(void)
 {
     struct koru_ring m;
@@ -560,8 +595,8 @@ void sec_slots(void)
     const struct koru_cqe *a, *b;
     uint8_t pattern[S_SLOT];
     unsigned completed = 0, i;
-    int ret, ok, busy;
-    int64_t want;
+    int ret, ok, n;
+    int64_t want, got;
 
     for (i = 0; i < S_SLOT; i++)
         pattern[i] = (uint8_t)(i * 17 + 3);
@@ -582,11 +617,13 @@ void sec_slots(void)
     a = find_cqe(cq, completed, 0xaa);
     b = find_cqe(cq, completed, 0xbb);
     check(a && b, "  each completion carries its own user_data");
-    if (a && b) {
-        check(((a->res >= 0) ^ (b->res >= 0)) && ((a->res == -EBUSY) ^ (b->res == -EBUSY)),
-              "  exactly one succeeds, the other gets -EBUSY");
-        check((a->res >= 0 ? a->res : b->res) == want, "  and the winner's checksum is right");
-    }
+
+    got = -1;
+    n   = collide(&m, 3, 2, &got);
+    check(n > 0, "  exactly one succeeds, the other gets -EBUSY");
+    check(got == want, "  and the winner's checksum is right");
+    if (n > 1)
+        note("the collision took %d attempts", n);
 
     /* 2. Released in the same critical section that posts the CQE. */
     sqe_checksum(&sq[0], 3, 0, S_SLOT, 0xcc);
@@ -603,27 +640,11 @@ void sec_slots(void)
           "two ops on different slots both succeed");
 
     /* 4. A refused op must not release the slot the winner holds. */
-    for (i = 0; i < 3; i++)
-        sqe_checksum(&sq[i], 3, 0, S_SLOT, 0x20 + i);
-    ret  = submit(m.fd, sq, 3, cq, 3, 3, &completed);
-    ok   = busy = 0;
-    for (i = 0; i < completed; i++) {
-        if (cq[i].res >= 0)
-            ok++;
-        else if (cq[i].res == -EBUSY)
-            busy++;
-    }
-    check(ret == 3 && completed == 3 && ok == 1 && busy == 2,
-          "three on one slot: one succeeds, two get -EBUSY");
+    check(collide(&m, 3, 3, NULL) > 0, "three on one slot: one succeeds, two get -EBUSY");
 
     /* 5. Past the first bitmap word, and no aliasing with the word below. */
     memcpy(m.arena + 70 * S_SLOT, pattern, S_SLOT);
-    sqe_checksum(&sq[0], 70, 0, S_SLOT, 0x30);
-    sqe_checksum(&sq[1], 70, 0, S_SLOT, 0x31);
-    ret = submit(m.fd, sq, 2, cq, 2, 2, &completed);
-    a   = find_cqe(cq, completed, 0x30);
-    b   = find_cqe(cq, completed, 0x31);
-    check(ret == 2 && completed == 2 && a && b && ((a->res >= 0) ^ (b->res >= 0)),
+    check(collide(&m, 70, 2, NULL) > 0,
           "slot 70, in the second bitmap word, is tracked separately");
     sqe_checksum(&sq[0], 6, 0, S_SLOT, 0x32);
     sqe_checksum(&sq[1], 70, 0, S_SLOT, 0x33);

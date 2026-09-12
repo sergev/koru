@@ -880,6 +880,26 @@ Note also that the bitmap is a whole number of 64-bit words, so with a small
 missing check. Probing past the word boundary is what makes the hole visible,
 which is why the fuzzer generates slots past 64 and near `u32::MAX`.
 
+**Observing a collision is racy, and the test used to assume it was not.** Two
+`CHECKSUM`s naming one slot are dispatched one after the other inside a single
+submit loop, but the winner's kworker can run on another CPU and post its
+completion — releasing the slot — before the loser is dispatched. Both then
+succeed and an exclusive-or assertion fails. It is rare: once in about thirteen
+full runs, and never in twelve targeted ones, which is exactly the frequency
+that gets mistaken for cosmic rays.
+
+Three assertions in `sec_slots` made that assumption. They now retry, up to
+sixty-four times, and assert that a collision was observed at least once. That
+is what the suite already does for every other racy property, and it keeps the
+teeth: with `slot_try_acquire` forced to always succeed, no attempt collides and
+all three fail. In practice the first attempt lands, so the loop costs nothing
+and prints an attempt count only when it does not.
+
+There is no deterministic fix available. Nothing userspace can submit holds a
+slot for a controllable length of time: `DELAY_NS` holds none, and a blocking
+`READ` would wedge a kworker. The window cannot be forced open, so asserting a
+floor over repeated attempts is the honest shape for this claim.
+
 ### The tests live in the repo now
 
 They used to sit next to the kernel tree, outside version control, which is how
