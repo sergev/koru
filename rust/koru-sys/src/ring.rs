@@ -101,6 +101,13 @@ impl From<EnterError> for io::Error {
     }
 }
 
+/// Drops the writeback: keep the `EnterError` itself to resubmit.
+impl From<EnterError> for crate::error::Error {
+    fn from(e: EnterError) -> crate::error::Error {
+        crate::error::Error::from_errno(e.errno)
+    }
+}
+
 impl std::fmt::Display for EnterError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "ENTER: {:?}, {:?}", self.errno, self.progress)

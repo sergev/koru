@@ -2,8 +2,9 @@
 
 //! Errnos, and the table mapping them onto Braam's fifteen names.
 //!
-//! T20 adds the `Result` alias, the `?` conversions and the Braam aliases in
-//! the `koru` crate, re-exporting [`Error`] rather than defining a second type.
+//! The `Result` alias and the Braam type aliases are the `koru` crate's, which
+//! re-exports [`Error`] rather than defining a second type. The `?`
+//! conversions are here because the orphan rule puts them beside the type.
 
 use std::fmt;
 use std::io;
@@ -129,6 +130,48 @@ pub enum Kind {
     NotEmpty = 13,
     Loop = 14,
     Intr = 15,
+}
+
+/// The fifteen, in wire order. `abi_dump` walks this rather than its own list.
+pub const KINDS: [Kind; 15] = [
+    Kind::Invalid,
+    Kind::NoMemory,
+    Kind::NotFound,
+    Kind::Exists,
+    Kind::NotDir,
+    Kind::IsDir,
+    Kind::Perm,
+    Kind::Io,
+    Kind::Cancelled,
+    Kind::Again,
+    Kind::Unsupported,
+    Kind::Closed,
+    Kind::NotEmpty,
+    Kind::Loop,
+    Kind::Intr,
+];
+
+impl Kind {
+    /// Braam's `error_name`, word for word. Prose, so not in the ABI dump.
+    pub fn name(self) -> &'static str {
+        match self {
+            Kind::Invalid => "invalid",
+            Kind::NoMemory => "out of memory",
+            Kind::NotFound => "not found",
+            Kind::Exists => "already exists",
+            Kind::NotDir => "not a directory",
+            Kind::IsDir => "is a directory",
+            Kind::Perm => "permission denied",
+            Kind::Io => "i/o error",
+            Kind::Cancelled => "cancelled",
+            Kind::Again => "try again",
+            Kind::Unsupported => "unsupported",
+            Kind::Closed => "closed",
+            Kind::NotEmpty => "directory not empty",
+            Kind::Loop => "too many symbolic links",
+            Kind::Intr => "interrupted",
+        }
+    }
 }
 
 /// One row: an errno, its name, the vocabulary name, and where it comes from.
@@ -351,6 +394,15 @@ impl Error {
         }
     }
 
+    /// The one name with no errno preimage; raw 0 means synthesised here.
+    /// The only such constructor, on purpose. doc/Notes.md says why.
+    pub fn closed() -> Error {
+        Error {
+            kind: Kind::Closed,
+            raw: Errno(0),
+        }
+    }
+
     pub fn kind(self) -> Kind {
         self.kind
     }
@@ -359,11 +411,55 @@ impl Error {
     pub fn raw(self) -> Errno {
         self.raw
     }
+
+    /// Braam's `e == Error::Cancelled`. `==` between two `Error`s compares
+    /// the raw errno too, which keeps EBUSY and EALREADY distinct.
+    pub fn is(self, kind: Kind) -> bool {
+        self.kind == kind
+    }
 }
 
 impl From<Errno> for Error {
     fn from(e: Errno) -> Error {
         Error::from_errno(e)
+    }
+}
+
+/// So `err == Kind::Cancelled` reads as it does in Braam.
+impl PartialEq<Kind> for Error {
+    fn eq(&self, other: &Kind) -> bool {
+        self.kind == *other
+    }
+}
+
+impl PartialEq<Error> for Kind {
+    fn eq(&self, other: &Error) -> bool {
+        *self == other.kind
+    }
+}
+
+/// `?` from any ordinary POSIX call. One carrying no errno becomes `Io` with
+/// raw 0; every real errno round-trips.
+impl From<io::Error> for Error {
+    fn from(e: io::Error) -> Error {
+        match e.raw_os_error() {
+            Some(n) if n > 0 => Error::from_errno(Errno(n)),
+            _ => Error {
+                kind: Kind::Io,
+                raw: Errno(0),
+            },
+        }
+    }
+}
+
+impl From<Error> for io::Error {
+    fn from(e: Error) -> io::Error {
+        if e.raw.0 == 0 {
+            // Only Closed gets here.
+            io::Error::new(io::ErrorKind::UnexpectedEof, e)
+        } else {
+            e.raw.as_io()
+        }
     }
 }
 
@@ -375,7 +471,12 @@ impl fmt::Debug for Error {
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.raw)
+        // The OS message where there is one; it says more than the name.
+        if self.raw.0 == 0 {
+            write!(f, "{}", self.kind.name())
+        } else {
+            write!(f, "{}", self.raw)
+        }
     }
 }
 
@@ -442,6 +543,52 @@ mod tests {
         assert_eq!(odd.name(), None);
         assert_eq!(Error::from_errno(odd).kind(), Kind::Io);
         assert_eq!(Error::from_errno(odd).raw(), odd);
+    }
+
+    #[test]
+    fn the_fifteen_names_are_braams_own_wording_and_are_distinct() {
+        assert_eq!(KINDS.len(), 15);
+        let mut words = HashSet::new();
+        for k in KINDS {
+            assert!(words.insert(k.name()), "{k:?} shares a phrase");
+            assert!(!k.name().is_empty());
+        }
+        // Spot-checked against Braam's error_name, which is the source.
+        assert_eq!(Kind::NotFound.name(), "not found");
+        assert_eq!(Kind::NoMemory.name(), "out of memory");
+        assert_eq!(Kind::Loop.name(), "too many symbolic links");
+        assert_eq!(Kind::Intr.name(), "interrupted");
+    }
+
+    #[test]
+    fn closed_is_the_one_name_synthesised_rather_than_mapped() {
+        let e = Error::closed();
+        assert_eq!(e.kind(), Kind::Closed);
+        assert_eq!(e.raw(), Errno(0), "no errno preimage");
+        assert_eq!(e.to_string(), "closed");
+        assert!(e.is(Kind::Closed));
+    }
+
+    #[test]
+    fn an_error_compares_against_a_bare_name() {
+        let e = Error::from_errno(ECANCELED);
+        assert_eq!(e, Kind::Cancelled);
+        assert_eq!(Kind::Cancelled, e);
+        assert_ne!(e, Kind::Intr);
+        // Two errnos sharing a name are still two errors.
+        assert_ne!(Error::from_errno(EBUSY), Error::from_errno(EALREADY));
+    }
+
+    #[test]
+    fn io_error_converts_both_ways() {
+        let e = Error::from_errno(ENOENT);
+        let io: io::Error = e.into();
+        assert_eq!(io.raw_os_error(), Some(ENOENT.0));
+        assert_eq!(Error::from(io), e);
+        // No errno at all: Io, and honest about having no raw value.
+        let other = Error::from(io::Error::other("not a syscall"));
+        assert_eq!(other.kind(), Kind::Io);
+        assert_eq!(other.raw(), Errno(0));
     }
 
     #[test]

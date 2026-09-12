@@ -21,7 +21,7 @@ use koru_sys::abi::{
     KORU_OP_CHECKSUM, KORU_OP_CLOSE, KORU_OP_DELAY_NS, KORU_OP_NOP, KORU_OP_OPEN, KORU_OP_READ,
     KORU_OP_WRITE, KORU_OPEN_FLAGS_ALL, KORU_SETUP_FLAGS_ALL, KORU_SQE_FLAGS_ALL,
 };
-use koru_sys::error::{KORU_ERRNOS, Kind};
+use koru_sys::error::{KINDS, KORU_ERRNOS};
 use koru_sys::ring::DEV_KORU;
 use koru_sys::sys::{KORU_IOC_ENTER, KORU_IOC_GET_PARAMS, KORU_IOC_SETUP};
 use std::fmt::Write as _;
@@ -402,24 +402,9 @@ fn main() {
         c.handles += 1;
     }
 
-    // Closed has no errno preimage, so only this loop emits it.
-    for k in [
-        Kind::Invalid,
-        Kind::NoMemory,
-        Kind::NotFound,
-        Kind::Exists,
-        Kind::NotDir,
-        Kind::IsDir,
-        Kind::Perm,
-        Kind::Io,
-        Kind::Cancelled,
-        Kind::Again,
-        Kind::Unsupported,
-        Kind::Closed,
-        Kind::NotEmpty,
-        Kind::Loop,
-        Kind::Intr,
-    ] {
+    // Closed has no errno preimage, so only this loop emits it. KINDS is the
+    // table the vocabulary itself walks, not a second list to keep in step.
+    for k in KINDS {
         let _ = writeln!(out, "kind {k:?} {}", k as u8);
         c.kinds += 1;
     }

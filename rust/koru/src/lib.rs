@@ -14,6 +14,7 @@ mod future;
 mod op;
 mod reactor;
 mod slab;
+mod vocab;
 
 pub use combinator::{Either, race};
 pub use exec::Runtime;
@@ -21,7 +22,7 @@ pub use future::{BufResult, Checksum, Close, Delay, Handle, Nop, Open, Read};
 pub use reactor::Stats;
 pub use slab::Cookie;
 
-// The vocabulary is koru-sys's, unchanged. T20 adds the `Result` alias and the
-// Braam aliases over this same `Error`, never a second type.
-pub use koru_sys::error::{Errno, Error, Kind};
+// Braam's vocabulary over koru-sys's own `Error`, never a second type.
+pub use vocab::{Errno, Error, KINDS, Kind, Result, Span, SpanMut, Str};
+
 pub use koru_sys::{BufPool, BufSlot, Ring, SetupConfig};

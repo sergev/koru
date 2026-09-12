@@ -8,7 +8,8 @@
 use crate::exec::Runtime;
 use crate::reactor::Inner;
 use crate::slab::Cookie;
-use koru_sys::error::{Error, from_res};
+use crate::vocab::{Error, Result};
+use koru_sys::error::from_res;
 use koru_sys::{BufSlot, Sqe};
 use std::future::Future;
 use std::pin::Pin;
@@ -16,7 +17,7 @@ use std::rc::Rc;
 use std::task::{Context, Poll};
 
 /// A result that gives the slot back either way.
-pub type BufResult<T> = (Result<T, Error>, BufSlot);
+pub type BufResult<T> = (Result<T>, BufSlot);
 
 /// An open file, `(index, generation)` as the kernel encodes it. Its drop
 /// closes nothing: a destructor cannot await.
@@ -71,7 +72,7 @@ pub struct Nop {
 }
 
 impl Future for Nop {
-    type Output = Result<(), Error>;
+    type Output = Result<()>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let me = self.get_mut();
@@ -93,7 +94,7 @@ pub struct Delay {
 }
 
 impl Future for Delay {
-    type Output = Result<(), Error>;
+    type Output = Result<()>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let me = self.get_mut();
@@ -117,7 +118,7 @@ pub struct Close {
 }
 
 impl Future for Close {
-    type Output = Result<(), Error>;
+    type Output = Result<()>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let me = self.get_mut();

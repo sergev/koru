@@ -5,14 +5,14 @@ code in this repository.
 
 ## State of the repository
 
-**T0–T19 are done: the kernel reached stdout and Phase 5 is finished.**
-The module registers `/dev/koru`, configures a ring with `SETUP`, and submits
-`NOP`, `DELAY_NS`, `CHECKSUM`, `OPEN`, `READ`, `WRITE`, `CLOSE` and `CANCEL`
-through `ENTER`, which blocks for completions. The arena is mmap'd, with slot
-exclusivity enforced by the kernel. Open files live in a generational handle
-table. A queued op can be genuinely dequeued, and `close(fd)` cancels whatever
-is still queued. The whole validation surface has been fuzzed under KASAN,
-lockdep and kmemleak.
+**T0–T20 are done: the kernel reached stdout and the Braam surface has
+started.** The module registers `/dev/koru`, configures a ring with `SETUP`,
+and submits `NOP`, `DELAY_NS`, `CHECKSUM`, `OPEN`, `READ`, `WRITE`, `CLOSE`
+and `CANCEL` through `ENTER`, which blocks for completions. The arena is
+mmap'd, with slot exclusivity enforced by the kernel. Open files live in a
+generational handle table. A queued op can be genuinely dequeued, and
+`close(fd)` cancels whatever is still queued. The whole validation surface has
+been fuzzed under KASAN, lockdep and kmemleak.
 
 T13 added `rust/koru-sys`: the ABI mirror, the ioctl wrappers, `Ring`, `Arena`,
 `BufPool` and the errno table, with the T4–T11 matrix re-expressed as Rust
@@ -51,6 +51,13 @@ root-only descriptor its parent opened. Adopting any koru fd is `ELOOP`, which
 is why the ring's own `&File` is threaded into `dispatch`; without it `rmmod`
 never succeeds again.
 
+T20 opened the Braam surface with the vocabulary: `koru::vocab` re-exports
+`koru-sys`'s `Error`, `Kind` and `Errno`, adds `Result`, `Str`, `Span` and
+`SpanMut`, and the `?` conversions from `Errno`, `io::Error` and `EnterError`.
+Those impls are in `koru-sys`, because the orphan rule allows them nowhere
+else. `Error::closed()` is the only name userspace synthesises, and Rust's `?`
+is all four of Braam's `TRY` macros.
+
 T14 made the two userspace ABI mirrors a diff rather than a promise.
 `cpp/include/koru_abi.h` and `cpp/include/koru_errno.h` are the C mirrors,
 shared with `test/`, and an `abi_dump` on each side emits a canonical record
@@ -69,7 +76,8 @@ its fastest gate: no VM, no device, no module.
 - `test/` — `koru_check`, the one integrated test for the module. It includes
   the C ABI mirror from `cpp/include/` and keeps no copy. See Commands.
 - `rust/` — the Cargo workspace. `koru-sys` is the raw binding; `koru` holds
-  the futures, the executor and, from T20 on, the Braam surface.
+  the futures, the executor and the Braam surface, which starts at
+  `koru/src/vocab.rs`.
 - `cpp/` — the C ABI mirrors and `abi_dump`, built by the top-level
   `CMakeLists.txt`. The binding itself arrives at T39.
 - `scripts/` — the guest-side check and the host-side runner that boots the VM,
@@ -142,7 +150,7 @@ survived**.
 
 ## Commands
 
-These work today (T0 through T19):
+These work today (T0 through T20):
 
 ```sh
 KDIR=../kernel-dev/linux-source-7.1

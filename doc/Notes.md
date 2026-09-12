@@ -1680,6 +1680,107 @@ jitter, both forwarded into the guest by `scripts/run-rust.sh`, and each test
 prints the pair it used. The full run needs a `TIMEOUT` past the runner's
 600-second default.
 
+## Braam's vocabulary in Rust
+
+T20 is the first piece of the Braam surface, and almost all of it already
+existed: `Error`, `Kind` and the errno table were written at T13 because the
+ABI dump needed them. So the task was mostly deciding where things live and
+what the fifteen names are allowed to cost.
+
+### The re-export, and where the orphan rule puts the conversions
+
+`koru::vocab` re-exports `koru-sys`'s `Error`, `Kind` and `Errno` and adds the
+`Result` alias and the type aliases. It defines no type of its own, because a
+second `Error` would be visible at every T15 call site at once — every op
+future's `Output` carries one.
+
+The `?` conversions could not follow it there. `io::Error` and `Error` are both
+foreign to the `koru` crate, so `impl From<io::Error> for Error` is an orphan
+impl and does not compile; the impls live in `koru-sys` beside the type and the
+`koru` crate re-exports the type that carries them. Worth stating plainly
+because the instinct is to put the whole surface in the surface crate, and the
+compiler only objects once you have written it.
+
+Four conversions, which together are what "native `?`" means here: from
+`Errno`, from `io::Error` for the ordinary POSIX calls the binding still makes,
+from `EnterError` for the ioctl, and back into `io::Error` so a koru error can
+leave for any Rust caller. The `EnterError` one drops the writeback, which is
+fine only because a caller who propagates with `?` has stopped caring what was
+consumed; keep the `EnterError` itself to resubmit.
+
+### Braam's `Error::Cancelled` is `Kind::Cancelled` here
+
+Braam's `Error` is a bare enum, so `r.error() == Error::Cancelled` is ordinary
+equality. Ours carries the raw errno as well, and that equality has to keep
+`EBUSY` and `EALREADY` apart even though both are named `Again`. So `==`
+between two `Error`s compares both fields, and the Braam idiom is served by
+`PartialEq<Kind>` — `err == Kind::Cancelled` — plus `err.is(Kind::Cancelled)`
+where a method reads better. This is one of the few places the Rust surface
+cannot be a transcription: C++ gets the name back at T44, where `Error` can be
+the enum and the raw errno can ride alongside in `result<T>`.
+
+### Exactly one name is synthesised, and it has raw errno 0
+
+`Kind::Closed` has no errno preimage: end of file is `res == 0`. That makes it
+the one vocabulary name userspace has to invent, so `Error::closed()` is the
+only constructor that does not start from an errno, and it sets raw 0 — a value
+no kernel path can produce, so "raw 0" reads unambiguously as "made up here".
+
+Resisting the general `Error::from_kind(kind)` is deliberate. The errno is the
+lossless direction; a name invented in userspace cannot go back to one, and a
+constructor that let any of the fifteen be built without an errno would make
+`raw()` a lie wherever anyone used it. There is one name that needs it and one
+constructor that provides it.
+
+The same 0 is what an `io::Error` with no errno at all becomes — `Io`, raw 0 —
+and `Display` falls back to Braam's own wording there. Everywhere else
+`Display` stays the OS message, because this binding is Linux's and `ENOENT`
+says more than `not found`.
+
+### Three aliases, and the macros that are not needed
+
+Braam's `String`, `Option` and its fixed-width integer names are Rust's own
+spelling already, so the alias list is `Str`, `Span` and `SpanMut`. Braam's
+`Span<T>` is the mutable one and `Span<const T>` the shared one, because its
+const-ness sits in the element type; in Rust it sits in the reference, so the
+unsuffixed name is the shared one and the mutable one gets the suffix.
+
+`TRY`, `TRY_VOID`, `CO_TRY` and `CO_TRY_VOID` have no Rust counterpart to
+write: `?` is all four, inside an `async` block as well as outside one. That is
+the one place the Rust surface is strictly shorter than Braam's, and T44 has to
+write the macros because C++ has no such operator.
+
+### What the done test proves, and what it cannot
+
+The table-driven check walks `KORU_ERRNOS` and asserts, for every row, that the
+errno maps to one name, that the `Error` still carries the raw value, that the
+bare-name comparison agrees, and that no errno appears twice. A second test
+subtracts the mapped names from `KINDS` and requires the remainder to be
+exactly `[Closed]`, so a sixteenth name added without an errno row fails
+immediately. A third round-trips every row out through `io::Error` and back.
+
+Six perturbations, each applied and reverted:
+
+- `kind_of` always answering `Io`: the done test fails on the first row.
+- `from_errno` discarding the raw errno: the done test fails on the raw half
+  and the `io::Error` round-trip fails independently.
+- `Kind::Closed` removed from `KINDS`: only the orphan-name test fails, and
+  `scripts/abi.sh` fails too, on its record-count floor.
+- `impl From<io::Error> for Error` deleted: the `?` test fails to *compile*,
+  which is the only way a conversion test can have teeth.
+- A row duplicated: the "exactly one" assertion fails.
+- **A row's judgement flipped — `EACCES` from `Perm` to `Io` — and every test
+  passes.** Both sides of the assertion read the same table, so the check
+  proves the mapping is total and lossless, not that any row is *right*.
+  `scripts/abi.sh` catches that one, by diffing the row against the C mirror,
+  and the reason column in the table is what makes it reviewable. Two
+  instruments, neither redundant; recorded because the first one looks like it
+  should cover both.
+
+`KINDS` also replaced `abi_dump`'s hand-written list of the fifteen, so the
+emitter and the vocabulary cannot drift apart. The dump is byte-identical
+across that change: 136 records, still agreeing with the C mirror.
+
 ## C++20 userspace binding
 
 The kernel side is **unchanged** — same device, same ioctls, same wire format,

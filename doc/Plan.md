@@ -65,20 +65,9 @@ ABI.
 
 ## Phase 6 — first milestone
 
-Two tasks, and at the end of them Braam's hello world runs through koru. This is
-the first point where the project's claim is demonstrated end to end rather than
-asserted, and it arrives well before the plan is finished.
-
-### T20 [M] — the vocabulary, Rust
-
-`Error` as Braam's fifteen names, each carrying the raw errno it was built from
-so the mapping loses nothing. Native `Result` and `?`. Aliases where Braam's
-names differ from Rust's.
-
-Done test: a table-driven check that every errno koru can produce maps to
-exactly one `Error` and back to a raw errno, over `koru_sys::error::KORU_ERRNOS`
-unchanged. `Error` and the fifteen names already exist in `koru-sys`; re-export
-them rather than defining a second type, or every T15 call site sees both.
+One task left, and at the end of it Braam's hello world runs through koru. This
+is the first point where the project's claim is demonstrated end to end rather
+than asserted, and it arrives well before the plan is finished.
 
 ### T21 [M] — the ambient ring and runtime entry, Rust
 
@@ -866,11 +855,11 @@ lands:
    koru-sys --lib)` is the host-only half: ABI assertions, the ioctl numbers
    and the errno table, with no device needed.
 3. `(cd rust && cargo test -p koru --lib)` — the host-only half: the cookie,
-   the slab, the op state machine and the stall predicate, with no device.
-   Everything else in that crate needs `/dev/koru` and runs as the `runtime`
-   suite inside step 2's boot: futures, executor, drop safety and the Rust
-   surface (T15, T16, T20, T21, T30–T32), plus the screen client against its
-   fake daemon (T37).
+   the slab, the op state machine, the stall predicate and the vocabulary
+   (T20), with no device. Everything else in that crate needs `/dev/koru` and
+   runs as the `runtime` suite inside step 2's boot: futures, executor, drop
+   safety and the Rust surface (T15, T16, T21, T30–T32), plus the screen
+   client against its fake daemon (T37).
 4. `cargo run --example read_file` — the Rust demo (T21).
 5. `cmake -B build -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined"`, then
    `cmake --build build`.
