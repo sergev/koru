@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0
+// SPDX-License-Identifier: MIT
 //
 // Per-opcode matrices, plus signals and credentials, which need a fork.
 // Tail sections: they allocate almost nothing. See doc/Notes.md.

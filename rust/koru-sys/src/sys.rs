@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0
+// SPDX-License-Identifier: MIT
 
 //! The libc surface, declared by hand. Everything else comes from `std`.
 //!

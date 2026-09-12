@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0
+// SPDX-License-Identifier: MIT
 
 //! The device suite: T4-T11 re-expressed against `koru-sys`.
 //!

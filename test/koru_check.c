@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0
+// SPDX-License-Identifier: MIT
 //
 // koru_check: the integrated test for the kernel module. One process, one
 // shared ring, run inside the virtme-ng guest by scripts/check.sh.

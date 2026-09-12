@@ -5,14 +5,14 @@ code in this repository.
 
 ## State of the repository
 
-**T0–T13 are done: the kernel side is finished and the Rust ABI layer
-exists.** The module registers
-`/dev/koru`, configures a ring with `SETUP`, and submits `NOP`, `DELAY_NS`,
-`CHECKSUM`, `OPEN`, `READ`, `CLOSE` and `CANCEL` through `ENTER`, which blocks
-for completions. The arena is mmap'd, with slot exclusivity enforced by the
-kernel. Open files live in a generational handle table. A queued op can be
-genuinely dequeued, and `close(fd)` cancels whatever is still queued. The whole
-validation surface has been fuzzed under KASAN, lockdep and kmemleak.
+**T0–T13 are done: the kernel side is finished and the Rust ABI layer exists.**
+The module registers `/dev/koru`, configures a ring with `SETUP`, and submits
+`NOP`, `DELAY_NS`, `CHECKSUM`, `OPEN`, `READ`, `CLOSE` and `CANCEL` through
+`ENTER`, which blocks for completions. The arena is mmap'd, with slot
+exclusivity enforced by the kernel. Open files live in a generational handle
+table. A queued op can be genuinely dequeued, and `close(fd)` cancels whatever
+is still queued. The whole validation surface has been fuzzed under KASAN,
+lockdep and kmemleak.
 
 T13 added `rust/koru-sys`: the ABI mirror, the ioctl wrappers, `Ring`, `Arena`,
 `BufPool` and the errno table, with the T4–T11 matrix re-expressed as Rust
@@ -37,6 +37,12 @@ Everything from here is userspace.
 
 Work proceeds in plan order. Task numbers are referenced across all three
 documents; if you renumber, fix the cross-references.
+
+**Licensing is split.** `kernel/` is GPL-2.0, because the module uses GPL-only
+symbols and declares `MODULE_LICENSE("GPL")`. Everything else is MIT: the
+bindings, `test/` and `scripts/`. A new file gets the SPDX tag of the half it
+belongs to, and a userspace file must never be given GPL-2.0 by reflex — the
+whole point is that a koru program is not obliged to be GPL.
 
 Two documentation rules, both load-bearing:
 

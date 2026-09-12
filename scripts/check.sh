@@ -1,5 +1,5 @@
 #!/bin/sh
-# SPDX-License-Identifier: GPL-2.0
+# SPDX-License-Identifier: MIT
 #
 # The guest side of the check. Runs inside the virtme-ng guest, never on the
 # host: a module bug panics the machine.

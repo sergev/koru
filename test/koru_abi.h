@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: GPL-2.0 */
+/* SPDX-License-Identifier: MIT */
 /* Hand-written mirror of kernel/koru_abi.rs, which is canonical. A change there
  * means a change here; the asserts below are what catch you forgetting.
  * T14 replaces this file with cpp/include/koru_abi.h. */

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0
+// SPDX-License-Identifier: MIT
 
 //! The ring: `SETUP`, `ENTER`, and the mmap'd arena.
 

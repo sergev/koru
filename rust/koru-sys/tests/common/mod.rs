@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0
+// SPDX-License-Identifier: MIT
 
 //! Helpers for the device suite. Every `.rs` directly in `tests/` is its own
 //! binary, so shared code lives here.

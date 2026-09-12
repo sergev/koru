@@ -145,6 +145,18 @@ Requires a Linux box running a kernel ≥6.16 built with `CONFIG_RUST=y` — and
 full build tree, since distro `linux-headers` packages omit the Rust artifacts.
 Use a VM; early versions will panic it.
 
+## License
+
+MIT, except the kernel module. `kernel/` is GPL-2.0, because a Linux module
+that uses GPL-only symbols has to be, and it declares `MODULE_LICENSE("GPL")`
+to load at all. Everything else — the userspace bindings, the test suite and
+the scripts — is MIT, so a program written against koru is not obliged to be
+GPL by the binding it links.
+
+`kernel/koru_abi.rs` is GPL-2.0 as part of the module, and its userspace
+mirrors are MIT. Both are the same copyright holder's work, which is what makes
+that split his to make.
+
 ## Prior art
 
 [io_uring](https://kernel.dk/io_uring.pdf) is the working proof that Linux's

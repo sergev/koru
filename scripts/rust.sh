@@ -1,5 +1,5 @@
 #!/bin/sh
-# SPDX-License-Identifier: GPL-2.0
+# SPDX-License-Identifier: MIT
 #
 # The guest side of the Rust suite. Runs inside the virtme-ng guest, never on
 # the host. Mirrors check.sh; that script is left alone because it carries every

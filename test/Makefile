@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: GPL-2.0
+# SPDX-License-Identifier: MIT
 #
 # koru_check: the integrated test. Built on the host, run inside the virtme-ng
 # guest, where this directory is visible at the same path.

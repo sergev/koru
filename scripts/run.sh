@@ -1,5 +1,5 @@
 #!/bin/sh
-# SPDX-License-Identifier: GPL-2.0
+# SPDX-License-Identifier: MIT
 #
 # Host-side runner. Boots the dev kernel in a VM and runs the check inside it.
 # Never load the module on the host.

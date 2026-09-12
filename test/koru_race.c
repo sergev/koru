@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0
+// SPDX-License-Identifier: MIT
 //
 // The heavy phase: bulk allocation churn and the race loops. Runs first so one
 // kmemleak scan at the end sees all of it; anything allocation-heavy added to

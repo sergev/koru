@@ -813,6 +813,19 @@ the reason was not that the check was weak but that the bug is unreachable until
 the race window is wide enough to enter. A green run against a deliberately
 broken kernel is a statement about coverage, not about correctness.
 
+## Licensing
+
+`kernel/` is GPL-2.0 and stays that way: the module uses GPL-only symbols and
+declares `MODULE_LICENSE("GPL")`, so it could not load otherwise. Everything
+else is MIT — the bindings, `test/` and `scripts/` — which is what keeps a
+program written against koru from being obliged to be GPL by the binding it
+links. That obligation is the thing a userspace API most needs to avoid, so a
+new file under those directories takes MIT, never GPL by reflex.
+
+`kernel/koru_abi.rs` is GPL-2.0 as part of the module while its userspace
+mirrors are MIT. They are the same author's work, which is what makes the split
+available to make; it is not a relicensing of somebody else's code.
+
 ## The Rust binding
 
 `rust/koru-sys` is the raw layer: the ABI mirror, the ioctl wrappers, `Ring`,

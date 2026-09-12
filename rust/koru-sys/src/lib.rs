@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0
+// SPDX-License-Identifier: MIT
 
 //! Raw bindings for `/dev/koru`: the ABI structs, the ioctl wrappers, the ring
 //! and its arena, the buffer pool, and the errno table.

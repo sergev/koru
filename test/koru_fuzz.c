@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0
+// SPDX-License-Identifier: MIT
 //
 // Hostile userspace: random SQEs and ENTER parameters from eight threads on one
 // ring, plus faulting buffers, malformed ioctls, munmap under in-flight work

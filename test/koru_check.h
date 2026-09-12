@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: GPL-2.0 */
+/* SPDX-License-Identifier: MIT */
 /* Internals shared between koru_check's translation units. */
 
 #ifndef KORU_CHECK_H

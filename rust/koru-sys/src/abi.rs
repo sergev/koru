@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0
+// SPDX-License-Identifier: MIT
 
 //! The koru wire format. Mirrors `kernel/koru_abi.rs`, which is canonical; T14
 //! diffs the two. Pure layout: the `Sqe` constructors live in `ring.rs`.
