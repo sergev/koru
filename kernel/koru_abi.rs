@@ -176,6 +176,11 @@ pub(crate) const KORU_OP_CANCEL: u8 = 5; // T11
 /// FNV-1a over `len` bytes at `off` in slot `slot`, returned in `res`.
 /// `handle` must be zero. Scaffolding for the arena; see doc/Notes.md.
 pub(crate) const KORU_OP_CHECKSUM: u8 = 6; // T7
+/// Write `len` bytes from slot `slot`, at slot offset 0, to file offset `off`
+/// of `handle`. `res` is the count written; short is a result, not an error.
+/// Regular files only. A non-zero `off` needs a seekable file, else `EINVAL`;
+/// on an `O_APPEND` handle the kernel appends and `off` is ignored.
+pub(crate) const KORU_OP_WRITE: u8 = 7; // T17
 
 /// Any bit set is rejected.
 pub(crate) const KORU_SQE_FLAGS_ALL: u8 = 0;
@@ -218,7 +223,9 @@ pub(crate) struct Sqe {
     pub(crate) rsvd0: u16,
     /// Opcode-specific length.
     pub(crate) len: u32,
-    /// Opcode-specific offset, or the delay in nanoseconds for `DELAY_NS`.
+    /// Opcode-specific offset. A file offset on `READ` and `WRITE`, a
+    /// within-slot offset on `OPEN` and `CHECKSUM`, nanoseconds on `DELAY_NS`,
+    /// the target's `user_data` on `CANCEL`. `NOP` and `CLOSE` want zero.
     pub(crate) off: u64,
     /// Echoed into the CQE. Opaque; userspace packs (slab index, generation).
     pub(crate) user_data: u64,

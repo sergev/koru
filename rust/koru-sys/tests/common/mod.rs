@@ -23,6 +23,9 @@ pub const HANDLES: u32 = 32;
 pub const PATFILE: &str = "/tmp/koru-check-rs-pattern";
 pub const PATSIZE: usize = 65536;
 
+/// The WRITE tests' own target, created and removed by them.
+pub const WRFILE: &str = "/tmp/koru-check-rs-write";
+
 pub fn shared_config() -> SetupConfig {
     SetupConfig::new(SQ, CQ, SLOT, SLOTS, HANDLES)
 }
@@ -94,6 +97,10 @@ impl Mapped {
 
     pub fn read_into(&self, handle: u32, slot: u32, off: u64, len: u32) -> i64 {
         self.run_one(&Sqe::read(0x102, handle, slot, off, len))
+    }
+
+    pub fn write_from(&self, handle: u32, slot: u32, off: u64, len: u32) -> i64 {
+        self.run_one(&Sqe::write(0x103, handle, slot, off, len))
     }
 
     /// Assert nothing was left in flight.

@@ -276,6 +276,14 @@ int64_t r_read(struct koru_ring *r, uint32_t handle, uint32_t slot, uint64_t off
     return run_one(r->fd, &s);
 }
 
+int64_t r_write(struct koru_ring *r, uint32_t handle, uint32_t slot, uint64_t off, uint32_t len)
+{
+    struct koru_sqe s;
+
+    sqe_write(&s, handle, slot, off, len, 0x103);
+    return run_one(r->fd, &s);
+}
+
 /* ------------------------------------------------------------------------- */
 
 void sqe_nop(struct koru_sqe *s, uint64_t user_data)
@@ -328,6 +336,18 @@ void sqe_read(struct koru_sqe *s, uint32_t handle, uint32_t slot, uint64_t off, 
 {
     memset(s, 0, sizeof(*s));
     s->opcode    = KORU_OP_READ;
+    s->handle    = handle;
+    s->slot      = slot;
+    s->off       = off;
+    s->len       = len;
+    s->user_data = user_data;
+}
+
+void sqe_write(struct koru_sqe *s, uint32_t handle, uint32_t slot, uint64_t off, uint32_t len,
+               uint64_t user_data)
+{
+    memset(s, 0, sizeof(*s));
+    s->opcode    = KORU_OP_WRITE;
     s->handle    = handle;
     s->slot      = slot;
     s->off       = off;

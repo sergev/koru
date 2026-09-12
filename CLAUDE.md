@@ -5,10 +5,10 @@ code in this repository.
 
 ## State of the repository
 
-**T0–T15 are done: the kernel side is finished and the Rust binding runs.**
+**T0–T17 are done: the Rust binding runs and the kernel has reopened.**
 The module registers `/dev/koru`, configures a ring with `SETUP`, and submits
-`NOP`, `DELAY_NS`, `CHECKSUM`, `OPEN`, `READ`, `CLOSE` and `CANCEL` through
-`ENTER`, which blocks for completions. The arena is mmap'd, with slot
+`NOP`, `DELAY_NS`, `CHECKSUM`, `OPEN`, `READ`, `WRITE`, `CLOSE` and `CANCEL`
+through `ENTER`, which blocks for completions. The arena is mmap'd, with slot
 exclusivity enforced by the kernel. Open files live in a generational handle
 table. A queued op can be genuinely dequeued, and `close(fd)` cancels whatever
 is still queued. The whole validation surface has been fuzzed under KASAN,
@@ -30,6 +30,13 @@ lands, and the op that reuses that index must not get `-EBUSY`. "Under ASan"
 was settled as no nightly toolchain — `forbid(unsafe_code)` plus the kernel's
 KASAN plus the `Stats` accounting. doc/Notes.md has the reasoning and the five
 perturbations, one of which this test does **not** catch.
+
+T17 added `KORU_OP_WRITE`, the first new opcode since T11 and the first kernel
+work since T12. It mirrors `READ`: inline validate, deferred to the workqueue,
+one page-sized bounce buffer, the arena mutex never held across the VFS call.
+`features` stays zero, because `WRITE` is unconditional. Two of its guards are
+not falsifiable yet and one never will be by errno alone; doc/Notes.md says
+which and why.
 
 T14 made the two userspace ABI mirrors a diff rather than a promise.
 `cpp/include/koru_abi.h` and `cpp/include/koru_errno.h` are the C mirrors,
@@ -122,7 +129,7 @@ survived**.
 
 ## Commands
 
-These work today (T0 through T15):
+These work today (T0 through T17):
 
 ```sh
 KDIR=../kernel-dev/linux-source-7.1

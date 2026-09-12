@@ -377,6 +377,129 @@ void sec_read(void)
 
 /* ------------------------------------------------------------------------- */
 
+/* Fill slot `slot` with the pattern for file offset `off`. */
+static void fill_slot(uint32_t slot, uint64_t off, size_t n)
+{
+    uint8_t *p = R.arena + (size_t)slot * R.slot_size;
+    size_t i;
+
+    for (i = 0; i < n; i++)
+        p[i] = pattern_byte(off + i);
+}
+
+/* The file's bytes at `off` must be the pattern for `off`. */
+static int file_matches(int fd, uint64_t off, size_t n)
+{
+    uint8_t buf[8192];
+    size_t done = 0;
+
+    while (done < n) {
+        size_t want = n - done < sizeof(buf) ? n - done : sizeof(buf);
+        ssize_t got = pread(fd, buf, want, (off_t)(off + done));
+        size_t i;
+
+        if (got <= 0) {
+            note("pread at %llu returned %zd", (unsigned long long)(off + done), got);
+            return 0;
+        }
+        for (i = 0; i < (size_t)got; i++)
+            if (buf[i] != pattern_byte(off + done + i)) {
+                note("mismatch at %llu", (unsigned long long)(off + done + i));
+                return 0;
+            }
+        done += (size_t)got;
+    }
+    return 1;
+}
+
+void sec_write(void)
+{
+    struct koru_sqe sq[2];
+    struct koru_cqe cq[2];
+    const struct koru_cqe *a, *b;
+    unsigned completed = 0;
+    int64_t h, ro;
+    int fd;
+
+    fd = open(WRFILE, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) {
+        check(0, "create the WRITE target");
+        return;
+    }
+
+    h = r_open(&R, PATH_SLOT, WRFILE, KORU_O_WRONLY);
+    check(h > 0, "OPEN the target for writing");
+    if (h <= 0) {
+        close(fd);
+        unlink(WRFILE);
+        return;
+    }
+
+    /* 1. A whole slot out, then back through pread(2). */
+    fill_slot(1, 0, R.slot_size);
+    check_res(r_write(&R, (uint32_t)h, 1, 0, R.slot_size), R.slot_size,
+              "a multi-page WRITE reports every byte");
+    check(file_matches(fd, 0, R.slot_size), "  and pread(2) reads the pattern back");
+
+    /* 2. Into a hole, at an unaligned offset. Never rewritten, so the file
+     *    stays sparse below it. */
+    fill_slot(2, 1 << 20, 4096);
+    check_res(r_write(&R, (uint32_t)h, 2, 1 << 20, 4096), 4096,
+              "a WRITE into a sparse hole lands at its offset");
+    check(file_matches(fd, 1 << 20, 4096), "  and reads back there");
+    check_res(r_write(&R, (uint32_t)h, 2, 4097, 1), 1, "a one-byte WRITE at an odd offset works");
+
+    /* 3. Rejections. */
+    check_res(r_write(&R, 0, 1, 0, 64), -EBADF, "WRITE with handle 0 is EBADF");
+    check_res(r_write(&R, (uint32_t)h + (1u << 16), 1, 0, 64), -EBADF,
+              "  a stale generation is EBADF");
+    check_res(r_write(&R, R.handle_count | (1u << 16), 1, 0, 64), -EBADF,
+              "  an index past the table is EBADF");
+    check_res(r_write(&R, (uint32_t)h, 1, 0, 0), -EINVAL, "a zero-length WRITE is EINVAL");
+    check_res(r_write(&R, (uint32_t)h, 1, 0, R.slot_size + 1), -EINVAL,
+              "  a len past the slot is EINVAL");
+    check_res(r_write(&R, (uint32_t)h, R.slot_count, 0, 64), -EINVAL,
+              "  a slot past the arena is EINVAL");
+    check_res(r_write(&R, (uint32_t)h, 1, (uint64_t)1 << 63, 64), -EINVAL,
+              "  a negative file offset is EINVAL");
+
+    /* A read-only handle has no FMODE_WRITE. */
+    ro = r_open(&R, PATH_SLOT, WRFILE, KORU_O_RDONLY);
+    check(ro > 0, "OPEN the same file read-only");
+    if (ro > 0) {
+        check_res(r_write(&R, (uint32_t)ro, 1, 0, 64), -EBADF, "  WRITE through it is EBADF");
+        check_res(r_close(&R, (uint32_t)ro), 0, "  and it closes");
+    }
+
+    /* 4. Two WRITEs on one slot: one wins, one gets -EBUSY. */
+    fill_slot(3, 0, R.slot_size);
+    sqe_write(&sq[0], (uint32_t)h, 3, 0, R.slot_size, 0xb0);
+    sqe_write(&sq[1], (uint32_t)h, 3, 0, R.slot_size, 0xb1);
+    submit(R.fd, sq, 2, cq, 2, 2, &completed);
+    a = find_cqe(cq, completed, 0xb0);
+    b = find_cqe(cq, completed, 0xb1);
+    check(completed == 2 && a && b, "two WRITEs on one slot both complete");
+    if (a && b)
+        check(((a->res >= 0) ^ (b->res >= 0)) && ((a->res == -EBUSY) ^ (b->res == -EBUSY)),
+              "  exactly one succeeds, the other gets -EBUSY");
+
+    /* 5. A cancelled WRITE must release its slot. Without KORU_OP_WRITE in
+     *    OpWork::held_slot this is the only thing that says so. */
+    fill_slot(4, 0, R.slot_size);
+    sqe_write(&sq[0], (uint32_t)h, 4, 0, R.slot_size, 0x50);
+    if (submit(R.fd, sq, 1, cq, 0, 0, &completed) == 1) {
+        sqe_cancel(&sq[0], 0x50, 0x51);
+        submit(R.fd, sq, 1, cq, 2, 2, &completed);
+        check(completed == 2, "a WRITE and its CANCEL both complete");
+        sqe_checksum(&sq[0], 4, 0, R.slot_size, 0x52);
+        check(run_one(R.fd, &sq[0]) >= 0, "  and the cancelled WRITE released its slot");
+    }
+
+    check_res(r_close(&R, (uint32_t)h), 0, "the handle closes");
+    close(fd);
+    unlink(WRFILE);
+}
+
 void sec_delay(void)
 {
     struct koru_sqe sq[8];

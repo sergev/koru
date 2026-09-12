@@ -65,7 +65,7 @@ impl OpWork {
     /// `CANCEL` must free exactly what `run` would have.
     fn held_slot(sqe: &Sqe) -> Option<u32> {
         match sqe.opcode {
-            KORU_OP_CHECKSUM | KORU_OP_READ => Some(sqe.slot),
+            KORU_OP_CHECKSUM | KORU_OP_READ | KORU_OP_WRITE => Some(sqe.slot),
             _ => None,
         }
     }
@@ -98,6 +98,10 @@ impl WorkItem for OpWork {
             KORU_OP_READ => this
                 .ring
                 .do_read(sqe, this.file.as_deref())
+                .unwrap_or_else(|e| i64::from(e.to_errno())),
+            KORU_OP_WRITE => this
+                .ring
+                .do_write(sqe, this.file.as_deref())
                 .unwrap_or_else(|e| i64::from(e.to_errno())),
             _ => i64::from(EINVAL.to_errno()),
         };
@@ -147,6 +151,7 @@ impl RingCtx {
             KORU_OP_OPEN => Some(me.open_op(sqe)),
             KORU_OP_CLOSE => Some(me.close_op(sqe)),
             KORU_OP_READ => RingCtx::read_op(me, sqe),
+            KORU_OP_WRITE => RingCtx::write_op(me, sqe),
             KORU_OP_CANCEL => Some(me.cancel_op(sqe)),
             KORU_OP_CHECKSUM => {
                 if sqe.handle != 0 {
@@ -409,6 +414,95 @@ impl RingCtx {
         Ok(done as i64)
     }
 
+    /// `WRITE`: deferred, mirroring `READ`. `None` once the work item owns the
+    /// file and the slot.
+    fn write_op(me: ArcBorrow<'_, RingCtx>, sqe: &Sqe) -> Option<i64> {
+        let file = match RingCtx::write_validate(&me, sqe) {
+            Ok(file) => file,
+            Err(e) => return Some(i64::from(e.to_errno())),
+        };
+        if !me.state.lock().slot_try_acquire(sqe.slot) {
+            return Some(i64::from(EBUSY.to_errno()));
+        }
+        RingCtx::defer_holding_slot(me, sqe, Some(file))
+    }
+
+    /// Everything `WRITE` can reject before it costs a work item.
+    fn write_validate(&self, sqe: &Sqe) -> Result<ARef<File>> {
+        let Some(cfg) = *self.config.lock() else {
+            return Err(EINVAL);
+        };
+        if sqe.slot >= cfg.slot_count {
+            return Err(EINVAL);
+        }
+        // Writes start at slot offset 0, so `len` alone has to fit.
+        if sqe.len == 0 || sqe.len > cfg.slot_size {
+            return Err(EINVAL);
+        }
+        // `loff_t` is signed; a negative offset is not a position.
+        if sqe.off > i64::MAX as u64 {
+            return Err(EINVAL);
+        }
+
+        let file = self.handles.lock().resolve(sqe.handle)?;
+        check_writable(&file)?;
+        // `rw_verify_area` rejects only a negative offset, so an unseekable
+        // file would ignore `off` rather than refuse it. Refuse it here.
+        if sqe.off != 0 && !is_seekable(&file) {
+            return Err(EINVAL);
+        }
+        Ok(file)
+    }
+
+    /// Runs in a kworker. `do_read`'s loop with the copy reversed: out of the
+    /// arena into the bounce buffer, then into the file.
+    fn do_write(&self, sqe: &Sqe, file: Option<&File>) -> Result<i64> {
+        let file = file.ok_or(EINVAL)?;
+        let Some(cfg) = *self.config.lock() else {
+            return Err(EINVAL);
+        };
+
+        let base = u64::from(sqe.slot)
+            .checked_mul(u64::from(cfg.slot_size))
+            .ok_or(EINVAL)?;
+        let mut pos = usize::try_from(base).map_err(|_| EINVAL)?;
+        let mut fpos = sqe.off as i64;
+        let len = sqe.len as usize;
+        let mut done = 0usize;
+
+        let mut bounce = KVec::with_capacity(PAGE_SIZE, GFP_KERNEL)?;
+        bounce.resize(PAGE_SIZE, 0u8, GFP_KERNEL)?;
+
+        while done < len {
+            let in_page = pos % PAGE_SIZE;
+            let want = core::cmp::min(len - done, PAGE_SIZE - in_page);
+
+            {
+                let arena = self.arena.lock();
+                let page = arena.pages.get(pos / PAGE_SIZE).ok_or(EINVAL)?;
+                // SAFETY: `bounce` is valid for `want` bytes and `in_page +
+                // want <= PAGE_SIZE`. The slot is claimed for the life of this
+                // op, so nothing else touches the page.
+                unsafe { page.read_raw(bounce.as_mut_ptr(), in_page, want)? };
+            }
+
+            // The arena lock must NOT be held here, for the reason `do_read`
+            // records: this reaches the VFS, which takes the inode rwsem.
+            let n = match write_at(file, &bounce[..want], &mut fpos) {
+                Ok(n) => n,
+                Err(e) => return if done == 0 { Err(e) } else { Ok(done as i64) },
+            };
+            if n == 0 {
+                break; // No progress: report what went out.
+            }
+
+            pos += n;
+            done += n;
+        }
+
+        Ok(done as i64)
+    }
+
     /// `CLOSE`: retire `handle`. `len`, `off` and `slot` must be zero.
     fn close_op(&self, sqe: &Sqe) -> i64 {
         if sqe.len != 0 || sqe.off != 0 || sqe.slot != 0 {
@@ -562,7 +656,10 @@ impl RingCtx {
 // Not in the bindings: bindgen cannot evaluate their `__force` casts. From
 // include/linux/fs.h.
 const FMODE_READ: u32 = 1 << 0;
+const FMODE_WRITE: u32 = 1 << 1;
+const FMODE_LSEEK: u32 = 1 << 2;
 const FMODE_CAN_READ: u32 = 1 << 17;
+const FMODE_CAN_WRITE: u32 = 1 << 18;
 
 /// `i_mode & S_IFMT` for an open file.
 fn file_type(file: &File) -> u32 {
@@ -595,6 +692,55 @@ fn check_readable(file: &File) -> Result<()> {
         return Err(EINVAL);
     }
     Ok(())
+}
+
+/// Reject a file `kernel_write` cannot write, before it warns about it.
+///
+/// Only the first guard is reachable today: `OPEN` refuses every non-regular
+/// file, and a directory cannot be opened for writing. The other two are in
+/// for when `ADOPT_FD` lands. See doc/Notes.md.
+fn check_writable(file: &File) -> Result<()> {
+    // SAFETY: as above. `f_mode` is immutable after open.
+    let (f_mode, f_op) = unsafe { ((*file.as_ptr()).f_mode, (*file.as_ptr()).f_op) };
+
+    if f_mode & (FMODE_WRITE | FMODE_CAN_WRITE) != FMODE_WRITE | FMODE_CAN_WRITE {
+        return Err(EBADF);
+    }
+    // A blocking write in a kworker cannot be interrupted; same rule as READ.
+    if file_type(file) != bindings::S_IFREG {
+        return Err(EINVAL);
+    }
+    // SAFETY: a live file always has a valid `f_op`.
+    let (write, write_iter) = unsafe { ((*f_op).write, (*f_op).write_iter) };
+    if write.is_some() || write_iter.is_none() {
+        return Err(EINVAL);
+    }
+    Ok(())
+}
+
+/// Whether `off` means anything on this file.
+fn is_seekable(file: &File) -> bool {
+    // SAFETY: as above.
+    let f_mode = unsafe { (*file.as_ptr()).f_mode };
+    f_mode & FMODE_LSEEK != 0
+}
+
+/// One `kernel_write`, advancing `fpos`.
+fn write_at(file: &File, buf: &[u8], fpos: &mut i64) -> Result<usize> {
+    // SAFETY: `file` is live, `buf` is valid for reading its own length, and
+    // `fpos` points at a live `loff_t`.
+    let ret = unsafe {
+        bindings::kernel_write(
+            file.as_ptr(),
+            buf.as_ptr().cast(),
+            buf.len(),
+            core::ptr::from_mut(fpos),
+        )
+    };
+    if ret < 0 {
+        return Err(Error::from_errno(ret as core::ffi::c_int));
+    }
+    Ok(ret as usize)
 }
 
 /// One `kernel_read`, advancing `fpos`. `Ok(0)` is EOF.

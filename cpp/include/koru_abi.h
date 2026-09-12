@@ -90,13 +90,17 @@ struct koru_params {
     uint64_t reserved[2];     /* in: must be zero */
 };
 
-/* A submission queue entry. Fields an opcode does not read must be zero. */
+/* A submission queue entry. Fields an opcode does not read must be zero.
+ *
+ * off is a file offset on READ and WRITE, a within-slot offset on OPEN and
+ * CHECKSUM, nanoseconds on DELAY_NS, the target's user_data on CANCEL, and
+ * zero on NOP and CLOSE. */
 struct koru_sqe {
     uint8_t opcode;     /* one of the KORU_OP_* constants */
     uint8_t flags;      /* outside KORU_SQE_FLAGS_ALL completes EINVAL */
     uint16_t rsvd0;     /* must be zero */
     uint32_t len;       /* opcode-specific length */
-    uint64_t off;       /* opcode-specific offset */
+    uint64_t off;       /* opcode-specific offset; see above */
     uint64_t user_data; /* echoed into the CQE; opaque */
     uint32_t slot;      /* arena slot index; buffers are never addresses */
     uint32_t handle;    /* index low, generation high; OPEN flags on OPEN */
@@ -201,6 +205,7 @@ KORU_STATIC_ASSERT(KORU_IOC_ENTER == 0xc0406b02u, "ioctl ENTER");
 #define KORU_OP_CLOSE    4
 #define KORU_OP_CANCEL   5
 #define KORU_OP_CHECKSUM 6
+#define KORU_OP_WRITE    7
 
 KORU_STATIC_ASSERT(KORU_OP_NOP == 0, "op NOP");
 KORU_STATIC_ASSERT(KORU_OP_DELAY_NS == 1, "op DELAY_NS");
@@ -209,6 +214,7 @@ KORU_STATIC_ASSERT(KORU_OP_READ == 3, "op READ");
 KORU_STATIC_ASSERT(KORU_OP_CLOSE == 4, "op CLOSE");
 KORU_STATIC_ASSERT(KORU_OP_CANCEL == 5, "op CANCEL");
 KORU_STATIC_ASSERT(KORU_OP_CHECKSUM == 6, "op CHECKSUM");
+KORU_STATIC_ASSERT(KORU_OP_WRITE == 7, "op WRITE");
 
 /* Any bit set in an SQE's flags is rejected. */
 #define KORU_SQE_FLAGS_ALL 0u

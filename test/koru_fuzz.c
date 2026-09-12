@@ -20,6 +20,9 @@
 
 #include "koru_check.h"
 
+/* The only path the fuzzer ever opens for writing. */
+#define FUZZWRFILE "/tmp/koru-fuzz-write"
+
 #define F_SQ      64u
 #define F_CQ      128u
 #define F_SLOT    4096u
@@ -64,7 +67,7 @@ static int one_in(uint64_t *s, uint32_t n)
 static atomic_uint handle_pool[POOL];
 static atomic_uint pool_next;
 
-static atomic_ullong op_total[8], op_ok[8];
+static atomic_ullong op_total[16], op_ok[16];
 static atomic_ullong open_einval, open_ebusy, open_emfile, open_other;
 
 static uint32_t pool_pick(uint64_t *s)
@@ -113,6 +116,10 @@ static int res_allowed(uint8_t opcode, int64_t res)
         return res == 0 || res == -EINVAL || res == -EBADF;
     case KORU_OP_CANCEL:
         return res == 0 || res == -EINVAL || res == -ENOENT || res == -EALREADY;
+    case KORU_OP_WRITE:
+        return (res >= 0 && res <= F_SLOT) || res == -EINVAL || res == -EBADF || res == -EBUSY ||
+               res == -ENOMEM || res == -EAGAIN || res == -ECANCELED || res == -EIO ||
+               res == -EINTR || res == -ENOSPC || res == -EFBIG || res == -EDQUOT;
     case KORU_OP_CHECKSUM:
         return res >= 0 || res == -EINVAL || res == -EBUSY || res == -ENOMEM || res == -EAGAIN ||
                res == -ECANCELED;
@@ -145,7 +152,7 @@ static void gen_valid(uint64_t *s, struct koru_sqe *q, uint64_t ud, uint32_t pat
 {
     uint32_t slot = rnd_below(s, F_SLOTS);
 
-    switch (rnd_below(s, 12)) {
+    switch (rnd_below(s, 14)) {
     case 0:
         sqe_nop(q, ud);
         break;
@@ -155,9 +162,19 @@ static void gen_valid(uint64_t *s, struct koru_sqe *q, uint64_t ud, uint32_t pat
     case 2:
     case 3:
     case 4: {
-        const char *path = one_in(s, 2) ? PATFILE : HOSTNAME;
+        const char *path;
+        uint32_t flags;
 
-        sqe_open(q, path_slot, 0, put_path(arena, F_SLOT, path_slot, path), KORU_O_RDONLY, ud);
+        /* WRFILE is the only path ever opened for writing. A writable handle
+         * plus a random offset would otherwise corrupt whatever it names. */
+        if (one_in(s, 3)) {
+            path  = FUZZWRFILE;
+            flags = KORU_O_RDWR;
+        } else {
+            path  = one_in(s, 2) ? PATFILE : HOSTNAME;
+            flags = KORU_O_RDONLY;
+        }
+        sqe_open(q, path_slot, 0, put_path(arena, F_SLOT, path_slot, path), flags, ud);
         break;
     }
     case 5:
@@ -167,10 +184,16 @@ static void gen_valid(uint64_t *s, struct koru_sqe *q, uint64_t ud, uint32_t pat
         break;
     case 7:
     case 8:
+        /* A read-only handle here is a fine outcome: EBADF. */
+        sqe_write(q, one_in(s, 4) ? (uint32_t)rnd(s) : pool_pick(s), slot, rnd_below(s, PATSIZE),
+                  1 + rnd_below(s, F_SLOT), ud);
+        break;
     case 9:
+    case 10:
+    case 11:
         sqe_close(q, one_in(s, 4) ? (uint32_t)rnd(s) : pool_take(s), ud);
         break;
-    case 10:
+    case 12:
         sqe_cancel(q, UD(KORU_OP_DELAY_NS, rnd(s)), ud);
         break;
     default:
@@ -314,9 +337,9 @@ static void *worker(void *arg)
                 note("opcode %u res %lld", op, (long long)cq[i].res);
                 fail("every CQE res is in its opcode's allowed set");
             }
-            atomic_fetch_add(&op_total[op & 7], 1);
+            atomic_fetch_add(&op_total[op & 15], 1);
             if (cq[i].res >= 0)
-                atomic_fetch_add(&op_ok[op & 7], 1);
+                atomic_fetch_add(&op_ok[op & 15], 1);
             if (op == KORU_OP_OPEN && cq[i].res < 0) {
                 if (cq[i].res == -EINVAL)
                     atomic_fetch_add(&open_einval, 1);
@@ -536,8 +559,8 @@ static unsigned long long drain(void)
 
 int fuzz_main(unsigned secs, uint64_t seed)
 {
-    static const char *names[8] = { "NOP", "DELAY", "OPEN", "READ", "CLOSE", "CANCEL", "CKSUM",
-                                    "other" };
+    static const char *names[9] = { "NOP",   "DELAY",  "OPEN",  "READ", "CLOSE",
+                                    "CANCEL", "CKSUM", "WRITE", "other" };
     struct koru_ring m;
     pthread_t th[NWORKERS + 2];
     uint64_t seeds[NWORKERS + 2];
@@ -553,8 +576,14 @@ int fuzz_main(unsigned secs, uint64_t seed)
     sa.sa_handler = usr1;
     sigaction(SIGUSR1, &sa, NULL);
 
+    if (make_pattern_file(FUZZWRFILE, F_SLOT) != 0) {
+        fail("create the fuzzer's scratch file");
+        return failures;
+    }
+
     if (ring_open(&m, F_SQ, F_CQ, F_SLOT, F_SLOTS, F_HANDLES) != 0 || ring_map(&m) != 0) {
         failures++;
+        unlink(FUZZWRFILE);
         return failures;
     }
     fd    = m.fd;
@@ -600,7 +629,7 @@ int fuzz_main(unsigned secs, uint64_t seed)
 
         note("%llu ENTERs, %llu SQEs consumed, %llu CQEs reaped (%llu at drain)",
              (unsigned long long)atomic_load(&total_ops), sub, rea, tail);
-        for (op = 0; op < 8; op++)
+        for (op = 0; op < 9; op++)
             note("%-6s %7llu completed, %7llu succeeded", names[op],
                  (unsigned long long)atomic_load(&op_total[op]),
                  (unsigned long long)atomic_load(&op_ok[op]));
@@ -613,7 +642,7 @@ int fuzz_main(unsigned secs, uint64_t seed)
         check(sub > SUB_FLOOR, "the fuzzer actually exercised the ring");
         /* Completion, not success: the tail sections carry that claim. */
         reached = 1;
-        for (op = 0; op <= KORU_OP_CHECKSUM; op++)
+        for (op = 0; op <= KORU_OP_WRITE; op++)
             if (atomic_load(&op_total[op]) == 0) {
                 note("opcode %d never completed once", op);
                 reached = 0;
@@ -625,6 +654,7 @@ int fuzz_main(unsigned secs, uint64_t seed)
     }
 
     ring_close(&m);
+    unlink(FUZZWRFILE);
     return failures;
 }
 

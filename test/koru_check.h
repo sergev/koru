@@ -21,6 +21,9 @@ extern struct koru_ring R;
 
 #define HOSTNAME "/etc/hostname"
 
+/* The WRITE section's own target. Created and unlinked by that section. */
+#define WRFILE "/tmp/koru-check-write"
+
 /* koru_check.c */
 void sec_smoke(void);
 void sec_setup(void);
@@ -33,6 +36,7 @@ void sec_slots(void);
 void sec_checksum(void);
 void sec_open(void);
 void sec_read(void);
+void sec_write(void);
 void sec_delay(void);
 void sec_cancel(void);
 void sec_signals(void);

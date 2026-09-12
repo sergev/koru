@@ -481,6 +481,19 @@ impl Sqe {
         }
     }
 
+    /// `off` is a file offset; the source is always slot offset 0.
+    pub fn write(user_data: u64, handle: u32, slot: u32, off: u64, len: u32) -> Sqe {
+        Sqe {
+            opcode: KORU_OP_WRITE,
+            len,
+            off,
+            user_data,
+            slot,
+            handle,
+            ..Sqe::default()
+        }
+    }
+
     pub fn close(user_data: u64, handle: u32) -> Sqe {
         Sqe {
             opcode: KORU_OP_CLOSE,

@@ -54,7 +54,7 @@ fn smoke_the_device_is_there() {
 // ---------------------------------------------------------------------------
 
 /// Every opcode plus two that do not exist.
-const ALL_OPCODES: [u8; 9] = [
+const ALL_OPCODES: [u8; 10] = [
     KORU_OP_NOP,
     KORU_OP_DELAY_NS,
     KORU_OP_OPEN,
@@ -62,7 +62,8 @@ const ALL_OPCODES: [u8; 9] = [
     KORU_OP_CLOSE,
     KORU_OP_CANCEL,
     KORU_OP_CHECKSUM,
-    7,
+    KORU_OP_WRITE,
+    8,
     200,
 ];
 
@@ -1490,6 +1491,172 @@ fn read_race_four_hundred_closes_against_an_in_flight_read() {
         close_first >= 350,
         "the CLOSE landed first only {close_first} times of 400"
     );
+    m.assert_quiesced();
+}
+
+// ---------------------------------------------------------------------------
+// T17 - WRITE
+// ---------------------------------------------------------------------------
+
+/// A fresh writable file per test, removed when the guard drops.
+struct Scratch(String);
+
+impl Scratch {
+    fn new(tag: &str) -> Scratch {
+        let path = format!("{WRFILE}-{tag}");
+        std::fs::write(&path, b"").expect("scratch file");
+        Scratch(path)
+    }
+
+    fn path(&self) -> &str {
+        &self.0
+    }
+
+    fn bytes(&self) -> Vec<u8> {
+        std::fs::read(&self.0).expect("read back")
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+#[test]
+fn write_lands_byte_for_byte() {
+    let f = Scratch::new("bytes");
+    let m = Mapped::shared();
+    let n = m.slot_size();
+    let h = m.open_path(0, f.path(), KORU_O_WRONLY) as u32;
+    assert!(h > 0, "OPEN for writing");
+
+    m.fill(1, |j| pattern_byte(j));
+    assert_eq!(m.write_from(h, 1, 0, n), i64::from(n), "a multi-page WRITE");
+
+    let got = f.bytes();
+    assert_eq!(got.len(), n as usize);
+    for (j, b) in got.iter().enumerate() {
+        assert_eq!(*b, pattern_byte(j), "byte {j}");
+    }
+    assert_eq!(m.close_handle(h), 0);
+    m.assert_quiesced();
+}
+
+#[test]
+fn write_places_bytes_at_any_offset() {
+    let f = Scratch::new("offset");
+    let m = Mapped::shared();
+    let h = m.open_path(0, f.path(), KORU_O_WRONLY) as u32;
+    assert!(h > 0);
+
+    // Into a hole: the file is empty, so everything below stays sparse.
+    let off = 1u64 << 20;
+    m.fill(1, |j| pattern_byte(j + off as usize));
+    assert_eq!(m.write_from(h, 1, off, 4096), 4096);
+    assert_eq!(m.write_from(h, 1, 4097, 1), 1, "a one-byte WRITE");
+
+    let got = f.bytes();
+    assert_eq!(
+        got.len(),
+        off as usize + 4096,
+        "the file grew to the offset"
+    );
+    for j in 0..4096usize {
+        assert_eq!(got[off as usize + j], pattern_byte(j + off as usize), "{j}");
+    }
+    assert_eq!(got[4097], pattern_byte(off as usize), "the odd-offset byte");
+    assert_eq!(got[0], 0, "the hole below it reads as zero");
+    assert_eq!(m.close_handle(h), 0);
+    m.assert_quiesced();
+}
+
+#[test]
+fn write_rejection_matrix() {
+    let f = Scratch::new("reject");
+    let m = Mapped::shared();
+    let n = m.slot_size();
+    let h = m.open_path(0, f.path(), KORU_O_WRONLY) as u32;
+    assert!(h > 0);
+    let ebadf = -(EBADF.0 as i64);
+    let bad = -(EINVAL.0 as i64);
+
+    assert_eq!(m.write_from(0, 1, 0, n), ebadf, "handle 0");
+    assert_eq!(
+        m.write_from(h + (1 << 16), 1, 0, n),
+        ebadf,
+        "a stale generation"
+    );
+    assert_eq!(
+        m.write_from(make_handle(m.handle_count() as u16, 1), 1, 0, n),
+        ebadf,
+        "an index past the table"
+    );
+    assert_eq!(m.write_from(h, 1, 0, 0), bad, "len 0");
+    assert_eq!(m.write_from(h, 1, 0, n + 1), bad, "len past the slot");
+    assert_eq!(
+        m.write_from(h, m.slot_count(), 0, n),
+        bad,
+        "slot past the arena"
+    );
+    assert_eq!(
+        m.write_from(h, 1, 1 << 63, n),
+        bad,
+        "a negative file offset"
+    );
+
+    // No FMODE_WRITE on a read-only handle.
+    let ro = m.open_path(0, f.path(), KORU_O_RDONLY) as u32;
+    assert!(ro > 0);
+    assert_eq!(m.write_from(ro, 1, 0, n), ebadf, "a read-only handle");
+    assert_eq!(m.close_handle(ro), 0);
+
+    // WRITE holds its slot for the whole deferred op.
+    let sq = [Sqe::checksum(0x70, 5, 0, n), Sqe::write(0x71, h, 5, 0, n)];
+    let mut cq = [Cqe::default(); 2];
+    let r = m.ring.enter(&sq, &mut cq, 2, None).expect("ENTER");
+    assert_eq!(r.progress.completed, 2);
+    assert_eq!(
+        find_cqe(&cq, 0x71).res,
+        -(EBUSY.0 as i64),
+        "two ops on one slot"
+    );
+
+    assert_eq!(m.close_handle(h), 0);
+    assert_eq!(m.write_from(h, 1, 0, n), ebadf, "a closed handle");
+    m.assert_quiesced();
+}
+
+/// A cancelled WRITE must release its slot, which is the only thing that says
+/// KORU_OP_WRITE reached OpWork::held_slot.
+#[test]
+fn write_releases_its_slot_when_cancelled() {
+    let f = Scratch::new("cancel");
+    let m = Mapped::shared();
+    let n = m.slot_size();
+    let h = m.open_path(0, f.path(), KORU_O_WRONLY) as u32;
+    assert!(h > 0);
+
+    m.fill(6, |j| pattern_byte(j));
+    let r = m
+        .ring
+        .enter(&[Sqe::write(0x60, h, 6, 0, n)], &mut [], 0, None)
+        .expect("ENTER");
+    assert_eq!(r.consumed, 1, "the WRITE is queued");
+
+    let mut cq = [Cqe::default(); 4];
+    let r = m
+        .ring
+        .enter(&[Sqe::cancel(0x61, 0x60)], &mut cq, 2, None)
+        .expect("ENTER");
+    assert_eq!(r.progress.completed, 2, "both complete");
+
+    // Not -EBUSY: the slot came back whether the cancel won or the write ran.
+    assert!(
+        m.run_one(&Sqe::checksum(0x62, 6, 0, n)) >= 0,
+        "the cancelled WRITE never released its slot"
+    );
+    assert_eq!(m.close_handle(h), 0);
     m.assert_quiesced();
 }
 

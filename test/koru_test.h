@@ -63,6 +63,7 @@ const struct koru_cqe *find_cqe(const struct koru_cqe *cq, unsigned n, uint64_t 
 int64_t r_open(struct koru_ring *r, uint32_t slot, const char *path, uint32_t flags);
 int64_t r_close(struct koru_ring *r, uint32_t handle);
 int64_t r_read(struct koru_ring *r, uint32_t handle, uint32_t slot, uint64_t off, uint32_t len);
+int64_t r_write(struct koru_ring *r, uint32_t handle, uint32_t slot, uint64_t off, uint32_t len);
 
 void sqe_nop(struct koru_sqe *s, uint64_t user_data);
 void sqe_delay(struct koru_sqe *s, uint64_t user_data, uint64_t ns);
@@ -73,6 +74,8 @@ void sqe_open(struct koru_sqe *s, uint32_t slot, uint64_t off, uint32_t len, uin
 void sqe_close(struct koru_sqe *s, uint32_t handle, uint64_t user_data);
 void sqe_read(struct koru_sqe *s, uint32_t handle, uint32_t slot, uint64_t off, uint32_t len,
               uint64_t user_data);
+void sqe_write(struct koru_sqe *s, uint32_t handle, uint32_t slot, uint64_t off, uint32_t len,
+               uint64_t user_data);
 /* `target` is the user_data of the op to cancel. */
 void sqe_cancel(struct koru_sqe *s, uint64_t target, uint64_t user_data);
 

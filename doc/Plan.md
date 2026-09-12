@@ -79,8 +79,10 @@ not a "for now".
 
 Three obligations apply to every kernel task rather than being repeated in each:
 
-- `KoruParams::features` gains a bit per capability, so userspace probes instead
-  of submitting and watching for `-EINVAL`. This is what `features` was for.
+- `KoruParams::features` gains a bit per **optional** capability, so userspace
+  probes instead of submitting and watching for `-EINVAL`. This is what
+  `features` was for. An opcode that is unconditionally present at this ABI
+  version needs no bit and does not get one; T17 settled that for `WRITE`.
 - The fuzzer grows with each opcode: a per-opcode allowed-`res` set, a
   per-opcode `extra` oracle replacing the blanket `extra == 0` assertion, and —
   for anything touching the filesystem — a per-run temp directory plus a path
@@ -94,42 +96,6 @@ existing "unimplemented completes `-EINVAL`" rule. A new bit in an existing
 `*_FLAGS_ALL` mask only relaxes a rejection, so it is safe in both directions.
 Per-opcode meanings for `Cqe::extra` are within its documented contract. New
 data-plane structs change no existing size or offset.
-
-### T17 [M] — `KORU_OP_WRITE`
-
-`len` bytes from slot offset 0, written at file offset `off` of `handle`.
-Deferred to the workqueue, mirroring `READ`. New `check_writable` guarding
-`FMODE_WRITE | FMODE_CAN_WRITE`, regular files only for now, and the same
-`f_op->write` / `write_iter` shape check that keeps `not supported for file` out
-of the log. Use `kernel_write`, not `__kernel_write`, which skips
-`rw_verify_area` and freeze protection. Chunk page by page; reusing `read_slot`
-would allocate a whole megabyte. Hold the arena mutex only around each
-`read_raw`, never across `kernel_write`.
-
-`O_APPEND` is the non-obvious one. `kernel_write` inherits `IOCB_APPEND` from
-`f_iocb_flags`. koru's `open_flags` has no `O_APPEND`, but an adopted handle
-(T19) can, and then `off` is silently ignored. Document it.
-
-`off` now means: a file offset on `READ` and `WRITE`, a within-slot offset on
-`OPEN` and `CHECKSUM`, nanoseconds on `DELAY_NS`, a target cookie on `CANCEL`.
-Phase 7 adds four more meanings. The per-opcode doc comments in `koru_abi.rs`
-are a second implementer's only defence, so make that list explicit there.
-
-One wart to settle rather than discover: `rw_verify_area` rejects only a
-*negative* offset, so a non-zero `off` on a non-seekable file such as a socket
-is silently ignored rather than refused. Either reject it here or write it down
-— silently ignoring a field is how a second implementer loses a day, and T37
-writes to a socket through this opcode.
-
-Done test: a known pattern written to a temp file and read back with `pread(2)`;
-placement at a non-zero `off` into a sparse file; the rejection matrix
-(read-only handle to `-EBADF`, directory handle, zero or oversized `len`,
-out-of-range `slot`, non-zero `rsvd0`, unknown flag bit), each shown to fail
-when its check is deleted; two concurrent writes to one slot giving one
-`-EBUSY`. Then the one that matters: cancel a queued `WRITE` and assert the slot
-is freed. That fails if `KORU_OP_WRITE` is missing from `OpWork::held_slot`,
-which is this task's most likely bug and which otherwise shows up only as every
-later op on that index getting `-EBUSY` with nothing saying why. Heavy phase.
 
 ### T18 [M] — `KORU_O_NONBLOCK` and the non-regular-file gate
 

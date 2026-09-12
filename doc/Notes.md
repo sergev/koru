@@ -460,6 +460,92 @@ uninteresting rather than fatal, and the perturbation proves it — capturing th
 file's address at submit time without taking the reference gives an immediate
 KASAN slab-use-after-free.
 
+### Writes
+
+T17's `WRITE` is `READ` with the copy reversed: the same inline validate that
+resolves the handle and claims the slot in ioctl context, the same deferral to
+the workqueue, the same one page-sized bounce buffer, and the arena mutex held
+only around the page copy and never across the VFS call. `kernel_write` rather
+than `__kernel_write`, which skips `rw_verify_area` and freeze protection. The
+loop does not reuse `read_slot`: that buffers the whole length into a `KVec`,
+which for a whole slot is a megabyte.
+
+`check_range` is **wrong for this opcode** and is not called. It reads `off` as
+a within-slot offset, and on `READ` and `WRITE` `off` is a file offset. Both
+open-code their own bounds check instead. The `Sqe::off` doc comment now lists
+every per-opcode meaning, because that collision is the one a second
+implementer meets first.
+
+**`held_slot` is the line that matters.** It is the only thing that frees the
+slot when a queued op is cancelled, so a missing `KORU_OP_WRITE` there shows up
+nowhere except as every later op on that index getting `-EBUSY`, with nothing
+saying why. The check asserts it directly by reusing the slot after a cancel.
+
+**A non-zero `off` on an unseekable file is refused**, by `FMODE_LSEEK`.
+`rw_verify_area` rejects only a *negative* offset, so without this the field
+would be silently ignored on a pipe or a socket rather than refused. Nothing
+can reach it yet — `OPEN` takes regular files only — but T19 can, and T37
+writes to a socket through this opcode with `off` zero, which stays legal.
+
+**No feature bit.** `WRITE` is unconditional: any kernel at this ABI version
+has it, so there is nothing to probe and `KoruParams::features` stays zero.
+`features` is for capabilities that can actually be absent.
+
+`O_APPEND` is the wart. `kernel_write` inherits `IOCB_APPEND` from
+`f_iocb_flags`, so on an appending handle the kernel appends and `off` is
+ignored. koru's own open flags cannot set it; an adopted descriptor (T19) can.
+
+#### What the errno cannot see
+
+Three of the four guards in `check_writable` and `write_validate` are not
+falsifiable by asserting a completion code, and two of those not at all yet.
+Recorded because a check nobody has watched fail proves nothing.
+
+- Delete the `FMODE_WRITE` guard and the read-only-handle test still passes:
+  `__kernel_write_iter` has its own `WARN_ON_ONCE` returning the same `-EBADF`.
+  What catches it is the taint gate, which goes 4096 to 4608, and the dmesg
+  scan. So the guard's job is exactly `check_readable`'s — keeping the log
+  clean — and the gate, not the assertion, is its oracle.
+- Delete the negative-file-offset guard and **nothing** fails: `rw_verify_area`
+  answers `-EINVAL` itself for a regular file, with no splat. It is kept
+  because it refuses before spending a work item, and for symmetry with `READ`,
+  whose guard is redundant in the same way. That is a cost argument, not a
+  correctness one, and it should not be mistaken for a tested one.
+- The `S_IFREG` and `f_op` shape guards cannot be reached at all: `OPEN` refuses
+  every non-regular file, and a directory cannot be opened for writing. They
+  become reachable at T19.
+
+#### What was verified, and how
+
+Six perturbations, each reverted. Four fail, and the two that do not are the
+finding above.
+
+- Drop `KORU_OP_WRITE` from `held_slot`. The cancelled write never releases its
+  slot and the reuse probe fails.
+- Hold the arena mutex across `write_at`. Lockdep reports the circular
+  dependency and the dmesg gate fails the run, which is the same three-link
+  cycle `READ` found in T10.
+- Delete the `len` bounds. The zero-length case returns 0 and the oversized one
+  returns 65537 — a write that ran one byte past its slot.
+- Change `KORU_OP_WRITE` in one userspace mirror. `scripts/abi.sh` fails.
+  Change it in **both** and the diff passes while every device test fails with
+  `-EINVAL`, which is the clearest demonstration that the diff cannot see the
+  kernel and that the device suites are what tie a mirror to it.
+
+The fuzzer grew a `WRITE` arm and reaches it about five thousand times per
+three-second run, with a few dozen succeeding — most handles in its pool are
+read-only, and `-EBADF` is a fine outcome. **Its writable handle comes from a
+dedicated scratch file and from nothing else.** Every other path it opens is
+read-only, one of them `/etc/hostname`; a writable handle plus a random offset
+would corrupt whatever it named. That sandboxing is a property of the test, not
+of the kernel.
+
+Opcode 7 used to be the "does not exist" probe in two rejection matrices, the C
+check's `all_opcodes` and the Rust suite's `ALL_OPCODES`. Both now name
+`KORU_OP_WRITE` and probe 8 instead. The fuzzer's per-opcode counters were
+sized 8 with slot 7 as an "other" bucket, so they and their `& 7` masks had to
+widen before the new opcode could be counted at all.
+
 ### Cancellation
 
 `CANCEL` names its target by `user_data` in `off`. A duplicate `user_data`
