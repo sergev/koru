@@ -8,12 +8,17 @@
 # Prints exactly one KORU-RUST-PASS or KORU-RUST-FAIL marker, which
 # scripts/run-rust.sh greps for. Every check below gates that marker.
 #
-# SUITES is `name|binary|floor` per suite, built by the runner on the host.
+# SUITES is `name|binary|floor` per suite and EXAMPLES is `name|binary`, both
+# built by the runner on the host.
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 KO=${KO:-$ROOT/kernel/koru.ko}
 SUITES=${SUITES:-}
+EXAMPLES=${EXAMPLES:-}
 FILTERS="$*"
+OUT=/tmp/koru-ex-out
+ERR=/tmp/koru-ex-err
+DATA=/tmp/koru-ex-data
 
 fail=0
 fence() { echo "koru-check: $1" > /dev/kmsg 2>/dev/null; echo; echo "=== $1 ==="; }
@@ -49,6 +54,62 @@ run_suite() {
 	[ -z "$skips" ] || { echo "SKIPPED, which is not a pass:"; echo "$skips"; fail=1; }
 }
 
+want_eq() {
+	if [ "$2" = "$3" ]; then
+		echo "ok: $1"
+	else
+		echo "MISMATCH $1: got [$2] want [$3]"
+		fail=1
+	fi
+}
+
+# Braam's hello world. Its stdout arrives two ways and both matter: a pipe is
+# blocking, which koru refuses until the runtime re-opens it, and a regular
+# file takes three writes at three offsets, which is the position bookkeeping.
+example_hello() {
+	want_eq "hello through a pipe" "$("$1" 2>$ERR)" "Hello, world!"
+	want_eq "hello with an argument" "$("$1" koru 2>$ERR)" "Hello, koru!"
+	"$1" file >$OUT 2>$ERR
+	want_eq "hello exit status" "$?" "0"
+	want_eq "hello to a regular file" "$(cat $OUT)" "Hello, file!"
+}
+
+# T15's demo on the ambient ring: the file on stdout, the timer order on
+# stderr, and the timers must not have resolved in the order they were armed.
+example_read_file() {
+	printf 'one\ntwo\nthree\n' >$DATA
+	"$1" $DATA >$OUT 2>$ERR
+	want_eq "read_file exit status" "$?" "0"
+	if cmp -s $OUT $DATA; then
+		echo "ok: read_file wrote the file and nothing else"
+	else
+		echo "MISMATCH read_file bytes"
+		fail=1
+	fi
+	want_eq "read_file timer order" "$(cat $ERR)" "10 20 30"
+	want_eq "read_file through a pipe" "$("$1" $DATA 2>$ERR | cat)" "$(cat $DATA)"
+}
+
+run_example() {
+	name=$1
+	bin=$2
+	fence "example $name"
+	if [ ! -x "$bin" ]; then
+		echo "NOT BUILT: $bin"
+		echo "run: (cd rust && cargo build --examples)"
+		fail=1
+		return
+	fi
+	case $name in
+	hello) example_hello "$bin" ;;
+	read_file) example_read_file "$bin" ;;
+	*)
+		echo "UNKNOWN EXAMPLE: $name"
+		fail=1
+		;;
+	esac
+}
+
 echo "=== koru rust suites ==="
 uname -r
 mount -t debugfs none /sys/kernel/debug 2>/dev/null
@@ -82,6 +143,22 @@ for suite in $SUITES; do
 	floor=${rest##*|}
 	run_suite "$name" "$bin" "$floor"
 done
+
+# The entry's own test: #[koru::main] replaces main, so libtest cannot call
+# one. A filter is a test-name filter, so the examples are skipped with one.
+if [ -z "$FILTERS" ]; then
+	if [ -z "$EXAMPLES" ]; then
+		echo
+		echo "NO EXAMPLES"
+		fail=1
+	fi
+	for ex in $EXAMPLES; do
+		run_example "${ex%%|*}" "${ex#*|}"
+	done
+else
+	echo
+	echo "=== examples skipped: filtered run ==="
+fi
 
 fence "rmmod"
 rmmod koru || { echo "RMMOD FAILED"; fail=1; }

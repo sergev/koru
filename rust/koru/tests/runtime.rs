@@ -10,8 +10,8 @@ mod common;
 
 use common::*;
 use koru::{Either, Errno, Handle, Kind, race};
-use koru_sys::abi::KORU_O_RDONLY;
-use koru_sys::error::{EBADF, EBUSY, EINVAL};
+use koru_sys::abi::{KORU_O_RDONLY, KORU_O_WRONLY};
+use koru_sys::error::{EBADF, EBUSY, EINVAL, EPIPE};
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -472,4 +472,198 @@ fn errno_names_survive_the_round_trip() {
         assert_eq!(e.raw().name(), Some("EBADF"));
         assert_ne!(e.raw(), Errno(0));
     });
+}
+
+// ---------------------------------------------------------------------------
+// T21 - the ambient ring, the entry and the write half
+// ---------------------------------------------------------------------------
+
+/// The examples are the entry's own test, because `#[koru::main]` replaces
+/// `main` and cannot be called from libtest. These cover everything under it.
+fn ambient() -> koru::Runtime {
+    let rt = runtime();
+    koru::install(rt.clone());
+    rt
+}
+
+#[test]
+fn the_ambient_ring_is_the_one_installed_and_the_streams_are_adopted() {
+    let rt = ambient();
+    assert_eq!(
+        koru::rt::current().ring().as_raw_fd(),
+        rt.ring().as_raw_fd()
+    );
+    for (name, h) in [
+        ("stdin", koru::stdin()),
+        ("stdout", koru::stdout()),
+        ("stderr", koru::stderr()),
+    ] {
+        assert_ne!(h.0, 0, "{name} was not adopted");
+    }
+    // Three ADOPT_FDs, each inline, before anything else has run.
+    assert_eq!(rt.stats().cqes_reaped, 3);
+    koru::rt::shutdown();
+}
+
+/// Braam's hello world writes three times, so a stdout redirected to a file
+/// is wrong unless userspace keeps the position: `WRITE` never touches f_pos.
+#[test]
+fn write_all_to_a_regular_file_advances_its_own_position() {
+    let path = "/tmp/koru-rt-write";
+    std::fs::write(path, vec![0u8; 32]).expect("make the file");
+    let rt = ambient();
+
+    rt.block_on(async {
+        let slot = rt.acquire().expect("a slot");
+        let (h, slot) = rt.open(slot, path, KORU_O_WRONLY).await;
+        let h = h.expect("open for writing");
+        drop(slot);
+        koru::rt::register_handle(h, true);
+
+        koru::write_all(h, "Hello, ").await.expect("first write");
+        koru::write_all(h, "world").await.expect("second write");
+        koru::write_all(h, "!\n").await.expect("third write");
+        koru::close_fd(h).await;
+    });
+    koru::rt::shutdown();
+
+    let text = std::fs::read(path).expect("read back");
+    assert_eq!(
+        &text[..14],
+        b"Hello, world!\n",
+        "three writes at three offsets"
+    );
+}
+
+#[test]
+fn write_all_of_nothing_writes_nothing_rather_than_failing() {
+    let rt = ambient();
+    rt.block_on(async {
+        koru::write_all(koru::stdout(), "")
+            .await
+            .expect("empty write");
+    });
+    assert_eq!(rt.stats().cqes_reaped, 3, "no WRITE was submitted");
+    koru::rt::shutdown();
+}
+
+/// A socket is unseekable, so every write is at offset 0 and the stream's own
+/// position is the kernel's. It is also the only non-regular file a test can
+/// make without a second process.
+#[test]
+fn write_all_to_a_stream_writes_at_offset_zero() {
+    use std::io::Read;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::net::UnixStream;
+
+    let (mine, theirs) = UnixStream::pair().expect("socketpair");
+    // T18's gate: koru admits a non-regular file only when it was opened
+    // non-blocking, and never sets that bit itself.
+    mine.set_nonblocking(true).expect("O_NONBLOCK");
+    let rt = ambient();
+
+    rt.block_on(async {
+        let h = rt.adopt(mine.as_raw_fd()).await.expect("adopt");
+        koru::write_all(h, "Hello, ").await.expect("first write");
+        koru::write_all(h, "world!\n").await.expect("second write");
+        koru::close_fd(h).await;
+    });
+    koru::rt::shutdown();
+
+    drop(mine);
+    let mut got = String::new();
+    let mut theirs = theirs;
+    theirs.read_to_string(&mut got).expect("read the far end");
+    assert_eq!(got, "Hello, world!\n");
+}
+
+/// EPIPE is the whole reason `Closed` has an errno preimage.
+#[test]
+fn a_write_whose_reader_is_gone_is_closed() {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::net::UnixStream;
+
+    let (mine, theirs) = UnixStream::pair().expect("socketpair");
+    mine.set_nonblocking(true).expect("O_NONBLOCK");
+    drop(theirs);
+    let rt = ambient();
+
+    rt.block_on(async {
+        let h = rt.adopt(mine.as_raw_fd()).await.expect("adopt");
+        let e = koru::write_all(h, "nobody there").await.expect_err("EPIPE");
+        assert_eq!(e.raw(), EPIPE);
+        assert_eq!(e.kind(), Kind::Closed, "Braam's name for a dead far end");
+        koru::close_fd(h).await;
+    });
+    koru::rt::shutdown();
+}
+
+#[test]
+fn at_exit_hooks_run_last_first_and_may_await() {
+    let rt = ambient();
+    let log = Rc::new(RefCell::new(Vec::new()));
+
+    for i in 0..3 {
+        let log = Rc::clone(&log);
+        koru::at_exit(move || {
+            let log = Rc::clone(&log);
+            async move {
+                // A hook is asynchronous because a buffered writer flushes
+                // here and a destructor cannot await.
+                let _ = koru::rt::current().nop().await;
+                log.borrow_mut().push(i);
+            }
+        });
+    }
+    assert!(log.borrow().is_empty(), "a hook runs at exit, not at once");
+
+    let before = rt.stats().cqes_reaped;
+    koru::rt::shutdown();
+    assert_eq!(*log.borrow(), vec![2, 1, 0]);
+    assert_eq!(rt.stats().cqes_reaped, before + 3, "each hook awaited");
+}
+
+/// Braam's rule: the process ends when the root task returns, whatever the
+/// others are doing. An hour-long delay must not hold the exit.
+#[test]
+fn a_spawned_task_does_not_hold_the_exit() {
+    arm_alarm(30);
+    let rt = ambient();
+    let ran = Rc::new(RefCell::new(false));
+
+    let ran2 = Rc::clone(&ran);
+    let rt2 = rt.clone();
+    koru::spawn(async move {
+        let _ = rt2.delay(3600 * 1_000_000_000).await;
+        *ran2.borrow_mut() = true;
+    });
+    koru::block_on(async { koru::rt::current().nop().await }).expect("nop");
+
+    let t0 = std::time::Instant::now();
+    koru::rt::shutdown();
+    disarm_alarm();
+
+    assert!(!*ran.borrow(), "the delay never completed");
+    assert!(
+        t0.elapsed().as_millis() < 2000,
+        "shutdown waited for a spawned task: {:?}",
+        t0.elapsed()
+    );
+    assert_eq!(rt.stats().inflight, 0, "the delay was cancelled, not left");
+}
+
+#[test]
+fn installing_a_second_ring_replaces_the_first() {
+    let first = ambient();
+    let first_out = koru::stdout();
+    let second = ambient();
+    assert_ne!(first.ring().as_raw_fd(), second.ring().as_raw_fd());
+    // A fresh handle table, so the same descriptor is adopted again.
+    assert_eq!(
+        koru::stdout().0,
+        first_out.0,
+        "the same index and generation"
+    );
+    koru::rt::shutdown();
+    assert!(koru::rt::try_current().is_none(), "shutdown clears it");
 }

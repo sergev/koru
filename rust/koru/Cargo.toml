@@ -5,12 +5,24 @@ edition.workspace = true
 license.workspace = true
 description = "koru futures, op slab and single-threaded executor"
 
-# No dependencies but koru-sys, deliberately: the workspace lockfile listing
-# nothing but its own packages is what proves the build needs no registry.
+# Nothing from a registry, deliberately: the workspace lockfile listing nothing
+# but its own packages is what proves the build needs none. koru-macros is the
+# #[koru::main] attribute, written without syn for the same reason.
 [dependencies]
 koru-sys = { path = "../koru-sys" }
+koru-macros = { path = "../koru-macros" }
 
 # Declared rather than autodiscovered, like koru-sys's.
 [[test]]
 name = "runtime"
 path = "tests/runtime.rs"
+
+# Braam's hello world, and T15's demo against the ambient ring. Both need
+# /dev/koru, so scripts/rust.sh runs them in the guest.
+[[example]]
+name = "hello"
+path = "examples/hello.rs"
+
+[[example]]
+name = "read_file"
+path = "examples/read_file.rs"

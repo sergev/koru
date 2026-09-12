@@ -24,7 +24,7 @@ pub type SpanMut<'a, T> = &'a mut [T];
 mod tests {
     use super::*;
     use koru_sys::EnterError;
-    use koru_sys::error::{KORU_ERRNOS, kind_of};
+    use koru_sys::error::{EPIPE, KORU_ERRNOS, kind_of};
     use std::collections::{HashMap, HashSet};
     use std::io;
 
@@ -100,19 +100,21 @@ mod tests {
         }
     }
 
-    /// A name no errno reaches is a name no program can be handed. Closed is
-    /// the documented exception; a sixteenth without a row must fail here.
+    /// A name no errno reaches is a name no program can be handed. Since T21
+    /// there are none: `Closed` arrives as EPIPE from a write, and end of file
+    /// synthesises it with no errno at all.
     #[test]
-    fn exactly_one_name_has_no_errno_preimage() {
+    fn every_name_is_reachable_from_the_errno_table() {
         let mapped: HashSet<Kind> = KORU_ERRNOS.iter().map(|d| d.kind).collect();
         let orphans: Vec<Kind> = KINDS
             .iter()
             .copied()
             .filter(|k| !mapped.contains(k))
             .collect();
-        assert_eq!(orphans, [Kind::Closed], "a name no errno can produce");
+        assert_eq!(orphans, [] as [Kind; 0], "a name no errno can produce");
+        assert_eq!(Error::from(EPIPE).kind(), Kind::Closed);
         assert_eq!(Error::closed().kind(), Kind::Closed);
-        assert_eq!(Error::closed().raw(), Errno(0));
+        assert_eq!(Error::closed().raw(), Errno(0), "end of file has no errno");
     }
 
     #[test]

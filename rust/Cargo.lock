@@ -6,8 +6,13 @@ version = 4
 name = "koru"
 version = "0.1.0"
 dependencies = [
+ "koru-macros",
  "koru-sys",
 ]
+
+[[package]]
+name = "koru-macros"
+version = "0.1.0"
 
 [[package]]
 name = "koru-sys"

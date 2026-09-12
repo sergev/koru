@@ -198,6 +198,60 @@ impl Future for Read {
 abandon_on_drop!(Read);
 
 #[must_use = "a koru op does nothing until it is awaited"]
+pub struct Write {
+    inner: Rc<Inner>,
+    cookie: Option<Cookie>,
+    args: Option<(Handle, BufSlot, u64, u32)>,
+}
+
+impl Future for Write {
+    type Output = BufResult<usize>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let me = self.get_mut();
+        let landed = poll_body!(me, cx, {
+            let (handle, slot, off, len) = me.args.take().expect("args survive to the first poll");
+            let index = slot.index();
+            me.inner
+                .register(Some(slot), |c| Sqe::write(c.0, handle.0, index, off, len))
+        });
+        let (res, _, slot) = match landed {
+            Poll::Ready(v) => v,
+            Poll::Pending => return Poll::Pending,
+        };
+        let slot = slot.expect("a write op owns its slot");
+        // A short write is a result, not an error; `write_all` loops.
+        Poll::Ready((from_res(res).map(|n| n as usize).map_err(err), slot))
+    }
+}
+
+abandon_on_drop!(Write);
+
+#[must_use = "a koru op does nothing until it is awaited"]
+pub struct Adopt {
+    inner: Rc<Inner>,
+    cookie: Option<Cookie>,
+    fd: i32,
+}
+
+impl Future for Adopt {
+    type Output = Result<Handle>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let me = self.get_mut();
+        let fd = me.fd;
+        let (res, _, _) =
+            match poll_body!(me, cx, me.inner.register(None, |c| Sqe::adopt_fd(c.0, fd))) {
+                Poll::Ready(v) => v,
+                Poll::Pending => return Poll::Pending,
+            };
+        Poll::Ready(from_res(res).map(|h| Handle(h as u32)).map_err(err))
+    }
+}
+
+abandon_on_drop!(Adopt);
+
+#[must_use = "a koru op does nothing until it is awaited"]
 pub struct Open<'a> {
     inner: Rc<Inner>,
     cookie: Option<Cookie>,
@@ -287,6 +341,26 @@ impl Runtime {
             inner: Rc::clone(self.inner()),
             cookie: None,
             args: Some((handle, slot, off, len)),
+        }
+    }
+
+    /// `off` is a file offset and must be 0 on anything unseekable; the source
+    /// is always slot offset 0. `len` must not be 0.
+    pub fn write(&self, handle: Handle, slot: BufSlot, off: u64, len: u32) -> Write {
+        Write {
+            inner: Rc::clone(self.inner()),
+            cookie: None,
+            args: Some((handle, slot, off, len)),
+        }
+    }
+
+    /// A handle for a descriptor the caller already holds. Grants no authority
+    /// the caller lacks, and takes a reference of its own.
+    pub fn adopt(&self, fd: i32) -> Adopt {
+        Adopt {
+            inner: Rc::clone(self.inner()),
+            cookie: None,
+            fd,
         }
     }
 

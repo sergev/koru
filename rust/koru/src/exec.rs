@@ -179,6 +179,16 @@ impl Runtime {
         self.exec.mark_ready(id);
     }
 
+    /// Drop every spawned task, whatever it is waiting for, then quiesce the
+    /// ring. Each future's `Drop` abandons its own op, so this cancels rather
+    /// than leaks. Braam's rule: the program ends when the root returns.
+    pub fn drop_tasks(&self) {
+        let taken = self.exec.tasks.borrow_mut().take_all();
+        drop(taken);
+        self.exec.take_ready();
+        self.inner.drain();
+    }
+
     /// Drive until `fut` resolves. Spawned tasks run alongside it.
     pub fn block_on<F: Future>(&self, fut: F) -> F::Output {
         let mut root = Box::pin(fut);

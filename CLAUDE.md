@@ -5,14 +5,14 @@ code in this repository.
 
 ## State of the repository
 
-**T0–T20 are done: the kernel reached stdout and the Braam surface has
-started.** The module registers `/dev/koru`, configures a ring with `SETUP`,
-and submits `NOP`, `DELAY_NS`, `CHECKSUM`, `OPEN`, `READ`, `WRITE`, `CLOSE`
-and `CANCEL` through `ENTER`, which blocks for completions. The arena is
-mmap'd, with slot exclusivity enforced by the kernel. Open files live in a
-generational handle table. A queued op can be genuinely dequeued, and
-`close(fd)` cancels whatever is still queued. The whole validation surface has
-been fuzzed under KASAN, lockdep and kmemleak.
+**T0–T21 are done: Braam's hello world runs through koru.** The module
+registers `/dev/koru`, configures a ring with `SETUP`, and submits `NOP`,
+`DELAY_NS`, `CHECKSUM`, `OPEN`, `READ`, `WRITE`, `CLOSE` and `CANCEL` through
+`ENTER`, which blocks for completions. The arena is mmap'd, with slot
+exclusivity enforced by the kernel. Open files live in a generational handle
+table. A queued op can be genuinely dequeued, and `close(fd)` cancels whatever
+is still queued. The whole validation surface has been fuzzed under KASAN,
+lockdep and kmemleak.
 
 T13 added `rust/koru-sys`: the ABI mirror, the ioctl wrappers, `Ring`, `Arena`,
 `BufPool` and the errno table, with the T4–T11 matrix re-expressed as Rust
@@ -22,7 +22,7 @@ Everything from here is userspace.
 T15 added `rust/koru`: the op slab, a future per opcode and a
 single-threaded executor whose park is `ENTER`. An async block now reads a file
 through the ring while timers complete out of order. The crate is
-`#![forbid(unsafe_code)]` and depends on nothing but `koru-sys`.
+`#![forbid(unsafe_code)]` and depends on nothing from a registry.
 
 T16 added `race`, the crate's first combinator, and falsified the drop path
 under it: a `READ` dropped mid-flight keeps its slot until the target's CQE
@@ -58,6 +58,15 @@ Those impls are in `koru-sys`, because the orphan rule allows them nowhere
 else. `Error::closed()` is the only name userspace synthesises, and Rust's `?`
 is all four of Braam's `TRY` macros.
 
+T21 added the ambient ring: a thread-local `Runtime`, `#[koru::main]` from the
+new dependency-free `koru-macros`, `block_on`, `spawn`, `at_exit`, `Args`, and
+the write half of the operation layer, `write_all` and `close_fd`. The standard
+streams are re-opened through `/proc/self/fd` before they are adopted, because
+T18's gate refuses a blocking non-regular file and koru never sets `O_NONBLOCK`
+on a descriptor it did not open. The file position is userspace's own
+bookkeeping, which Braam's three-write hello world is what forces. `EPIPE`
+joined the errno table as `Closed`.
+
 T14 made the two userspace ABI mirrors a diff rather than a promise.
 `cpp/include/koru_abi.h` and `cpp/include/koru_errno.h` are the C mirrors,
 shared with `test/`, and an `abi_dump` on each side emits a canonical record
@@ -76,8 +85,9 @@ its fastest gate: no VM, no device, no module.
 - `test/` — `koru_check`, the one integrated test for the module. It includes
   the C ABI mirror from `cpp/include/` and keeps no copy. See Commands.
 - `rust/` — the Cargo workspace. `koru-sys` is the raw binding; `koru` holds
-  the futures, the executor and the Braam surface, which starts at
-  `koru/src/vocab.rs`.
+  the futures, the executor and the Braam surface — `vocab.rs`, `rt.rs`,
+  `ops.rs`, `args.rs` — and `koru-macros` is `#[koru::main]` alone. The
+  examples in `koru/examples/` are programs, so the guest runs them.
 - `cpp/` — the C ABI mirrors and `abi_dump`, built by the top-level
   `CMakeLists.txt`. The binding itself arrives at T39.
 - `scripts/` — the guest-side check and the host-side runner that boots the VM,
@@ -150,7 +160,7 @@ survived**.
 
 ## Commands
 
-These work today (T0 through T20):
+These work today (T0 through T21):
 
 ```sh
 KDIR=../kernel-dev/linux-source-7.1
@@ -180,8 +190,9 @@ KORU_SEED=12345 scripts/run.sh    # replay a fuzz failure
 # under a second; the integration suite needs /dev/koru, so it runs in a VM.
 (cd rust && cargo fmt --all -- --check)
 (cd rust && cargo test -p koru-sys --lib)      # ABI, ioctl numbers, errnos
-(cd rust && cargo test -p koru --lib)          # cookie, slab, op states
+(cd rust && cargo test -p koru --lib)          # cookie, slab, ops, vocabulary
 (cd rust && cargo test --workspace --no-run)   # build before the runner
+(cd rust && cargo build --examples)            # the programs the runner runs
 scripts/run-rust.sh
 scripts/run-rust.sh cancel read                # only matching test names
 KORU_SEED=12345 scripts/run-rust.sh            # replay a race loop

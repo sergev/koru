@@ -63,27 +63,6 @@ surface is built first and the C++ surface transcribes it, because the design
 will churn and churning it twice is the same mistake this plan avoids for the
 ABI.
 
-## Phase 6 — first milestone
-
-One task left, and at the end of it Braam's hello world runs through koru. This
-is the first point where the project's claim is demonstrated end to end rather
-than asserted, and it arrives well before the plan is finished.
-
-### T21 [M] — the ambient ring and runtime entry, Rust
-
-Braam programs never name an executor, and that is what makes free functions
-work. A thread-local default ring set up by the runtime entry, an attribute
-macro for `main`, `block_on`, a fire-and-forget spawn matching `proc_spawn`
-without its eight-task ceiling, and an at-exit hook — a destructor cannot await,
-and the buffered writers need flushing.
-
-Also the write half of the operation layer: `write_all` and `close_fd`, enough
-for the milestone. The rest is T30.
-
-Done test: Braam's hello world, compiled and run with the include line as the
-only change, writing through the ring via T17 and T19. Then T15's demo
-re-expressed against the ambient ring, same output.
-
 ## Phase 7 — kernel: the rest of the surface
 
 One finding governs every kernel task in this plan. **`override_creds` is not
@@ -860,7 +839,10 @@ lands:
    runs as the `runtime` suite inside step 2's boot: futures, executor, drop
    safety and the Rust surface (T15, T16, T21, T30–T32), plus the screen
    client against its fake daemon (T37).
-4. `cargo run --example read_file` — the Rust demo (T21).
+4. The Rust examples (T21), run inside step 2's boot rather than on the host:
+   `cargo run` cannot reach `/dev/koru` from here. `scripts/rust.sh` runs each
+   three ways, because a pipe, a regular file and an argument are three
+   different assertions about the entry.
 5. `cmake -B build -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined"`, then
    `cmake --build build`.
 6. `scripts/abi.sh` — the two ABI dumps agree (T14). The screen protocol's two
@@ -868,8 +850,8 @@ lands:
 7. `ctest --test-dir build` — the C++ matrix (T39), abandonment (T40),
    symmetric transfer (T41), drop safety (T43), the C++ surface (T44–T47) and
    the C++ screen client (T48), under ASan and UBSan.
-8. `./build/examples/read_file` — the C++ demo (T42). Must match step 4 byte
-   for byte.
+8. `./build/examples/read_file` — the C++ demo (T42). Must match the Rust
+   example of step 4 byte for byte.
 9. `ctest --test-dir build -L screen` — the terminal model against Braam's own
    cell-exact tests (T34), the protocol server's rejection matrix through
    `feed()` (T36) and the five pixel oracles (T35). **These need no VM, no

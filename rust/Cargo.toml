@@ -1,7 +1,7 @@
 # The Rust binding. `koru-sys` is the raw layer; `koru` holds the futures, the
 # executor and, from T20 on, the surface.
 [workspace]
-members = ["koru-sys", "koru"]
+members = ["koru-sys", "koru-macros", "koru"]
 resolver = "3"
 
 [workspace.package]

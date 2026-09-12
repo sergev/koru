@@ -126,6 +126,22 @@ impl<T> Slab<T> {
             Entry::Free { .. } => unreachable!("checked live above"),
         }
     }
+
+    /// Every live payload, the slab left empty and every index retired. The
+    /// caller drops them outside any borrow, as `remove` requires.
+    pub fn take_all(&mut self) -> Vec<T> {
+        let mut out = Vec::with_capacity(self.live);
+        for index in 0..self.entries.len() as u32 {
+            let generation = match &self.entries[index as usize] {
+                Entry::Live { generation, .. } => *generation,
+                Entry::Free { .. } => continue,
+            };
+            if let Some(v) = self.remove(Cookie::new(index, generation)) {
+                out.push(v);
+            }
+        }
+        out
+    }
 }
 
 #[cfg(test)]

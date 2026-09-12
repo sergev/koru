@@ -1781,6 +1781,158 @@ Six perturbations, each applied and reverted:
 emitter and the vocabulary cannot drift apart. The dump is byte-identical
 across that change: 136 records, still agreeing with the C mirror.
 
+## The ambient ring and the runtime entry
+
+T21 is the first task whose deliverable is a *program* rather than a library:
+Braam's hello world, running through koru. Most of it was straightforward and
+three parts were not — the standard streams, the file position, and what a
+program's exit means for what it spawned.
+
+### A thread-local ring, and an attribute macro with no `syn`
+
+`koru::rt` holds an `Option<Ambient>` in a thread-local: the `Runtime`, the
+three standard handles, and the position table. `install` replaces it, which is
+what lets a test have its own; `current` clones, which is cheap because a
+`Runtime` is a handle and not the ring. Every free function — `block_on`,
+`spawn`, `write_all` — finds it there, and that is the whole reason a Braam
+program never names an executor.
+
+`#[koru::main]` is a third crate, `koru-macros`, because a proc macro cannot
+live in the library it serves. It has **no dependencies**: no `syn`, no
+`quote`. The workspace lockfile still lists nothing but its own packages, which
+is the property worth keeping — this is one signature, and parsing it is token
+surgery. It finds `fn`, insists the token before it is `async` and the one
+after it is `main`, renames that one token, and appends a real `main` that
+calls the entry. Renaming one token rather than re-emitting the item is what
+keeps the body's spans, so a compile error inside the program still points at
+the program's own line. Accepting only `main` and only `async` is not
+pedantry: both misuses produce a clear message instead of a broken expansion,
+and both were checked by writing them.
+
+### The standard streams, and T18's gate inherited
+
+T19 recorded that a program whose stdout is a pipe or a tty cannot write
+through koru unless whoever created that descriptor made it non-blocking, and
+that this would be T21's problem. It is, and the answer is to re-open rather
+than to modify.
+
+`fcntl(F_SETFL, O_NONBLOCK)` on the inherited descriptor would work and is
+wrong: descriptor 1 is usually a *shared* file description, so the flag reaches
+the shell and every other process holding it — the classic way to break a
+terminal. Opening `/proc/self/fd/1` instead gives a file description of our
+own, and the flag stays inside the program. The whole probe is safe `std`,
+which matters because the crate is `#![forbid(unsafe_code)]`: `metadata` of
+`/proc/self/fd/N` follows the link and answers whether it is a regular file,
+`/proc/self/fdinfo/N` carries the open flags in octal, and `OpenOptionsExt`
+passes `O_NONBLOCK`. No `fstat`, no `fcntl`, no `unsafe`.
+
+So each of the three is adopted directly when it is a regular file or already
+non-blocking, and re-opened first otherwise. `ADOPT_FD` takes a reference of
+its own, so the re-opened descriptor is closed on the way out.
+
+**The re-open does not always work, and the VM is where it does not.** Under
+`vng --exec` descriptor 1 is a virtio-serial port, and virtio_console permits
+one open per port, so `/proc/self/fd/1` answers `-EBUSY`. On an ordinary
+terminal, where it is a `/dev/pts` device, it succeeds. When it fails the raw
+descriptor is adopted anyway and the write is refused, which is honest and
+visible rather than silent. The consequence, stated plainly: **a koru program
+run straight onto the VM console prints nothing; piped or redirected it works.**
+That is why the gate runs each example three ways.
+
+A descriptor that cannot be adopted at all becomes `Handle(0)`, which is never
+a valid handle, so the kernel answers `EBADF` rather than the runtime guessing.
+
+### The file position is userspace's, and hello world is what proves it
+
+`READ` and `WRITE` carry an explicit file offset and never touch `f_pos`. The
+plan calls the consequence `seek_fd` and files it under T30, as "pure userspace
+bookkeeping" — but it is not deferrable to T30, because **Braam's hello world
+writes three times**. With the offset stuck at 0 a redirected stdout ends up
+holding `!\n` over the front of the greeting, which is exactly what the
+perturbation produced.
+
+So the ambient state carries a position per handle, and `write_all` advances
+it. Two rules fall out. A handle is registered by *whoever creates it*, because
+only the creator knows whether an offset means anything on it — `install` for
+the three streams, T30's `open_at` for a path — so `register_handle` is public
+API rather than an internal detail. And an unregistered handle counts as a
+stream, offset 0, which is the only offset an unseekable file accepts anyway.
+
+This is the first place koru's "no `f_pos`" decision costs userspace something
+concrete. It is cheap, but it is not free, and it is now paid in one place.
+
+### `EPIPE` joins the errno table
+
+Braam's own `result.h` says it: `Closed` is "the far end of a stream is gone:
+EOF to a reader, EPIPE to a writer". T20's table had no `EPIPE` row, because
+until `WRITE` could reach a pipe nothing could produce one. It can now —
+`prog | head` produces it on purpose — so the row is there, mapped to `Closed`,
+in both mirrors.
+
+That retires T20's "exactly one name has no errno preimage": `Closed` now
+arrives both ways, from `EPIPE` and synthesised by `Error::closed()` for end of
+file, and the test became "every name is reachable", which is the stronger
+assertion. The socketpair test is what proves the row rather than asserting it:
+drop the far end, write, and the error is `Closed` carrying raw `EPIPE`.
+
+### What a program's exit means
+
+Braam's rule is that the process ends when the **root** task returns, whatever
+the others are doing, and `proc_spawn` is fire and forget. So the entry does
+not drive spawned tasks to completion. `Runtime::drop_tasks` empties the task
+slab; each dropped future's `Drop` abandons its op, which submits a `CANCEL`,
+and the bounded `drain` reaps them. An hour-long delay in a spawned task must
+not hold the exit, and when the perturbation made `shutdown` call `run()`
+instead, the test did not fail — it **hung**, and the alarm killed the guest
+process. A hang is a legitimate failure here as long as an alarm is armed.
+
+The at-exit hooks are asynchronous, because the thing they exist for is
+flushing a buffered writer and a destructor cannot await. They run last
+registered first, like C's `atexit`, before the tasks are dropped.
+
+Two interim shapes, both marked in the source. A non-blocking write that
+answers `EAGAIN` has nothing to wait on until `POLL_ADD` arrives at T22, so
+`write_all` backs off a millisecond through the ring rather than spinning. And
+a program that finds the slot pool empty yields and retries; a proper waiter
+queue belongs with T30, and with eight 64 KiB slots nothing reaches it.
+
+### The examples are the entry's own test
+
+`#[koru::main]` replaces `main`, so libtest cannot call one: the entry can only
+be tested by running a program. `scripts/rust.sh` runs both examples in the
+guest after the suites, and `scripts/run-rust.sh` asks cargo where each binary
+is, for the same reason it does for the test binaries.
+
+Each is run three ways, and each way is a different assertion. Through a
+**pipe**, which is blocking and is therefore the re-open path. Redirected to a
+**regular file**, which is the three-writes-at-three-offsets path. And with an
+argument, which is `Args`. `read_file` writes the file to stdout and the timer
+completion order to stderr, so "it printed the right bytes" and "the timers
+resolved out of order" stay two separate assertions, and the second is what
+makes it T15's demo rather than `cat`.
+
+A filtered run skips the examples, because a filter is a test-name filter and
+would otherwise run them unfiltered every time; an unfiltered run with no
+examples at all fails, which is the same hole `WANT_PASSED` closes.
+
+### What was shown to fail
+
+Six perturbations, each applied and reverted.
+
+- **The position always 0.** The runtime test fails on the file's contents, and
+  the script's regular-file hello prints the three writes on top of each other.
+- **The streams adopted as they are, with no re-open.** Every piped run
+  produces nothing at all, and the redirected one still passes — which is the
+  clearest statement of what the re-open is for.
+- **`shutdown` running the spawned tasks instead of dropping them.** The test
+  hangs rather than failing, and the alarm is what reports it.
+- **The at-exit hooks in registration order.** Only the hook-order test fails.
+- **The `EPIPE` row deleted.** The vocabulary's reachability test fails and
+  `scripts/abi.sh` fails, one for each mirror.
+- **`#[koru::main]` on a blocking `fn`, and on a function not called `main`.**
+  Both are a compile error naming the reason, rather than an expansion that
+  fails somewhere else.
+
 ## C++20 userspace binding
 
 The kernel side is **unchanged** — same device, same ioctls, same wire format,

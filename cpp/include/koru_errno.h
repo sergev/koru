@@ -16,9 +16,9 @@
 #ifndef KORU_ERRNO_H
 #define KORU_ERRNO_H
 
-/* The fifteen names, with Braam's wire values. Closed has no errno preimage:
- * end of file is res == 0, and the read wrapper is what turns one into the
- * other. */
+/* The fifteen names, with Braam's wire values. Closed reaches userspace two
+ * ways: EPIPE from a write whose reader is gone, and end of file, which is
+ * res == 0 and which the read wrapper is what turns into a name. */
 #define KORU_KIND_TABLE(X) \
     X(Invalid, 1)          \
     X(NoMemory, 2)         \
@@ -63,6 +63,7 @@ enum koru_kind { KORU_KIND_TABLE(KORU_KIND_ENUMERATOR) };
     X(ENOTTY, 25, Unsupported)     \
     X(ENOSPC, 28, Io)              \
     X(EROFS, 30, Perm)             \
+    X(EPIPE, 32, Closed)           \
     X(ERANGE, 34, Invalid)         \
     X(ENAMETOOLONG, 36, Invalid)   \
     X(ENOSYS, 38, Unsupported)     \

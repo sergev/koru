@@ -121,6 +121,7 @@ device matrix, and `koru`'s `runtime`, which is the futures and the executor.
 
 ```sh
 (cd ../rust && cargo test --workspace --no-run)   # build first, as above
+(cd ../rust && cargo build --examples)            # and the example programs
 scripts/run-rust.sh
 scripts/run-rust.sh cancel read                   # only matching test names
 KORU_SEED=12345 scripts/run-rust.sh               # replay a race loop
@@ -149,6 +150,19 @@ coverage is still `koru_check`'s job.
 It picks each test binary out of `cargo`'s JSON by target **kind**. Since T14
 `koru-sys` also has an `abi_dump` bin, which the same command emits, in an
 order that varies; taking the wrong one runs no tests and exits 0.
+
+After the suites it runs the **examples**, listed in `EXAMPLES` and located the
+same way. They are the runtime entry's only test, because `#[koru::main]`
+replaces `main` and libtest cannot call one. Each runs three ways, and each way
+asserts something different: through a pipe, which koru can only write to after
+re-opening it; redirected to a regular file, which is three writes at three
+offsets; and with an argument, which is `Args`. A filtered run skips them,
+since a filter is a test-name filter, and an unfiltered run with none fails.
+
+**A koru program run straight onto the VM console prints nothing.** Its stdout
+is a virtio-serial port, which permits one open, so the runtime cannot re-open
+it non-blocking and the kernel refuses the write. Redirect or pipe it — which
+is what the gate does, and what doc/Notes.md explains.
 
 ## The ABI conformance diff
 

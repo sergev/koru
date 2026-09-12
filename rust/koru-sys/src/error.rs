@@ -96,6 +96,7 @@ pub const EMFILE: Errno = Errno(24);
 pub const ENOTTY: Errno = Errno(25);
 pub const ENOSPC: Errno = Errno(28);
 pub const EROFS: Errno = Errno(30);
+pub const EPIPE: Errno = Errno(32);
 pub const ERANGE: Errno = Errno(34);
 pub const ENAMETOOLONG: Errno = Errno(36);
 pub const ENOSYS: Errno = Errno(38);
@@ -110,8 +111,8 @@ pub const ECANCELED: Errno = Errno(125);
 
 /// Braam's error vocabulary, with Braam's wire values.
 ///
-/// [`Kind::Closed`] has no errno preimage: EOF is `res == 0`, and T30's
-/// `read_chunk` is what turns one into the other.
+/// [`Kind::Closed`] reaches a program two ways: `EPIPE`, and end of file,
+/// which is `res == 0` and which T30's `read_chunk` turns into a name.
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 #[repr(u8)]
 pub enum Kind {
@@ -302,6 +303,12 @@ pub const KORU_ERRNOS: &[ErrnoDef] = &[
         produced_by: "filp_open on a read-only mount",
     },
     ErrnoDef {
+        errno: EPIPE,
+        name: "EPIPE",
+        kind: Kind::Closed,
+        produced_by: "WRITE to a pipe or socket whose reader is gone",
+    },
+    ErrnoDef {
         errno: ERANGE,
         name: "ERANGE",
         kind: Kind::Invalid,
@@ -394,7 +401,7 @@ impl Error {
         }
     }
 
-    /// The one name with no errno preimage; raw 0 means synthesised here.
+    /// End of file, which has no errno at all; raw 0 means synthesised here.
     /// The only such constructor, on purpose. doc/Notes.md says why.
     pub fn closed() -> Error {
         Error {
