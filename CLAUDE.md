@@ -14,12 +14,12 @@ table. A queued op can be genuinely dequeued, and `close(fd)` cancels whatever
 is still queued. The whole validation surface has been fuzzed under KASAN,
 lockdep and kmemleak.
 
-T13 added `rust/koru-sys`: the ABI mirror, the ioctl wrappers, `Ring`, `Arena`,
+T13 added `rust/sys`: the ABI mirror, the ioctl wrappers, `Ring`, `Arena`,
 `BufPool` and the errno table, with the T4–T11 matrix re-expressed as Rust
 integration tests. It also moved the whole project onto rustup's rustc 1.98.1.
 Everything from here is userspace.
 
-T15 added `rust/koru`: the op slab, a future per opcode and a
+T15 added `rust/runtime`: the op slab, a future per opcode and a
 single-threaded executor whose park is `ENTER`. An async block now reads a file
 through the ring while timers complete out of order. The crate is
 `#![forbid(unsafe_code)]` and depends on nothing from a registry.
@@ -84,10 +84,13 @@ its fastest gate: no VM, no device, no module.
   `koru_ops.rs` holds opcode dispatch, the op implementations and `OpWork`.
 - `test/` — `koru_check`, the one integrated test for the module. It includes
   the C ABI mirror from `cpp/include/` and keeps no copy. See Commands.
-- `rust/` — the Cargo workspace. `koru-sys` is the raw binding; `koru` holds
-  the futures, the executor and the Braam surface — `vocab.rs`, `rt.rs`,
-  `ops.rs`, `args.rs` — and `koru-macros` is `#[koru::main]` alone. The
-  examples in `koru/examples/` are programs, so the guest runs them.
+- `rust/` — the Cargo workspace. **Directories are named by role and packages
+  by name**: `rust/sys` is `koru-sys`, the raw binding; `rust/runtime` is
+  `koru` itself, holding the futures, the executor and the Braam surface
+  (`vocab.rs`, `rt.rs`, `ops.rs`, `args.rs`); `rust/macros` is `koru-macros`,
+  `#[koru::main]` alone. Cargo names the package, so `-p koru-sys` and
+  `use koru_sys::` are unaffected by the directory. The examples in
+  `rust/runtime/examples/` are programs, so the guest runs them.
 - `cpp/` — the C ABI mirrors and `abi_dump`, built by the top-level
   `CMakeLists.txt`. The binding itself arrives at T39.
 - `scripts/` — the guest-side check and the host-side runner that boots the VM,
@@ -208,15 +211,15 @@ ctest --test-dir build          # the same comparison, as a registered test
 `test/koru_check` is the entire test suite for the module: one binary, one
 shared ring, one process, plus the two `rmmod` races that need a second one.
 `kernel/koru_abi.rs` is canonical and is copied into two userspace mirrors,
-`rust/koru-sys/src/abi.rs` and `cpp/include/koru_abi.h`, which `test/` includes
+`rust/sys/src/abi.rs` and `cpp/include/koru_abi.h`, which `test/` includes
 rather than copying again. **A wire-format change is all three files**, and
 only the kernel one is unchecked: `scripts/abi.sh` diffs the other two, and the
 header's own `static_assert`s catch a layout slip at compile time. The C++
 suite comes at T39.
 
 `scripts/rust.sh` runs both Rust suites in one VM boot:
-`rust/koru-sys/tests/kernel.rs`, which is T4–T11 plus the T3 matrices, and
-`rust/koru/tests/runtime.rs`, which is the futures and the executor. Neither
+`rust/sys/tests/kernel.rs`, which is T4–T11 plus the T3 matrices, and
+`rust/runtime/tests/runtime.rs`, which is the futures and the executor. Neither
 supersedes `koru_check`, which keeps the fuzz, the two `rmmod` races and the
 heavy-phase leak window. Two gates exist because `#[test]` can pass without
 proving anything: a filter matching nothing exits 0, so `rust.sh` asserts a
@@ -455,9 +458,9 @@ wrappers.
 
 ## Cross-language ABI
 
-`kernel/koru_abi.rs` is canonical; `rust/koru-sys/src/abi.rs` and
+`kernel/koru_abi.rs` is canonical; `rust/sys/src/abi.rs` and
 `cpp/include/koru_abi.h` mirror it, and `cpp/include/koru_errno.h` mirrors
-`rust/koru-sys/src/error.rs`. The two mirrors are kept in step by
+`rust/sys/src/error.rs`. The two mirrors are kept in step by
 `scripts/abi.sh`, which diffs an `abi_dump` emitted by each side. Touch any of
 them and run it — then confirm it actually fails when you perturb a field, or
 it proves nothing.
@@ -466,7 +469,7 @@ Adding a field or a constant means editing **both** emitters, and a record
 missing from both diffs clean. That is why each struct declares its field count
 and each emitter checks that the field sizes sum to `sizeof`; keep new structs
 padding-free so that guard keeps working. The diff cannot see the kernel at
-all — the caps assertions in `rust/koru-sys/tests/kernel.rs` are the only thing
+all — the caps assertions in `rust/sys/tests/kernel.rs` are the only thing
 tying a mirror to the canonical file, and they run in the VM.
 
 The two userspace bindings share no code. That is intentional: the second

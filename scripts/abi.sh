@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: MIT
 #
 # The ABI conformance gate: cpp/include/koru_abi.h and koru_errno.h against
-# rust/koru-sys/src/abi.rs and error.rs, through the two abi_dump binaries.
+# rust/sys/src/abi.rs and error.rs, through the two abi_dump binaries.
 # No VM, no device, no module. CMake registers this same script as the
 # `abi_conformance` ctest, so there is one implementation of the comparison.
 #

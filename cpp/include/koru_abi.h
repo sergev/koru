@@ -2,7 +2,7 @@
 /*
  * The koru wire format. Hand-written mirror of kernel/koru_abi.rs, which is
  * canonical. A change there means a change here, and scripts/abi.sh diffs this
- * file against rust/koru-sys/src/abi.rs through the two abi_dump binaries.
+ * file against rust/sys/src/abi.rs through the two abi_dump binaries.
  *
  * Two rules hold everywhere: reserved fields must be zero and unknown flag bits
  * are rejected, and nothing has padding.
@@ -130,7 +130,7 @@ struct koru_enter {
 };
 
 /* Size alone would not catch two fields being swapped, so assert every
- * offset. The kernel file and rust/koru-sys/src/abi.rs assert the same set. */
+ * offset. The kernel file and rust/sys/src/abi.rs assert the same set. */
 
 KORU_STATIC_ASSERT(sizeof(struct koru_params) == 104, "params size");
 KORU_STATIC_ASSERT(KORU_ALIGNOF(struct koru_params) == 8, "params align");

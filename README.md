@@ -104,7 +104,7 @@ and no `Waker`.
   the only entry point.
 - **The `mmap`'d arena** — fixed-size slots in kernel-owned pages. This is the
   data plane.
-- **`rust/koru-sys`, `rust/koru`** — the Rust binding: ABI structs and ioctl
+- **`rust/sys`, `rust/runtime`** — the Rust binding: ABI structs and ioctl
   wrappers, then `Future` impls, an executor and the Braam surface.
 - **`cpp`** — the C++20 binding: awaiters, `task<T>` and an executor.
 
@@ -114,41 +114,79 @@ makes with `io-wq`.
 
 ## Status
 
-**The kernel module works, and the Rust binding runs async code.** It registers
-`/dev/koru` and runs `NOP`, `DELAY_NS`, `CHECKSUM`, `OPEN`, `READ`, `CLOSE` and
-`CANCEL` through `ENTER`. The arena is mapped and slot exclusivity is enforced
-by the kernel, open files live in a generational handle table, a queued
-operation can be genuinely dequeued, and closing the ring cancels whatever is
-still queued. The whole validation surface has been fuzzed for ten minutes under
-KASAN, lockdep and kmemleak with no kernel messages.
+**Braam's hello world runs through koru**, which is the first point where the
+language-neutrality claim is demonstrated rather than asserted — and it is the
+program's own source, not a lookalike:
+
+```rust
+use koru::{Args, Result, write_all};
+
+#[koru::main]
+async fn main(args: Args) -> Result<i32> {
+    let mut who = "world";
+    if args.size() > 1 {
+        who = &args[1];
+    }
+
+    write_all(koru::stdout(), "Hello, ").await?;
+    write_all(koru::stdout(), who).await?;
+    write_all(koru::stdout(), "!\n").await?;
+
+    Ok(0)
+}
+```
+
+It names no executor and no ring. The runtime entry opens one, adopts
+descriptors 0, 1 and 2 into it, and the free functions find it in a
+thread-local — so those three writes reach the terminal through `ADOPT_FD` and
+`WRITE`, with nothing between them and the kernel but the `ENTER` ioctl.
+
+The module registers `/dev/koru` and runs `NOP`, `DELAY_NS`, `CHECKSUM`,
+`OPEN`, `READ`, `WRITE`, `CLOSE`, `CANCEL` and `ADOPT_FD` through `ENTER`. The
+arena is mapped and slot exclusivity is enforced by the kernel, open files live
+in a generational handle table, a queued operation can be genuinely dequeued,
+and closing the ring cancels whatever is still queued. The whole validation
+surface has been fuzzed for ten minutes under KASAN, lockdep and kmemleak with
+no kernel messages.
 
 One binary, `test/koru_check`, is the entire test suite for the module.
 `scripts/run.sh` boots a VM, runs it and prints one verdict line in about half a
 minute.
 
-`rust/koru-sys` is the first half of the Rust binding: the `#[repr(C)]` ABI
+`rust/sys` is the first half of the Rust binding: the `#[repr(C)]` ABI
 mirror, the ioctl wrappers, the ring and its arena, a buffer pool, and the errno
 table. Its integration suite re-expresses the module's own tests against that
 API, so the two independent views of the wire format have to agree.
 `scripts/run-rust.sh` runs it in a VM.
 
-`rust/koru` is the second half: an op slab keyed by a generational cookie, a
+`rust/runtime` is the second half: an op slab keyed by a generational cookie, a
 future per opcode, and a single-threaded executor whose park is the `ENTER`
 ioctl. An async block reads a file through the ring while timers complete out
 of order. Dropping a future mid-flight cancels its operation and holds its
 buffer slot until the completion lands, so nothing the kernel is still writing
-into can be reused. The crate contains no `unsafe` at all.
+into can be reused. On top of that sit Braam's vocabulary, the ambient ring,
+`#[koru::main]` and the write half of its operation layer. The crate contains
+no `unsafe` at all.
 
 The wire format now exists in a C mirror as well, `cpp/include/koru_abi.h`,
 which the C test suite includes rather than copying. Each side prints a
 canonical dump of the whole surface and `scripts/abi.sh` diffs the two, so the
 agreement is checked rather than promised. It needs no VM and no device.
 
-Next is userspace, and the Braam decision reopens the kernel for one phase:
-there is no `WRITE` opcode yet, and `OPEN` refuses anything but regular files
-and directories on purpose, because a blocking read in a worker thread cannot be
-interrupted. So today a koru program cannot write to a terminal or a pipe at
-all, which the target API rather depends on.
+One limitation is worth knowing before you run a program. A blocking read or
+write in a worker thread cannot be interrupted, so the kernel admits a
+non-regular file only when it was opened non-blocking — and koru never sets
+that bit on a descriptor it did not open. The runtime re-opens the standard
+streams through `/proc/self/fd` to get a file description of its own, which
+works for a pipe and an ordinary terminal but not for every character device:
+on the virtio console of a VM, opening it a second time is refused, so a
+program printing straight onto that console prints nothing. Redirect it or
+pipe it.
+
+Next is the rest of the kernel surface — `POLL_ADD` first, because a socket
+wakes from softirq and that is the biggest unknown left, then stat, the path
+operations and `READDIR` — followed by the rest of the operation layer, the
+terminal, and the C++ binding that has to transcribe all of it.
 
 [doc/Notes.md](doc/Notes.md) has the design and the reasoning behind it.
 [doc/Plan.md](doc/Plan.md) has the remaining tasks, each with a test.

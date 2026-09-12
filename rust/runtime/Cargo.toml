@@ -9,8 +9,8 @@ description = "koru futures, op slab and single-threaded executor"
 # but its own packages is what proves the build needs none. koru-macros is the
 # #[koru::main] attribute, written without syn for the same reason.
 [dependencies]
-koru-sys = { path = "../koru-sys" }
-koru-macros = { path = "../koru-macros" }
+koru-sys = { path = "../sys" }
+koru-macros = { path = "../macros" }
 
 # Declared rather than autodiscovered, like koru-sys's.
 [[test]]

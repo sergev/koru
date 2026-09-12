@@ -1100,7 +1100,7 @@ available to make; it is not a relicensing of somebody else's code.
 
 ## The Rust binding
 
-`rust/koru-sys` is the raw layer: the ABI mirror, the ioctl wrappers, `Ring`,
+`rust/sys` is the raw layer: the ABI mirror, the ioctl wrappers, `Ring`,
 `Arena`, `BufPool` and the errno table. The kernel side is unchanged.
 
 ### Two toolchains became one, at 1.98.1
@@ -1392,7 +1392,7 @@ selects on the target kind.
 
 ## Futures and the executor
 
-T15 built `rust/koru`: a slab of op state keyed by a generational cookie, a
+T15 built `rust/runtime`: a slab of op state keyed by a generational cookie, a
 future per opcode, and a single-threaded executor whose park is
 `ENTER(min_complete = 1)`. The ownership rule the design section states —
 the slab entry owns the `BufSlot`, the future owns only the cookie, a drop
@@ -2076,7 +2076,7 @@ In dependency order. The kernel files marked *exists* are written; the rest
 arrive with their tasks.
 
 - `kernel/koru_abi.rs` — `#[repr(C)]` SQE/CQE/params/ioctl definitions.
-  Mirrored byte-for-byte by `rust/koru-sys/src/abi.rs`. The most consequential
+  Mirrored byte-for-byte by `rust/sys/src/abi.rs`. The most consequential
   file in the project. *exists*
 - `kernel/koru.rs` — `MiscDevice` impl, the `Arc<RingCtx>` graph, admission
   control. *exists*
@@ -2085,35 +2085,35 @@ arrive with their tasks.
 - `kernel/koru_arena.rs` — `KVec<Page>`, the `mmap` validation matrix, the
   `vm_insert_page` loop, slot busy tracking. The arena code is still in
   `koru.rs`; split it out when it grows enough to be worth the churn.
-- `rust/koru-sys/src/abi.rs` — the userspace mirror of `koru_abi.rs`, with the
+- `rust/sys/src/abi.rs` — the userspace mirror of `koru_abi.rs`, with the
   same assertions as compile-time `const` checks. *exists*
-- `rust/koru-sys/src/sys.rs` — the fourteen hand-declared libc prototypes, the
+- `rust/sys/src/sys.rs` — the fourteen hand-declared libc prototypes, the
   `_IOC` encoding and the typed ioctl wrappers. *exists*
-- `rust/koru-sys/src/error.rs` — `Errno`, the fifteen-name `Kind`, `Error` and
+- `rust/sys/src/error.rs` — `Errno`, the fifteen-name `Kind`, `Error` and
   `KORU_ERRNOS`. *exists*
-- `rust/koru-sys/src/ring.rs` — `Ring`, `Arena`, the `ENTER` outcome types and
+- `rust/sys/src/ring.rs` — `Ring`, `Arena`, the `ENTER` outcome types and
   the `Sqe` constructors. *exists*
-- `rust/koru-sys/src/pool.rs` — `BufPool` and move-only `BufSlot`. *exists*
-- `rust/koru-sys/tests/kernel.rs` — the device suite, T4-T11 plus the T3
+- `rust/sys/src/pool.rs` — `BufPool` and move-only `BufSlot`. *exists*
+- `rust/sys/tests/kernel.rs` — the device suite, T4-T11 plus the T3
   matrices. *exists*
-- `rust/koru/src/slab.rs` — the generational `Cookie` and the payload-generic
+- `rust/runtime/src/slab.rs` — the generational `Cookie` and the payload-generic
   slab. Device-free, so its mechanics are host tests. *exists*
-- `rust/koru/src/op.rs` — the op states and their transitions, plus the stall
+- `rust/runtime/src/op.rs` — the op states and their transitions, plus the stall
   predicate. Also device-free. *exists*
-- `rust/koru/src/reactor.rs` — the pending batch, `ENTER`, dispatch, and the
+- `rust/runtime/src/reactor.rs` — the pending batch, `ENTER`, dispatch, and the
   lock order everything else obeys. *exists*
-- `rust/koru/src/exec.rs` — `Runtime`, the task slab, the waker, `spawn`,
+- `rust/runtime/src/exec.rs` — `Runtime`, the task slab, the waker, `spawn`,
   `block_on`. *exists*
-- `rust/koru/src/future.rs` — one future per opcode and their shared drop.
+- `rust/runtime/src/future.rs` — one future per opcode and their shared drop.
   *exists*
-- `rust/koru/src/combinator.rs` — `race` and `Either`, and the only place a
+- `rust/runtime/src/combinator.rs` — `race` and `Either`, and the only place a
   koru future is dropped for you. *exists*
-- `rust/koru/tests/runtime.rs` — the device suite for all of it. *exists*
+- `rust/runtime/tests/runtime.rs` — the device suite for all of it. *exists*
 - `cpp/include/koru_abi.h` — the C mirror of `koru_abi.rs`, kept in step by
   the T14 conformance diff. *exists*
 - `cpp/include/koru_errno.h` — the C mirror of `error.rs`'s vocabulary and
   errno table, as X-macros. *exists*
-- `cpp/tools/abi_dump.cpp` and `rust/koru-sys/src/bin/abi_dump.rs` — the two
+- `cpp/tools/abi_dump.cpp` and `rust/sys/src/bin/abi_dump.rs` — the two
   emitters `scripts/abi.sh` diffs. *exists*
 - `cpp/include/koru.hpp` — `Ring`, `BufPool`, move-only `BufSlot`,
   `result<T>`.
@@ -2126,7 +2126,7 @@ arrive with their tasks.
 `test/koru_check` stays the kernel's own check and is not superseded by the
 Rust suite: it owns the fuzz, the two `rmmod` races and the heavy-phase leak
 window. A wire-format change is still three files — `kernel/koru_abi.rs` and
-the two userspace mirrors, `rust/koru-sys/src/abi.rs` and
+the two userspace mirrors, `rust/sys/src/abi.rs` and
 `cpp/include/koru_abi.h` — but only the first of those three is now unchecked.
 `test/` includes the C mirror rather than keeping a fourth copy, and
 `scripts/abi.sh` diffs the two mirrors against each other.

@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: MIT */
 /*
  * Braam's error vocabulary and the closed set of errnos koru can produce.
- * Hand-written mirror of rust/koru-sys/src/error.rs; scripts/abi.sh diffs the
+ * Hand-written mirror of rust/sys/src/error.rs; scripts/abi.sh diffs the
  * two through the abi_dump binaries.
  *
  * Each row's provenance prose lives in error.rs and is deliberately not

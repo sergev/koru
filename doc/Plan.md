@@ -51,9 +51,11 @@ decision landed. If you renumber again, fix the references in
 [README.md](../README.md), [CLAUDE.md](../CLAUDE.md), [Notes.md](Notes.md) and
 `test/`.
 
-Rust lives in a Cargo workspace under `rust/`: `koru-sys` holds the ABI structs,
-the ioctl wrappers and `abi_dump`; `koru` holds the futures, the executor and
-the surface. C++ lives in `cpp`, with names in `namespace koru` and
+Rust lives in a Cargo workspace under `rust/`, whose directories are named by
+role and whose packages keep the `koru` prefix: `rust/sys` is `koru-sys` and
+holds the ABI structs, the ioctl wrappers and `abi_dump`; `rust/runtime` is
+`koru` and holds the futures, the executor and the surface; `rust/macros` is
+`koru-macros`. C++ lives in `cpp`, with names in `namespace koru` and
 `cpp/include/koru/braam.hpp` hoisting them to global scope, so a Braam
 source compiles with one added include.
 
@@ -686,7 +688,7 @@ RAII `Ring` covering open, `SETUP`, `mmap` and close. `BufPool`, move-only
 `result<T>` carrying both the Braam `Error` and the raw errno. No coroutines.
 
 Done test: the T4–T11 matrix re-expressed in C++, mirroring the test list in
-`rust/koru-sys/tests/kernel.rs` case for case. Any divergence is an ABI
+`rust/sys/tests/kernel.rs` case for case. Any divergence is an ABI
 ambiguity worth fixing before coroutines hide it.
 
 ### T40 [R] — op slab and awaiter
