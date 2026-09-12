@@ -39,6 +39,7 @@ static atomic_int stop;
 static int fd = -1;
 static uint8_t *arena;
 static uint64_t max_delay_ns;
+static int adoptable = -1; /* read-only, never 0/1/2: see gen_valid */
 
 /* xorshift64*, per thread so threads never share PRNG state. */
 static uint64_t rnd(uint64_t *s)
@@ -120,6 +121,9 @@ static int res_allowed(uint8_t opcode, int64_t res)
         return (res >= 0 && res <= F_SLOT) || res == -EINVAL || res == -EBADF || res == -EBUSY ||
                res == -ENOMEM || res == -EAGAIN || res == -ECANCELED || res == -EIO ||
                res == -EINTR || res == -ENOSPC || res == -EFBIG || res == -EDQUOT;
+    case KORU_OP_ADOPT_FD:
+        return res >= 0x10000 || res == -EINVAL || res == -EBADF || res == -ELOOP ||
+               res == -EMFILE;
     case KORU_OP_CHECKSUM:
         return res >= 0 || res == -EINVAL || res == -EBUSY || res == -ENOMEM || res == -EAGAIN ||
                res == -ECANCELED;
@@ -152,7 +156,7 @@ static void gen_valid(uint64_t *s, struct koru_sqe *q, uint64_t ud, uint32_t pat
 {
     uint32_t slot = rnd_below(s, F_SLOTS);
 
-    switch (rnd_below(s, 14)) {
+    switch (rnd_below(s, 15)) {
     case 0:
         sqe_nop(q, ud);
         break;
@@ -199,6 +203,22 @@ static void gen_valid(uint64_t *s, struct koru_sqe *q, uint64_t ud, uint32_t pat
         break;
     case 12:
         sqe_cancel(q, UD(KORU_OP_DELAY_NS, rnd(s)), ud);
+        break;
+    case 13:
+        /* Only a read-only scratch fd, the ring itself (ELOOP) and a number
+         * that is no fd at all. Never 0, 1 or 2: an adopted stdout plus a
+         * random WRITE would shred the check's own output. */
+        switch (rnd_below(s, 3)) {
+        case 0:
+            sqe_adopt(q, adoptable, ud);
+            break;
+        case 1:
+            sqe_adopt(q, fd, ud);
+            break;
+        default:
+            sqe_adopt(q, 1 << 20, ud);
+            break;
+        }
         break;
     default:
         sqe_checksum(q, slot, 0, rnd_below(s, F_SLOT + 1), ud);
@@ -563,8 +583,8 @@ static unsigned long long drain(void)
 
 int fuzz_main(unsigned secs, uint64_t seed)
 {
-    static const char *names[9] = { "NOP",   "DELAY",  "OPEN",  "READ", "CLOSE",
-                                    "CANCEL", "CKSUM", "WRITE", "other" };
+    static const char *names[10] = { "NOP",    "DELAY", "OPEN",  "READ",  "CLOSE",
+                                     "CANCEL", "CKSUM", "WRITE", "ADOPT", "other" };
     struct koru_ring m;
     pthread_t th[NWORKERS + 2];
     uint64_t seeds[NWORKERS + 2];
@@ -582,6 +602,11 @@ int fuzz_main(unsigned secs, uint64_t seed)
 
     if (make_pattern_file(FUZZWRFILE, F_SLOT) != 0) {
         fail("create the fuzzer's scratch file");
+        return failures;
+    }
+    adoptable = open(PATFILE, O_RDONLY);
+    if (adoptable < 0) {
+        fail("open the fuzzer's adoptable fd");
         return failures;
     }
 
@@ -633,7 +658,7 @@ int fuzz_main(unsigned secs, uint64_t seed)
 
         note("%llu ENTERs, %llu SQEs consumed, %llu CQEs reaped (%llu at drain)",
              (unsigned long long)atomic_load(&total_ops), sub, rea, tail);
-        for (op = 0; op < 9; op++)
+        for (op = 0; op < 10; op++)
             note("%-6s %7llu completed, %7llu succeeded", names[op],
                  (unsigned long long)atomic_load(&op_total[op]),
                  (unsigned long long)atomic_load(&op_ok[op]));
@@ -646,7 +671,7 @@ int fuzz_main(unsigned secs, uint64_t seed)
         check(sub > SUB_FLOOR, "the fuzzer actually exercised the ring");
         /* Completion, not success: the tail sections carry that claim. */
         reached = 1;
-        for (op = 0; op <= KORU_OP_WRITE; op++)
+        for (op = 0; op <= KORU_OP_ADOPT_FD; op++)
             if (atomic_load(&op_total[op]) == 0) {
                 note("opcode %d never completed once", op);
                 reached = 0;
@@ -658,6 +683,7 @@ int fuzz_main(unsigned secs, uint64_t seed)
     }
 
     ring_close(&m);
+    close(adoptable);
     unlink(FUZZWRFILE);
     return failures;
 }

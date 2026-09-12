@@ -481,6 +481,16 @@ impl Sqe {
         }
     }
 
+    /// `off` carries the descriptor; every other field must be zero.
+    pub fn adopt_fd(user_data: u64, fd: i32) -> Sqe {
+        Sqe {
+            opcode: KORU_OP_ADOPT_FD,
+            off: fd as u64,
+            user_data,
+            ..Sqe::default()
+        }
+    }
+
     /// `off` is a file offset; the source is always slot offset 0.
     pub fn write(user_data: u64, handle: u32, slot: u32, off: u64, len: u32) -> Sqe {
         Sqe {

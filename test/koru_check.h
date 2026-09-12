@@ -38,6 +38,7 @@ void sec_open(void);
 void sec_read(void);
 void sec_write(void);
 void sec_nonblock(void);
+void sec_adopt(void);
 void sec_delay(void);
 void sec_cancel(void);
 void sec_signals(void);

@@ -23,7 +23,7 @@ TIMEOUT=${TIMEOUT:-600}
 # package:test-target:minimum-passed, one per suite. The floor is per suite on
 # purpose: a single total would let one crate's growth mask a filter typo that
 # ran none of another's. Raise a floor when a test is added.
-SUITES=${SUITES:-"koru-sys:kernel:66 koru:runtime:17"}
+SUITES=${SUITES:-"koru-sys:kernel:70 koru:runtime:17"}
 
 # Race-loop knobs, forwarded into the guest. KORU_ITERS raises a loop's count
 # and KORU_SEED replays one; each test prints the values it used. The full

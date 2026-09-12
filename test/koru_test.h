@@ -62,6 +62,7 @@ const struct koru_cqe *find_cqe(const struct koru_cqe *cq, unsigned n, uint64_t 
 /* Whole ops on a mapped ring, each to completion. `slot` is the caller's. */
 int64_t r_open(struct koru_ring *r, uint32_t slot, const char *path, uint32_t flags);
 int64_t r_close(struct koru_ring *r, uint32_t handle);
+int64_t r_adopt(struct koru_ring *r, int fd);
 int64_t r_read(struct koru_ring *r, uint32_t handle, uint32_t slot, uint64_t off, uint32_t len);
 int64_t r_write(struct koru_ring *r, uint32_t handle, uint32_t slot, uint64_t off, uint32_t len);
 
@@ -72,6 +73,7 @@ void sqe_checksum(struct koru_sqe *s, uint32_t slot, uint64_t off, uint32_t len,
 void sqe_open(struct koru_sqe *s, uint32_t slot, uint64_t off, uint32_t len, uint32_t flags,
               uint64_t user_data);
 void sqe_close(struct koru_sqe *s, uint32_t handle, uint64_t user_data);
+void sqe_adopt(struct koru_sqe *s, int fd, uint64_t user_data);
 void sqe_read(struct koru_sqe *s, uint32_t handle, uint32_t slot, uint64_t off, uint32_t len,
               uint64_t user_data);
 void sqe_write(struct koru_sqe *s, uint32_t handle, uint32_t slot, uint64_t off, uint32_t len,

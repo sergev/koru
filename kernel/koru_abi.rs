@@ -26,6 +26,11 @@ pub(crate) fn ealready() -> Error {
     Error::from_errno(-(kernel::uapi::EALREADY as i32))
 }
 
+/// `ELOOP`: adopting a koru descriptor into a koru ring. Not in `error::code`.
+pub(crate) fn eloop() -> Error {
+    Error::from_errno(-(kernel::uapi::ELOOP as i32))
+}
+
 /// Set by userspace in [`KoruParams::magic`]. Spells "koru" little-endian.
 pub(crate) const KORU_MAGIC: u32 = 0x7572_6f6b;
 
@@ -182,6 +187,15 @@ pub(crate) const KORU_OP_CHECKSUM: u8 = 6; // T7
 /// a seekable file, else `EINVAL`; on an `O_APPEND` handle the kernel appends
 /// and `off` is ignored.
 pub(crate) const KORU_OP_WRITE: u8 = 7; // T17
+/// Adopt the already-open descriptor in `off` and return a handle for it, so
+/// stdin, stdout and stderr can reach the ring. `len`, `slot` and `handle` must
+/// be zero, and `off` must be at most `i32::MAX`.
+///
+/// **Grants no authority the submitting task does not already hold**: no
+/// permission check happens here, because the task already has the descriptor.
+/// Adopting any koru descriptor is `ELOOP` — it would make the ring
+/// unreachable by `release` and the module unloadable.
+pub(crate) const KORU_OP_ADOPT_FD: u8 = 8; // T19
 
 /// Any bit set is rejected.
 pub(crate) const KORU_SQE_FLAGS_ALL: u8 = 0;
@@ -234,7 +248,8 @@ pub(crate) struct Sqe {
     pub(crate) len: u32,
     /// Opcode-specific offset. A file offset on `READ` and `WRITE`, a
     /// within-slot offset on `OPEN` and `CHECKSUM`, nanoseconds on `DELAY_NS`,
-    /// the target's `user_data` on `CANCEL`. `NOP` and `CLOSE` want zero.
+    /// the target's `user_data` on `CANCEL`, a file descriptor on `ADOPT_FD`.
+    /// `NOP` and `CLOSE` want zero.
     pub(crate) off: u64,
     /// Echoed into the CQE. Opaque; userspace packs (slab index, generation).
     pub(crate) user_data: u64,

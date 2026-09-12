@@ -268,6 +268,14 @@ int64_t r_close(struct koru_ring *r, uint32_t handle)
     return run_one(r->fd, &s);
 }
 
+int64_t r_adopt(struct koru_ring *r, int fd)
+{
+    struct koru_sqe s;
+
+    sqe_adopt(&s, fd, 0x104);
+    return run_one(r->fd, &s);
+}
+
 int64_t r_read(struct koru_ring *r, uint32_t handle, uint32_t slot, uint64_t off, uint32_t len)
 {
     struct koru_sqe s;
@@ -328,6 +336,14 @@ void sqe_close(struct koru_sqe *s, uint32_t handle, uint64_t user_data)
     memset(s, 0, sizeof(*s));
     s->opcode    = KORU_OP_CLOSE;
     s->handle    = handle;
+    s->user_data = user_data;
+}
+
+void sqe_adopt(struct koru_sqe *s, int fd, uint64_t user_data)
+{
+    memset(s, 0, sizeof(*s));
+    s->opcode    = KORU_OP_ADOPT_FD;
+    s->off       = (uint64_t)fd;
     s->user_data = user_data;
 }
 

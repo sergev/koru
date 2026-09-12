@@ -619,6 +619,98 @@ already runs for three seconds under eight threads. On the three regular files
 it does open, the flag is a no-op, which is all the coverage the translation
 needs.
 
+### Adopting a descriptor
+
+T19 added `ADOPT_FD`, which turns a descriptor the caller already holds into a
+koru handle. With T17's `WRITE` and T18's non-blocking gate, stdout can now
+reach the ring, which was the whole point of reopening the kernel.
+
+An opcode rather than a fourth ioctl, so it inherits C1, E1, the `user_data`
+echo, batching and the fuzzer's oracle without a line of new plumbing. The
+descriptor travels in `off` rather than `handle`, which keeps "`handle` is a
+koru handle except on `OPEN`" from gaining a third exception. `off` bounded at
+`i32::MAX` before `fget` sees it, so `AT_FDCWD`-style magic numbers never reach
+it. `O_PATH` needs no check of its own: `fget` is `__fget(fd, FMODE_PATH)` and
+already returns NULL for those.
+
+**Inline, and for a different reason from `OPEN`.** `OPEN` is inline because a
+kworker would resolve and permission-check as root. `ADOPT_FD` is inline because
+`fget` resolves against `current->files`, which in a kworker is the kthread's
+table — a different fd table entirely, not a different privilege.
+
+**The security statement is the opposite of `OPEN`'s, and stronger.** `fget`
+performs no permission check, so **`ADOPT_FD` grants koru no authority the
+submitting task does not already hold**. The task had the descriptor; it still
+has it. The check asserts this the only way that means anything: a child dropped
+to nobody is refused `/etc/shadow` by `OPEN` and **succeeds** at adopting a
+descriptor its root parent opened on the same file, in the same test. If that
+case ever starts failing, something has begun re-checking permissions at use
+time.
+
+**The owning reference, not the light one.** `LocalFile::fget` plus
+`assume_no_fdget_pos`, never `fdget`. The safety condition holds because the
+ioctl path takes `fdget`, not `fdget_pos`. A light reference is valid only while
+the fd table cannot change, and this one outlives the ioctl by design: a kworker
+on another CPU will use it. The check proves it by adopting, calling `close(2)`
+on the descriptor, and reading through the handle anyway.
+
+That property is asserted but **not falsified**, and the reason is worth
+recording: the Rust abstraction exposes no way to build a light reference, so
+the mistake cannot be written. `bindings::fdget` exists but returns a `struct
+fd` the safe layer never converts. An un-writable mistake needs no perturbation.
+
+#### `ELOOP`, and what its absence costs
+
+Adopting a koru descriptor puts an `Arc<RingCtx>` into a handle table that lives
+inside a `RingCtx`. `release` then never runs, the arena never frees, and the
+module is permanently unloadable. **Comparing against our own file is not
+enough**: two rings reach each other in two hops. The check is on `f_op`, which
+every koru fd shares, and getting at the ring's own `f_op` is why the ring's
+`&File` is now threaded from `ioctl` through `enter` and `submit` into
+`dispatch`. Every `MiscDevice` callback already received it; koru had simply
+been ignoring it.
+
+Deleting that check does exactly what the argument predicts. The adoption
+returns a handle, and **`rmmod` is then refused for the rest of the boot**: the
+ring is unreachable by `release` because it holds itself.
+
+#### Stdout is usable, and only because of T18
+
+The deliverable is a child whose stdout is a pipe, adopting descriptor 1,
+writing through the ring, and the parent reading the bytes off the other end.
+**The pipe has to be created non-blocking**, and that is not an incidental
+detail of the test: T18's gate refuses a `WRITE` to a non-regular file that was
+not opened `O_NONBLOCK`, and koru never sets that bit on a file it did not open.
+Making the pipe blocking is a one-character change and the child fails with the
+write refused.
+
+So a program whose stdout is a pipe or a tty cannot write through koru unless
+whoever created that descriptor made it non-blocking. Redirected to a regular
+file it works unconditionally, since regular files are always admitted. Phase 9
+is unaffected, since the screen client creates its own socket, but T21's hello
+world inherits this and it is the runtime's problem, not the kernel's.
+
+#### What was verified, and how
+
+Five perturbations, each reverted.
+
+- Delete the `ELOOP` check. The own-ring adoption returns a handle instead of
+  `-ELOOP`, and `rmmod` is refused afterwards.
+- Delete the `i32::MAX` bound. The oversized descriptor reaches `fget` and comes
+  back `-EBADF` instead of `-EINVAL`, which is the wrong answer to the wrong
+  question.
+- Delete the zero-field checks. All three of `len`, `slot` and `handle` stop
+  being refused.
+- Make the stdout pipe blocking. The child's `WRITE` is refused, which is T18's
+  gate doing its job and the reason this task follows that one.
+- Change the opcode in one userspace mirror. `scripts/abi.sh` fails.
+
+The fuzzer grew an `ADOPT_FD` arm that names one of three things: a read-only
+scratch descriptor, the fuzz ring itself, and a number that is no descriptor at
+all, so `-ELOOP` is exercised thousands of times a run. **Never 0, 1 or 2.** An
+adopted stdout plus the fuzzer's random `WRITE` would shred the check's own
+output, and the failure would look like a corrupt test rather than a bug.
+
 ### Cancellation
 
 `CANCEL` names its target by `user_data` in `off`. A duplicate `user_data`

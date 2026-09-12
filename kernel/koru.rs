@@ -463,7 +463,7 @@ impl MiscDevice for RingCtx {
         module_put();
     }
 
-    fn ioctl(me: ArcBorrow<'_, RingCtx>, _file: &File, cmd: u32, arg: usize) -> Result<isize> {
+    fn ioctl(me: ArcBorrow<'_, RingCtx>, file: &File, cmd: u32, arg: usize) -> Result<isize> {
         // Dispatch on type and command number: matching the whole ioctl number
         // would report a version skew as "no such ioctl" and hide it.
         if _IOC_TYPE(cmd) != KORU_IOC_TYPE {
@@ -501,7 +501,7 @@ impl MiscDevice for RingCtx {
             // The only ioctl returning a value: SQEs consumed (E1).
             KORU_NR_ENTER => {
                 check(enter_size, rw)?;
-                RingCtx::enter(me, ptr)
+                RingCtx::enter(me, file, ptr)
             }
             _ => Err(ENOTTY),
         }
@@ -683,7 +683,7 @@ impl RingCtx {
 
     /// `KORU_IOC_ENTER`: submit, then reap. Returns SQEs **consumed** (E1);
     /// completions are counted in `completed`.
-    fn enter(me: ArcBorrow<'_, RingCtx>, arg: UserPtr) -> Result<isize> {
+    fn enter(me: ArcBorrow<'_, RingCtx>, file: &File, arg: UserPtr) -> Result<isize> {
         let this = &*me;
         let size = core::mem::size_of::<KoruEnter>();
         let (mut arg_reader, mut arg_writer) = UserSlice::new(arg, size).reader_writer();
@@ -728,6 +728,7 @@ impl RingCtx {
 
         let consumed = RingCtx::submit(
             me,
+            file,
             UserSlice::new(UserPtr::from_addr(req.sq_addr as usize), sq_bytes).reader(),
             req.to_submit,
         )?;
@@ -757,7 +758,12 @@ impl RingCtx {
 
     /// Consume up to `to_submit` SQEs, returning how many. Every consumed SQE
     /// posts exactly one completion, malformed ones included (C1).
-    fn submit(me: ArcBorrow<'_, RingCtx>, mut sq: UserSliceReader, to_submit: u32) -> Result<u32> {
+    fn submit(
+        me: ArcBorrow<'_, RingCtx>,
+        file: &File,
+        mut sq: UserSliceReader,
+        to_submit: u32,
+    ) -> Result<u32> {
         let this = &*me;
         let mut consumed: u32 = 0;
 
@@ -779,7 +785,7 @@ impl RingCtx {
             };
 
             consumed += 1;
-            match RingCtx::dispatch(me, &sqe) {
+            match RingCtx::dispatch(me, file, &sqe) {
                 // Completed inline: post now, consuming the reservation.
                 Some(res) => this.state.lock().post(Self::cqe(&sqe, res)),
                 // Deferred: the reservation stays claimed until `run` posts.

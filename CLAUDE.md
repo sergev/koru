@@ -5,7 +5,7 @@ code in this repository.
 
 ## State of the repository
 
-**T0–T18 are done: the Rust binding runs and the kernel has reopened.**
+**T0–T19 are done: the kernel reached stdout and Phase 5 is finished.**
 The module registers `/dev/koru`, configures a ring with `SETUP`, and submits
 `NOP`, `DELAY_NS`, `CHECKSUM`, `OPEN`, `READ`, `WRITE`, `CLOSE` and `CANCEL`
 through `ENTER`, which blocks for completions. The arena is mmap'd, with slot
@@ -43,6 +43,13 @@ gate moved off `OPEN`, which now refuses nothing, onto `check_readable` and
 `check_writable`, which admit a non-regular file only when it was opened
 non-blocking. Two of its six perturbations fail as a hang rather than an
 assertion, and two of them retire gaps T17 had to record as untested.
+
+T19 added `KORU_OP_ADOPT_FD`, so a descriptor the caller already holds becomes
+a koru handle and stdout reaches the ring. It grants no authority the caller
+lacks, and the check proves that by having an unprivileged child adopt a
+root-only descriptor its parent opened. Adopting any koru fd is `ELOOP`, which
+is why the ring's own `&File` is threaded into `dispatch`; without it `rmmod`
+never succeeds again.
 
 T14 made the two userspace ABI mirrors a diff rather than a promise.
 `cpp/include/koru_abi.h` and `cpp/include/koru_errno.h` are the C mirrors,
@@ -135,7 +142,7 @@ survived**.
 
 ## Commands
 
-These work today (T0 through T18):
+These work today (T0 through T19):
 
 ```sh
 KDIR=../kernel-dev/linux-source-7.1

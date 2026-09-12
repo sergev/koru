@@ -47,6 +47,7 @@ static const struct sec sections[] = {
     { "fuzz", sec_fuzz, 1 },
     { "races", sec_races, 1 },
     { "write", sec_write, 1 },
+    { "adopt", sec_adopt, 1 },
 
     /* Tail: deterministic matrices and the timing checks. */
     { "setup", sec_setup, 0 },
@@ -380,10 +381,10 @@ void sec_mmap(void)
  * ------------------------------------------------------------------------ */
 
 /* Every opcode, plus two that do not exist. */
-static const uint8_t all_opcodes[] = { KORU_OP_NOP,      KORU_OP_DELAY_NS, KORU_OP_OPEN,
-                                       KORU_OP_READ,     KORU_OP_CLOSE,    KORU_OP_CANCEL,
-                                       KORU_OP_CHECKSUM, KORU_OP_WRITE,    8,
-                                       200 };
+static const uint8_t all_opcodes[] = { KORU_OP_NOP,      KORU_OP_DELAY_NS,  KORU_OP_OPEN,
+                                       KORU_OP_READ,     KORU_OP_CLOSE,     KORU_OP_CANCEL,
+                                       KORU_OP_CHECKSUM, KORU_OP_WRITE,     KORU_OP_ADOPT_FD,
+                                       9,                200 };
 
 /* Submit and never reap. Admission control must stop this at cq_entries. */
 static unsigned fill_cq(struct koru_ring *r, uint64_t delay_ns)

@@ -15,6 +15,7 @@ use koru_sys::ring::{Ring, SetupConfig};
 use koru_sys::sys;
 use std::ffi::c_void;
 use std::io::{Read, Write};
+use std::os::fd::AsRawFd;
 use std::time::{Duration, Instant};
 
 /// One millisecond, in nanoseconds.
@@ -54,7 +55,7 @@ fn smoke_the_device_is_there() {
 // ---------------------------------------------------------------------------
 
 /// Every opcode plus two that do not exist.
-const ALL_OPCODES: [u8; 10] = [
+const ALL_OPCODES: [u8; 11] = [
     KORU_OP_NOP,
     KORU_OP_DELAY_NS,
     KORU_OP_OPEN,
@@ -63,7 +64,8 @@ const ALL_OPCODES: [u8; 10] = [
     KORU_OP_CANCEL,
     KORU_OP_CHECKSUM,
     KORU_OP_WRITE,
-    8,
+    KORU_OP_ADOPT_FD,
+    9,
     200,
 ];
 
@@ -1818,6 +1820,127 @@ fn the_f_op_guard_rejects_a_directory_on_its_own() {
     assert_eq!(m.read_into(h as u32, 1, 0, 64), -(EINVAL.0 as i64));
     assert_eq!(m.close_handle(h as u32), 0);
     m.assert_quiesced();
+}
+
+// ---------------------------------------------------------------------------
+// T19 - ADOPT_FD
+// ---------------------------------------------------------------------------
+
+#[test]
+fn adopt_gives_a_handle_that_outlives_the_descriptor() {
+    ensure_pattern_file();
+    let m = Mapped::shared();
+
+    let f = std::fs::File::open(PATFILE).expect("open");
+    let fd = f.as_raw_fd();
+    let h = m.adopt(fd);
+    assert!(h > 0, "adopt a descriptor");
+
+    // The reference is ours: an fget takes a real one.
+    drop(f);
+    assert_eq!(m.read_into(h as u32, 1, 0, 64), 64, "READ after close(2)");
+    for (j, b) in m.slot(1)[..64].iter().enumerate() {
+        assert_eq!(*b, pattern_byte(j), "byte {j}");
+    }
+    assert_eq!(m.close_handle(h as u32), 0);
+    m.assert_quiesced();
+}
+
+/// Adopting a koru fd would put an `Arc<RingCtx>` in a ring's own handle table,
+/// so `release` would never run and the module would never unload.
+#[test]
+fn adopt_refuses_any_koru_descriptor() {
+    let m = Mapped::shared();
+    let eloop = -(ELOOP.0 as i64);
+
+    assert_eq!(m.adopt(m.ring.as_raw_fd()), eloop, "our own ring");
+
+    let other = Ring::with_config(&SetupConfig::new(32, 64, 4096, 4, 8)).expect("SETUP");
+    assert_eq!(m.adopt(other.as_raw_fd()), eloop, "a second ring");
+    m.assert_quiesced();
+}
+
+#[test]
+fn adopt_rejection_matrix() {
+    ensure_pattern_file();
+    let m = Mapped::shared();
+    let bad = -(EINVAL.0 as i64);
+    let ebadf = -(EBADF.0 as i64);
+
+    assert_eq!(m.adopt(9999), ebadf, "an out-of-range fd");
+    let fd = {
+        let f = std::fs::File::open(PATFILE).expect("open");
+        f.as_raw_fd()
+    };
+    assert_eq!(m.adopt(fd), ebadf, "a closed fd");
+
+    let mut s = Sqe::adopt_fd(0x400, 0);
+    s.off = i32::MAX as u64 + 1;
+    assert_eq!(m.run_one(&s), bad, "an fd past INT32_MAX");
+    for (mutate, what) in [
+        ((|s: &mut Sqe| s.len = 1) as fn(&mut Sqe), "a non-zero len"),
+        (|s: &mut Sqe| s.slot = 1, "a non-zero slot"),
+        (|s: &mut Sqe| s.handle = 1, "a non-zero handle"),
+    ] {
+        let mut s = Sqe::adopt_fd(0x401, 0);
+        mutate(&mut s);
+        assert_eq!(m.run_one(&s), bad, "{what}");
+    }
+    m.assert_quiesced();
+}
+
+/// The mirror of `OPEN`'s creds test, asserting the opposite outcome. `fget`
+/// checks nothing, so a task that already holds the descriptor keeps it. If
+/// this ever starts failing, something began re-checking at use time.
+#[test]
+fn creds_an_unprivileged_child_adopts_a_root_only_fd() {
+    if !is_root() {
+        skip("adopt creds", "not root");
+        return;
+    }
+    let Ok(shadow) = std::fs::File::open("/etc/shadow") else {
+        skip("adopt creds", "no /etc/shadow");
+        return;
+    };
+    let (uid, gid) = nobody_ids();
+    let fd = shadow.as_raw_fd();
+    // VM_DONTCOPY: the parent must not map, the child maps after the fork.
+    let ring = Ring::with_config(&SetupConfig::new(32, 64, 8192, 4, 8)).expect("SETUP");
+
+    let pid = unsafe { sys::fork() };
+    assert!(pid >= 0, "fork");
+    if pid == 0 {
+        let code = unsafe {
+            match ring.mmap() {
+                Err(_) => 2,
+                Ok(arena) => {
+                    sys::setgroups(0, std::ptr::null());
+                    if sys::setresgid(gid, gid, gid) != 0 || sys::setresuid(uid, uid, uid) != 0 {
+                        3
+                    } else if sys::geteuid() == 0 {
+                        4
+                    } else {
+                        let m = Mapped { ring, arena };
+                        // OPEN would be EACCES; ADOPT_FD must not be.
+                        if m.open_path(0, "/etc/shadow", KORU_O_RDONLY) != -(EACCES.0 as i64) {
+                            5
+                        } else if m.adopt(fd) <= 0 {
+                            6
+                        } else {
+                            0
+                        }
+                    }
+                }
+            }
+        };
+        unsafe { sys::_exit(code) };
+    }
+
+    let mut status = 0;
+    unsafe { sys::waitpid(pid, &mut status, 0) };
+    assert!(sys::wifexited(status), "the child died");
+    // 2 mmap, 3 setresuid, 4 still root, 5 OPEN not EACCES, 6 adopt failed.
+    assert_eq!(sys::wexitstatus(status), 0, "child verdict");
 }
 
 // ---------------------------------------------------------------------------

@@ -6,7 +6,7 @@
 use kernel::{
     bindings,
     error::from_err_ptr,
-    fs::File,
+    fs::{File, LocalFile},
     impl_has_delayed_work, new_delayed_work,
     page::PAGE_SIZE,
     prelude::*,
@@ -119,7 +119,7 @@ impl RingCtx {
     /// Opcode dispatch. `Some(res)` completed inline, `None` was deferred and
     /// will post its own completion. Never fails the ioctl: per E1 a bad SQE is
     /// a completion.
-    pub(crate) fn dispatch(me: ArcBorrow<'_, RingCtx>, sqe: &Sqe) -> Option<i64> {
+    pub(crate) fn dispatch(me: ArcBorrow<'_, RingCtx>, ring: &File, sqe: &Sqe) -> Option<i64> {
         let einval = i64::from(EINVAL.to_errno());
 
         if sqe.rsvd0 != 0 || sqe.flags & !KORU_SQE_FLAGS_ALL != 0 {
@@ -152,6 +152,7 @@ impl RingCtx {
             KORU_OP_CLOSE => Some(me.close_op(sqe)),
             KORU_OP_READ => RingCtx::read_op(me, sqe),
             KORU_OP_WRITE => RingCtx::write_op(me, sqe),
+            KORU_OP_ADOPT_FD => Some(me.adopt_op(ring, sqe)),
             KORU_OP_CANCEL => Some(me.cancel_op(sqe)),
             KORU_OP_CHECKSUM => {
                 if sqe.handle != 0 {
@@ -505,6 +506,55 @@ impl RingCtx {
         }
 
         Ok(done as i64)
+    }
+
+    /// `ADOPT_FD`: a handle for an already-open descriptor.
+    ///
+    /// Inline, for a different reason from `OPEN`: `fget` resolves against
+    /// `current->files`, which in a kworker is the kthread's table.
+    fn adopt_op(&self, ring: &File, sqe: &Sqe) -> i64 {
+        match self.do_adopt(ring, sqe) {
+            Ok(handle) => i64::from(handle),
+            Err(e) => i64::from(e.to_errno()),
+        }
+    }
+
+    fn do_adopt(&self, ring: &File, sqe: &Sqe) -> Result<u32> {
+        // ADOPT_FD reads only `off`.
+        if sqe.len != 0 || sqe.slot != 0 || sqe.handle != 0 {
+            return Err(EINVAL);
+        }
+        // Bounded before `fget` sees it, so AT_FDCWD-style magic numbers never
+        // reach it. O_PATH needs no check: `fget` is `__fget(fd, FMODE_PATH)`.
+        if sqe.off > i32::MAX as u64 {
+            return Err(EINVAL);
+        }
+
+        // No permission check, and none is owed: the task holds the descriptor
+        // already, so this grants koru no authority it did not have.
+        let local = LocalFile::fget(sqe.off as u32)?;
+        // SAFETY: the safety condition holds because the ioctl path takes
+        // `fdget`, not `fdget_pos`. Owning, not a light reference: this
+        // outlives the ioctl and a kworker on another CPU will use it.
+        let file = unsafe { LocalFile::assume_no_fdget_pos(local) };
+
+        // Any koru fd, not just our own: two rings reach each other in two
+        // hops. `f_op` is what they all share. Adopting one would put an
+        // `Arc<RingCtx>` in a ring's own table, so `release` never runs.
+        // SAFETY: both are live; `f_op` is set at open and never changes.
+        let (theirs, ours) = unsafe { ((*file.as_ptr()).f_op, (*ring.as_ptr()).f_op) };
+        if core::ptr::eq(theirs, ours) {
+            return Err(eloop());
+        }
+
+        let inserted = self.handles.lock().insert(file);
+        match inserted {
+            Ok(handle) => Ok(handle),
+            Err(file) => {
+                drop(file);
+                Err(EMFILE)
+            }
+        }
     }
 
     /// `CLOSE`: retire `handle`. `len`, `off` and `slot` must be zero.

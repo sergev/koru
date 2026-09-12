@@ -117,6 +117,12 @@ pub const KORU_OP_CHECKSUM: u8 = 6;
 /// a seekable file, else `EINVAL`; on an `O_APPEND` handle the kernel appends
 /// and `off` is ignored.
 pub const KORU_OP_WRITE: u8 = 7;
+/// Adopt the already-open descriptor in `off` and return a handle for it.
+/// `len`, `slot` and `handle` must be zero, and `off` at most `i32::MAX`.
+///
+/// **Grants no authority the submitting task does not already hold.** Adopting
+/// any koru descriptor is `ELOOP`.
+pub const KORU_OP_ADOPT_FD: u8 = 8;
 
 /// Any bit set is rejected.
 pub const KORU_SQE_FLAGS_ALL: u8 = 0;
@@ -162,7 +168,8 @@ pub struct Sqe {
     pub len: u32,
     /// Opcode-specific offset. A file offset on `READ` and `WRITE`, a
     /// within-slot offset on `OPEN` and `CHECKSUM`, nanoseconds on `DELAY_NS`,
-    /// the target's `user_data` on `CANCEL`. `NOP` and `CLOSE` want zero.
+    /// the target's `user_data` on `CANCEL`, a file descriptor on `ADOPT_FD`.
+    /// `NOP` and `CLOSE` want zero.
     pub off: u64,
     /// Echoed into the CQE. Opaque.
     pub user_data: u64,

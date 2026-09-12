@@ -103,6 +103,10 @@ impl Mapped {
         self.run_one(&Sqe::write(0x103, handle, slot, off, len))
     }
 
+    pub fn adopt(&self, fd: i32) -> i64 {
+        self.run_one(&Sqe::adopt_fd(0x104, fd))
+    }
+
     /// Assert nothing was left in flight.
     pub fn assert_quiesced(&self) {
         let left = self.ring.quiesce().expect("quiesce");

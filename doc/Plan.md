@@ -63,89 +63,6 @@ surface is built first and the C++ surface transcribes it, because the design
 will churn and churning it twice is the same mistake this plan avoids for the
 ABI.
 
-## Phase 5 — kernel: reaching stdout
-
-The kernel reopens for a reason. Braam's hello world is
-`co_await write_all(SYS_STDOUT, ...)`, and koru has no `WRITE`, while `OPEN`
-refuses anything but regular files and directories on purpose, because a
-blocking read in a kworker cannot be interrupted. Stdout cannot reach the ring
-today.
-
-One finding governs every kernel task in this plan. **`override_creds` is not
-exported.** `prepare_creds` and `abort_creds` are, but neither can install a
-cred set, so no out-of-tree module can defer a creds-sensitive operation on this
-kernel. Every path-walking op below is inline, permanently; Notes' finding 3 is
-not a "for now".
-
-Three obligations apply to every kernel task rather than being repeated in each:
-
-- `KoruParams::features` gains a bit per **optional** capability, so userspace
-  probes instead of submitting and watching for `-EINVAL`. This is what
-  `features` was for. An opcode that is unconditionally present at this ABI
-  version needs no bit and does not get one; T17 settled that for `WRITE`.
-- The fuzzer grows with each opcode: a per-opcode allowed-`res` set, a
-  per-opcode `extra` oracle replacing the blanket `extra == 0` assertion, and —
-  for anything touching the filesystem — a per-run temp directory plus a path
-  generator structurally unable to emit `..` or an absolute path. That
-  sandboxing is a property of the test, not the kernel, and it is the most
-  important safety property in the plan.
-- Any new `#[repr(C)]` is mirrored in `koru_abi.h` and covered by T14's diff.
-
-No kernel task bumps `KORU_ABI_VERSION`. New opcodes are additive under the
-existing "unimplemented completes `-EINVAL`" rule. A new bit in an existing
-`*_FLAGS_ALL` mask only relaxes a rejection, so it is safe in both directions.
-Per-opcode meanings for `Cqe::extra` are within its documented contract. New
-data-plane structs change no existing size or offset.
-
-### T19 [M] — `KORU_OP_ADOPT_FD`
-
-A handle for an already-open descriptor, so stdin, stdout and stderr are usable.
-An opcode rather than a fourth ioctl, so it inherits C1, E1, the `user_data`
-echo, batching and the fuzzer's oracle for free. `off` carries the descriptor as
-a `u64` that must be at most `i32::MAX`, so `AT_FDCWD`-style magic numbers never
-reach `fget`; `len`, `slot` and `handle` must be zero. Using `off` rather than
-`handle` keeps "`handle` is a koru handle except on `OPEN`" from gaining a third
-exception.
-
-Inline, but for a different reason from `OPEN`: `fget` resolves against
-`current->files`, which in a kworker is the kthread's table. Use the owning
-`LocalFile::fget` plus `assume_no_fdget_pos`, never `fdget`, whose light
-reference is valid only while the fd table cannot change — this reference
-outlives the ioctl by design and a kworker on another CPU will use it. The
-safety condition holds because the ioctl path takes `fdget`, not `fdget_pos`;
-put that in the comment verbatim. `O_PATH` needs no check, since `fget` is
-`__fget(fd, FMODE_PATH)` and already returns NULL for them.
-
-The security statement is the opposite of `OPEN`'s and stronger. `fget` performs
-no permission check, so **`ADOPT_FD` grants koru no authority the submitting
-task does not already hold.** Worth stating precisely, because the reflex is to
-assume otherwise.
-
-Two rejections whose absence is catastrophic rather than subtle. Any koru
-descriptor, not merely our own, gives `-ELOOP`: the ring's file holds
-`Arc<RingCtx>` as private data and the handle table lives inside `RingCtx`, so
-adopting it makes `release` unreachable, the module permanently unloadable and
-the arena leaked. Two rings do the same in two hops, so comparing against our
-own file alone is insufficient; compare `f_op`, which means threading the ring's
-`&File` into `dispatch`. Do that here. And a non-regular adopted descriptor
-without `O_NONBLOCK` must be refused for `READ` and `WRITE` by T18's gate, which
-is why this task follows it: shipped first, the obvious `cat` demo wedges a
-kworker on its first read.
-
-Done test: adopt descriptor 1 where stdout is a pipe under the harness, write
-through the handle, parent reads the bytes. That is "stdout is usable", tested.
-Own ring fd and a second ring's fd both give `-ELOOP`, and with the check
-deleted `rmmod` must fail and one ring must leak — measured by the
-release-timing gate and field 1 of `/proc/sys/fs/file-nr`, not by kmemleak,
-since our own table still references the file. Bad, closed and out-of-range
-descriptors give `-EBADF`. The privilege mirror to `OPEN`'s test, asserting the
-*opposite* outcome: a child dropped to nobody adopts a descriptor the parent
-opened on a root-only file and **succeeds**. Keep both in one section, because
-if this case ever starts failing, something has begun re-checking permissions at
-use time. Lifetime: adopt, `close(2)` the descriptor, read through the handle
-and still get data, which catches an `fdget` mistake at once. Then 2,000
-adopt-and-close cycles against `file-nr`, heavy phase.
-
 ## Phase 6 — first milestone
 
 Two tasks, and at the end of them Braam's hello world runs through koru. This is
@@ -179,6 +96,32 @@ only change, writing through the ring via T17 and T19. Then T15's demo
 re-expressed against the ambient ring, same output.
 
 ## Phase 7 — kernel: the rest of the surface
+
+One finding governs every kernel task in this plan. **`override_creds` is not
+exported.** `prepare_creds` and `abort_creds` are, but neither can install a
+cred set, so no out-of-tree module can defer a creds-sensitive operation on this
+kernel. Every path-walking op below is inline, permanently; Notes' finding 3 is
+not a "for now".
+
+Three obligations apply to every kernel task rather than being repeated in each:
+
+- `KoruParams::features` gains a bit per **optional** capability, so userspace
+  probes instead of submitting and watching for `-EINVAL`. This is what
+  `features` was for. An opcode that is unconditionally present at this ABI
+  version needs no bit and does not get one; T17 settled that for `WRITE`.
+- The fuzzer grows with each opcode: a per-opcode allowed-`res` set, a
+  per-opcode `extra` oracle replacing the blanket `extra == 0` assertion, and —
+  for anything touching the filesystem — a per-run temp directory plus a path
+  generator structurally unable to emit `..` or an absolute path. That
+  sandboxing is a property of the test, not the kernel, and it is the most
+  important safety property in the plan.
+- Any new `#[repr(C)]` is mirrored in `koru_abi.h` and covered by T14's diff.
+
+No kernel task bumps `KORU_ABI_VERSION`. New opcodes are additive under the
+existing "unimplemented completes `-EINVAL`" rule. A new bit in an existing
+`*_FLAGS_ALL` mask only relaxes a rejection, so it is safe in both directions.
+Per-opcode meanings for `Cqe::extra` are within its documented contract. New
+data-plane structs change no existing size or offset.
 
 ### T22 [R] — `KORU_OP_POLL_ADD`
 

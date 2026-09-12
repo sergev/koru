@@ -607,6 +607,186 @@ void sec_nonblock(void)
     }
 }
 
+/* T19: a handle for a descriptor the caller already holds. */
+
+/* Child: stdout is the pipe, so it must print nothing. Verdict is the code. */
+static int adopt_stdout_child(struct koru_ring *m, int wr)
+{
+    int64_t h;
+
+    if (ring_map(m) != 0)
+        return 2;
+    if (dup2(wr, 1) < 0)
+        return 3;
+    h = r_adopt(m, 1);
+    if (h <= 0)
+        return 4;
+    memcpy(m->arena, "hello", 5);
+    if (r_write(m, (uint32_t)h, 0, 0, 5) != 5)
+        return 5;
+    return r_close(m, (uint32_t)h) == 0 ? 0 : 6;
+}
+
+/* Child: the parent opened `fd` on a root-only file before the fork. */
+static int adopt_creds_child(struct koru_ring *m, int fd)
+{
+    struct passwd *pw = getpwnam("nobody");
+    uid_t nobody      = pw ? pw->pw_uid : 65534;
+    gid_t nogroup     = pw ? pw->pw_gid : 65534;
+    int64_t h;
+
+    if (ring_map(m) != 0)
+        return 2;
+    if (setgroups(0, NULL) != 0 || setresgid(nogroup, nogroup, nogroup) != 0 ||
+        setresuid(nobody, nobody, nobody) != 0)
+        return 3;
+    if (geteuid() == 0)
+        return 4;
+
+    /* OPEN would be EACCES here. ADOPT_FD must not be: no permission check. */
+    if (r_open(m, 0, SHADOW, KORU_O_RDONLY) != -EACCES)
+        return 5;
+    h = r_adopt(m, fd);
+    if (h <= 0)
+        return 6;
+    if (r_read(m, (uint32_t)h, 1, 0, 64) < 0)
+        return 7;
+    return r_close(m, (uint32_t)h) == 0 ? 0 : 8;
+}
+
+void sec_adopt(void)
+{
+    struct koru_sqe s;
+    struct koru_ring m;
+    int64_t h, stale;
+    long before, leaked;
+    uint8_t buf[64];
+    int fd, pipefd[2];
+    pid_t pid;
+    int st = 0;
+    unsigned i;
+
+    /* 1. Stdout is usable. The pipe is non-blocking because T18's gate needs
+     *    it and koru must never set that bit on a file it did not open. */
+    if (pipe2(pipefd, O_NONBLOCK) != 0) {
+        check(0, "create the stdout pipe");
+        return;
+    }
+    if (ring_open(&m, 32, 64, 4096, 4, 8) != 0) {
+        check(0, "a ring for the stdout child");
+        close(pipefd[0]);
+        close(pipefd[1]);
+        return;
+    }
+    pid = fork();
+    if (pid == 0)
+        _exit(adopt_stdout_child(&m, pipefd[1]));
+    close(pipefd[1]);
+    if (pid < 0 || waitpid(pid, &st, 0) != pid) {
+        check(0, "fork the stdout child");
+    } else {
+        /* 2 map, 3 dup2, 4 adopt, 5 write, 6 close. */
+        check(WIFEXITED(st) && WEXITSTATUS(st) == 0, "a child writes to adopted stdout");
+        if (WIFEXITED(st) && WEXITSTATUS(st) != 0)
+            note("child verdict %d", WEXITSTATUS(st));
+        check(read(pipefd[0], buf, sizeof(buf)) == 5 && memcmp(buf, "hello", 5) == 0,
+              "  and the parent reads the bytes off the pipe");
+    }
+    close(pipefd[0]);
+    ring_close(&m);
+
+    /* 2. Adopting any koru fd would make release unreachable. */
+    check_res(r_adopt(&R, R.fd), -ELOOP, "adopting our own ring fd is ELOOP");
+    if (ring_open(&m, 32, 64, 4096, 4, 8) == 0) {
+        check_res(r_adopt(&R, m.fd), -ELOOP, "  and a second ring's fd too");
+        ring_close(&m);
+    }
+
+    /* 3. Rejections. */
+    check_res(r_adopt(&R, 9999), -EBADF, "an out-of-range fd is EBADF");
+    fd = open(PATFILE, O_RDONLY);
+    check(fd >= 0, "open the pattern file");
+    if (fd >= 0) {
+        close(fd);
+        check_res(r_adopt(&R, fd), -EBADF, "  a closed fd is EBADF");
+    }
+    sqe_adopt(&s, 0, 0x400);
+    s.off = (uint64_t)INT32_MAX + 1;
+    check_res(run_one(R.fd, &s), -EINVAL, "an fd past INT32_MAX is EINVAL");
+    sqe_adopt(&s, 0, 0x401);
+    s.len = 1;
+    check_res(run_one(R.fd, &s), -EINVAL, "  a non-zero len is EINVAL");
+    sqe_adopt(&s, 0, 0x402);
+    s.slot = 1;
+    check_res(run_one(R.fd, &s), -EINVAL, "  a non-zero slot is EINVAL");
+    sqe_adopt(&s, 0, 0x403);
+    s.handle = 1;
+    check_res(run_one(R.fd, &s), -EINVAL, "  a non-zero handle is EINVAL");
+
+    /* 4. The reference is ours: closing the descriptor changes nothing. */
+    fd = open(PATFILE, O_RDONLY);
+    if (fd >= 0) {
+        h = r_adopt(&R, fd);
+        check(h > 0, "adopt a descriptor on the pattern file");
+        close(fd);
+        if (h > 0) {
+            check(r_read(&R, (uint32_t)h, 1, 0, 64) == 64 && slot_matches(1, 0, 64),
+                  "  READ still works after close(2) on the descriptor");
+            stale = h;
+            check_res(r_close(&R, (uint32_t)h), 0, "  and the handle closes");
+            check_res(r_read(&R, (uint32_t)stale, 1, 0, 64), -EBADF, "  after which it is EBADF");
+        }
+    }
+
+    /* 5. The mirror of OPEN's creds test, asserting the opposite. If this ever
+     *    starts failing, something began re-checking permissions at use time. */
+    if (geteuid() != 0) {
+        printf("%-58s SKIP (not root)\n", "an unprivileged child adopts a root-only fd");
+    } else {
+        fd = open(SHADOW, O_RDONLY);
+        if (fd < 0) {
+            printf("%-58s SKIP (cannot open " SHADOW ")\n",
+                   "an unprivileged child adopts a root-only fd");
+        } else if (ring_open(&m, 32, 64, 8192, 4, 8) != 0) {
+            check(0, "a ring for the creds child");
+            close(fd);
+        } else {
+            pid = fork();
+            if (pid == 0)
+                _exit(adopt_creds_child(&m, fd));
+            if (pid < 0 || waitpid(pid, &st, 0) != pid) {
+                check(0, "fork the creds child");
+            } else {
+                /* 5 OPEN not EACCES, 6 adopt failed, 7 read failed. */
+                check(WIFEXITED(st) && WEXITSTATUS(st) == 0,
+                      "an unprivileged child adopts a root-only fd");
+                if (WIFEXITED(st) && WEXITSTATUS(st) != 0)
+                    note("child verdict %d", WEXITSTATUS(st));
+            }
+            ring_close(&m);
+            close(fd);
+        }
+    }
+
+    /* 6. Heavy: adopt and close in bulk. filp_open installs no descriptor, but
+     *    fget takes a real reference, so file-nr is the instrument. */
+    before = file_nr_settled();
+    for (i = 0; i < 2000; i++) {
+        fd = open(PATFILE, O_RDONLY);
+        if (fd < 0)
+            break;
+        h = r_adopt(&R, fd);
+        close(fd);
+        if (h > 0)
+            r_close(&R, (uint32_t)h);
+    }
+    check(i == 2000, "2,000 adopt-and-close cycles");
+    leaked = file_nr_settled() - before;
+    check(leaked < 64, "  and struct file allocations came back");
+    if (leaked >= 64)
+        note("file-nr leaked %ld", leaked);
+}
+
 void sec_delay(void)
 {
     struct koru_sqe sq[8];
