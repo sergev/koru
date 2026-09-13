@@ -308,66 +308,75 @@ impl WorkItem for OpWork {
 }
 
 impl RingCtx {
-    /// Opcode dispatch. `Some(res)` completed inline, `None` was deferred and
-    /// will post its own completion. Never fails the ioctl: per E1 a bad SQE is
-    /// a completion.
-    pub(crate) fn dispatch(me: ArcBorrow<'_, RingCtx>, ring: &File, sqe: &Sqe) -> Option<i64> {
+    /// Opcode dispatch. `Some((res, extra))` completed inline, `None` was
+    /// deferred and will post its own completion. Never fails the ioctl: per E1
+    /// a bad SQE is a completion. The tuple mirrors `run`'s, because `STATX_AT`
+    /// is the first inline op that sets `extra`.
+    pub(crate) fn dispatch(
+        me: ArcBorrow<'_, RingCtx>,
+        ring: &File,
+        sqe: &Sqe,
+    ) -> Option<(i64, u64)> {
         let einval = i64::from(EINVAL.to_errno());
+        // Only `STATX_AT` has anything to put in `extra`.
+        let plain = |res: i64| Some((res, 0));
 
         if sqe.rsvd0 != 0 || sqe.flags & !KORU_SQE_FLAGS_ALL != 0 {
-            return Some(einval);
+            return plain(einval);
         }
 
         match sqe.opcode {
             KORU_OP_NOP => {
                 // NOP reads no argument fields, so all must be zero.
                 if sqe.len != 0 || sqe.off != 0 || sqe.slot != 0 || sqe.handle != 0 {
-                    return Some(einval);
+                    return plain(einval);
                 }
-                Some(0)
+                plain(0)
             }
             KORU_OP_DELAY_NS => {
                 // DELAY_NS reads only `off`.
                 if sqe.len != 0 || sqe.slot != 0 || sqe.handle != 0 {
-                    return Some(einval);
+                    return plain(einval);
                 }
                 // A delay pins a CQ reservation for its whole duration.
                 if sqe.off > KORU_MAX_DELAY_NS {
-                    return Some(einval);
+                    return plain(einval);
                 }
-                RingCtx::defer(me, sqe, delay_jiffies(sqe.off), None)
+                RingCtx::defer(me, sqe, delay_jiffies(sqe.off), None).map(|res| (res, 0))
             }
             // Inline, in the submitting task's context: a kworker would resolve
             // and permission-check as root. Both must return `Some`, and
             // neither may call `complete`, which belongs to the deferred path.
-            KORU_OP_OPEN => Some(me.open_op(sqe)),
-            KORU_OP_CLOSE => Some(me.close_op(sqe)),
-            KORU_OP_READ => RingCtx::read_op(me, sqe),
-            KORU_OP_WRITE => RingCtx::write_op(me, sqe),
-            KORU_OP_ADOPT_FD => Some(me.adopt_op(ring, sqe)),
-            KORU_OP_POLL_ADD => RingCtx::poll_op(me, sqe),
-            KORU_OP_STAT => RingCtx::stat_op(me, sqe),
+            KORU_OP_OPEN => plain(me.open_op(sqe)),
+            KORU_OP_CLOSE => plain(me.close_op(sqe)),
+            KORU_OP_READ => RingCtx::read_op(me, sqe).map(|res| (res, 0)),
+            KORU_OP_WRITE => RingCtx::write_op(me, sqe).map(|res| (res, 0)),
+            KORU_OP_ADOPT_FD => plain(me.adopt_op(ring, sqe)),
+            KORU_OP_POLL_ADD => RingCtx::poll_op(me, sqe).map(|res| (res, 0)),
+            KORU_OP_STAT => RingCtx::stat_op(me, sqe).map(|res| (res, 0)),
             // Inline for `OPEN`'s reason, and permanently. See `path_op`.
-            KORU_OP_TRUNCATE | KORU_OP_UTIMES | KORU_OP_READLINK => Some(me.path_op(sqe)),
-            KORU_OP_CANCEL => Some(me.cancel_op(sqe)),
+            KORU_OP_TRUNCATE | KORU_OP_UTIMES | KORU_OP_READLINK | KORU_OP_STATX_AT => {
+                Some(me.path_op(sqe))
+            }
+            KORU_OP_CANCEL => plain(me.cancel_op(sqe)),
             KORU_OP_CHECKSUM => {
                 if sqe.handle != 0 {
-                    return Some(einval);
+                    return plain(einval);
                 }
                 // Validate in ioctl context, before claiming anything.
                 if let Err(e) = RingCtx::check_range(&me, sqe) {
-                    return Some(i64::from(e.to_errno()));
+                    return plain(i64::from(e.to_errno()));
                 }
                 if !me.state.lock().slot_try_acquire(sqe.slot) {
-                    return Some(i64::from(EBUSY.to_errno()));
+                    return plain(i64::from(EBUSY.to_errno()));
                 }
                 // Deferred, so the slot is genuinely held across a window. That
                 // window is what makes exclusivity observable, and it is the
                 // same shape READ takes in T10.
-                RingCtx::defer_holding_slot(me, sqe, None)
+                RingCtx::defer_holding_slot(me, sqe, None).map(|res| (res, 0))
             }
             // Unknown, or defined but not yet implemented.
-            _ => Some(einval),
+            _ => plain(einval),
         }
     }
 
@@ -817,74 +826,80 @@ impl RingCtx {
     fn do_stat(&self, sqe: &Sqe, file: Option<&File>, cred: &Credential) -> Result<(i64, u64)> {
         let file = file.ok_or(EINVAL)?;
         let pos = self.slot_offset(sqe)?;
-        let mut ks = bindings::kstat::default();
 
-        // SAFETY: the op holds an `ARef<File>`, so `f_path` is live, and `ks`
-        // is our own. The arena mutex is not held: this reaches the VFS.
-        // `f_path` sits in an anonymous union bindgen names for us.
-        let ret = unsafe {
-            bindings::vfs_getattr(
-                &raw const (*file.as_ptr()).__bindgen_anon_1.f_path,
-                &mut ks,
-                STAT_REQUEST_MASK,
-                bindings::AT_STATX_SYNC_AS_STAT,
-            )
-        };
-        if ret < 0 {
-            return Err(Error::from_errno(ret));
-        }
-
-        // SAFETY: `cred` holds a reference, so its `user_ns` is live.
-        let ns = unsafe { (*cred.as_ptr()).user_ns };
-        // Every field is named, `reserved` explicitly zero, so the copy below
-        // cannot show the caller its own stale bytes back as kernel values.
-        let out = KoruStat {
-            ino: ks.ino,
-            size: ks.size as u64,
-            blocks: ks.blocks,
-            blksize: u64::from(ks.blksize),
-            nlink: u64::from(ks.nlink),
-            mode: u64::from(ks.mode),
-            // Munged, as `stat(2)` is: an id with no mapping in `ns` reports
-            // `overflowuid` rather than a raw `(uid_t)-1` nothing else uses.
-            // SAFETY: `ns` is live and these are plain value translations.
-            uid: u64::from(unsafe { bindings::from_kuid_munged(ns, ks.uid) }),
-            // SAFETY: as above.
-            gid: u64::from(unsafe { bindings::from_kgid_munged(ns, ks.gid) }),
-            dev_major: u64::from(ks.dev >> MINORBITS),
-            dev_minor: u64::from(ks.dev & MINORMASK),
-            rdev_major: u64::from(ks.rdev >> MINORBITS),
-            rdev_minor: u64::from(ks.rdev & MINORMASK),
-            atime_sec: ks.atime.tv_sec,
-            atime_nsec: ks.atime.tv_nsec as u64,
-            mtime_sec: ks.mtime.tv_sec,
-            mtime_nsec: ks.mtime.tv_nsec as u64,
-            ctime_sec: ks.ctime.tv_sec,
-            ctime_nsec: ks.ctime.tv_nsec as u64,
-            btime_sec: ks.btime.tv_sec,
-            btime_nsec: ks.btime.tv_nsec as u64,
-            reserved: [0; 12],
-        };
+        // SAFETY: the op holds an `ARef<File>`, so `f_path` is live; it sits in
+        // an anonymous union bindgen names for us. The arena mutex is not held.
+        let (out, mask) =
+            unsafe { getattr(&raw const (*file.as_ptr()).__bindgen_anon_1.f_path, cred) }?;
 
         // `len` is the caller's buffer size and its version negotiation: an
         // older binary asks for less and gets exactly that much.
         let n = core::cmp::min(sqe.len as usize, core::mem::size_of::<KoruStat>());
         self.write_slot(pos, &out.as_bytes()[..n])?;
-        Ok((n as i64, statx_to_koru(ks.result_mask)))
+        Ok((n as i64, statx_to_koru(mask)))
     }
 
-    /// The three path ops. `res` is 0, or a length for `READLINK`.
+    /// The four path ops. `res` is 0, or a length for `READLINK` and
+    /// `STATX_AT`; only `STATX_AT` sets `extra`.
     ///
     /// **Inline, permanently**: in a kworker `current_cred()` is `init_cred`
     /// and `current->fs` is the init root, and `override_creds` is not
     /// exported. doc/Notes.md's finding 3.
-    fn path_op(&self, sqe: &Sqe) -> i64 {
-        let res = match sqe.opcode {
-            KORU_OP_TRUNCATE => self.do_truncate(sqe).map(|()| 0),
-            KORU_OP_UTIMES => self.do_utimes(sqe).map(|()| 0),
-            _ => self.do_readlink(sqe),
+    fn path_op(&self, sqe: &Sqe) -> (i64, u64) {
+        let failed = |e: Error| (i64::from(e.to_errno()), 0u64);
+        match sqe.opcode {
+            KORU_OP_TRUNCATE => self.do_truncate(sqe).map_or_else(failed, |()| (0, 0)),
+            KORU_OP_UTIMES => self.do_utimes(sqe).map_or_else(failed, |()| (0, 0)),
+            KORU_OP_STATX_AT => self.do_statx_at(sqe).unwrap_or_else(failed),
+            _ => self.do_readlink(sqe).map_or_else(failed, |res| (res, 0)),
+        }
+    }
+
+    /// `STATX_AT`: `STAT`'s answer for a path rather than a handle. The struct
+    /// replaces the path, as `READLINK`'s target does.
+    fn do_statx_at(&self, sqe: &Sqe) -> Result<(i64, u64)> {
+        if sqe.handle != 0 {
+            return Err(EINVAL);
+        }
+        let pos = self.path_validate(sqe)?;
+        // Aligned for `STAT`'s reason: every field is 64 bits.
+        if sqe.off % 8 != 0 {
+            return Err(EINVAL);
+        }
+        let Some(cfg) = *self.config.lock() else {
+            return Err(EINVAL);
         };
-        res.unwrap_or_else(|e| i64::from(e.to_errno()))
+        // The answer replaces the path, so the room is the rest of the slot.
+        // The whole struct or nothing: a prefix would leave the caller reading
+        // its own path bytes as fields.
+        if u64::from(cfg.slot_size) - sqe.off < core::mem::size_of::<KoruStat>() as u64 {
+            return Err(EINVAL);
+        }
+
+        // Held for the whole op, as `READLINK`'s is.
+        if !self.state.lock().slot_try_acquire(sqe.slot) {
+            return Err(EBUSY);
+        }
+        let done = self.statx_at_held(sqe, pos);
+        self.state.lock().slot_release(sqe.slot);
+        done
+    }
+
+    fn statx_at_held(&self, sqe: &Sqe, pos: usize) -> Result<(i64, u64)> {
+        // Consumed before anything is written, so the overlap raises no
+        // acquisition-order question.
+        let path = self.copy_path(pos, sqe.len as usize)?;
+        let cpath = CStr::from_bytes_with_nul(&path).map_err(|_| EINVAL)?;
+        let p = Lookup::new(cpath, LOOKUP_FOLLOW)?;
+
+        // Ioctl context, so `current` is the submitter and no carried cred is
+        // needed: the ids translate in its namespace.
+        let cred = current_cred();
+        // SAFETY: `p` holds the path across the call, and the arena mutex is
+        // not held here.
+        let (out, mask) = unsafe { getattr(p.as_ptr(), &cred) }?;
+        self.write_slot(pos, out.as_bytes())?;
+        Ok((core::mem::size_of::<KoruStat>() as i64, statx_to_koru(mask)))
     }
 
     fn do_truncate(&self, sqe: &Sqe) -> Result<()> {
@@ -1073,15 +1088,10 @@ impl RingCtx {
         // the drop impl always has a reference to release.
         module_get_live();
 
-        // Ioctl context, so `current` is the submitter. Taken for every
-        // deferred op rather than only for `STAT`: an op resolves everything it
-        // needs at submit time, and a kworker has no way back to this task.
-        // SAFETY: `current->cred` is replaced only by the task itself, so
-        // reading it in that task's own ioctl needs no RCU.
-        let cred = unsafe {
-            let task = bindings::get_current();
-            ARef::from(Credential::from_ptr((*task).cred))
-        };
+        // Taken for every deferred op rather than only for `STAT`: an op
+        // resolves everything it needs at submit time, and a kworker has no way
+        // back to this task.
+        let cred = current_cred();
 
         let op = match Arc::pin_init(
             pin_init!(OpWork {
@@ -1304,6 +1314,75 @@ impl RingCtx {
 
 /// What `STAT` asks `vfs_getattr` for. `result_mask` says what came back.
 const STAT_REQUEST_MASK: u32 = bindings::STATX_BASIC_STATS | bindings::STATX_BTIME;
+
+/// `vfs_getattr` into a [`KoruStat`], plus the raw `result_mask`. Shared by
+/// `STAT`, which carries the submitter's cred into a kworker, and `STATX_AT`,
+/// which is the submitter.
+///
+/// # Safety
+///
+/// `path` must point at a live `struct path`, and the arena mutex must not be
+/// held: this reaches the VFS.
+unsafe fn getattr(path: *const bindings::path, cred: &Credential) -> Result<(KoruStat, u32)> {
+    let mut ks = bindings::kstat::default();
+
+    // SAFETY: the caller guarantees `path`, and `ks` is our own.
+    let ret = unsafe {
+        bindings::vfs_getattr(
+            path,
+            &mut ks,
+            STAT_REQUEST_MASK,
+            bindings::AT_STATX_SYNC_AS_STAT,
+        )
+    };
+    if ret < 0 {
+        return Err(Error::from_errno(ret));
+    }
+
+    // SAFETY: `cred` holds a reference, so its `user_ns` is live.
+    let ns = unsafe { (*cred.as_ptr()).user_ns };
+    // Every field is named, `reserved` explicitly zero, so a copy of this can
+    // never show the caller its own stale bytes back as kernel values.
+    let out = KoruStat {
+        ino: ks.ino,
+        size: ks.size as u64,
+        blocks: ks.blocks,
+        blksize: u64::from(ks.blksize),
+        nlink: u64::from(ks.nlink),
+        mode: u64::from(ks.mode),
+        // Munged, as `stat(2)` is: an id with no mapping in `ns` reports
+        // `overflowuid` rather than a raw `(uid_t)-1` nothing else uses.
+        // SAFETY: `ns` is live and these are plain value translations.
+        uid: u64::from(unsafe { bindings::from_kuid_munged(ns, ks.uid) }),
+        // SAFETY: as above.
+        gid: u64::from(unsafe { bindings::from_kgid_munged(ns, ks.gid) }),
+        dev_major: u64::from(ks.dev >> MINORBITS),
+        dev_minor: u64::from(ks.dev & MINORMASK),
+        rdev_major: u64::from(ks.rdev >> MINORBITS),
+        rdev_minor: u64::from(ks.rdev & MINORMASK),
+        atime_sec: ks.atime.tv_sec,
+        atime_nsec: ks.atime.tv_nsec as u64,
+        mtime_sec: ks.mtime.tv_sec,
+        mtime_nsec: ks.mtime.tv_nsec as u64,
+        ctime_sec: ks.ctime.tv_sec,
+        ctime_nsec: ks.ctime.tv_nsec as u64,
+        btime_sec: ks.btime.tv_sec,
+        btime_nsec: ks.btime.tv_nsec as u64,
+        reserved: [0; 12],
+    };
+    Ok((out, ks.result_mask))
+}
+
+/// The submitting task's credentials. **Ioctl context only**: in a kworker
+/// this is `init_cred`, which is why `OpWork` carries one.
+fn current_cred() -> ARef<Credential> {
+    // SAFETY: `current->cred` is replaced only by the task itself, so reading
+    // it in that task's own ioctl needs no RCU.
+    unsafe {
+        let task = bindings::get_current();
+        ARef::from(Credential::from_ptr((*task).cred))
+    }
+}
 
 // `MAJOR` and `MINOR` are macros, so not in the bindings. From
 // include/linux/kdev_t.h.

@@ -79,6 +79,17 @@ impl Mapped {
         path.len() as u32
     }
 
+    /// One SQE to completion, keeping the CQE's `extra`.
+    pub fn run_one_extra(&self, sqe: &Sqe) -> (i64, u64) {
+        let mut cq = [Cqe::default(); 1];
+        let r = self
+            .ring
+            .enter(std::slice::from_ref(sqe), &mut cq, 1, None)
+            .expect("ENTER");
+        assert_eq!(r.progress.completed, 1, "no completion");
+        (cq[0].res, cq[0].extra)
+    }
+
     pub fn run_one(&self, sqe: &Sqe) -> i64 {
         self.ring
             .run_one(sqe)

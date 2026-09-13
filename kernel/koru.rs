@@ -788,7 +788,7 @@ impl RingCtx {
             consumed += 1;
             match RingCtx::dispatch(me, file, &sqe) {
                 // Completed inline: post now, consuming the reservation.
-                Some(res) => this.state.lock().post(Self::cqe(&sqe, res)),
+                Some((res, extra)) => this.state.lock().post(Self::cqe_extra(&sqe, res, extra)),
                 // Deferred: the reservation stays claimed until `run` posts.
                 None => {}
             }

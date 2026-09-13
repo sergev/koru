@@ -154,6 +154,16 @@ pub const KORU_OP_UTIMES: u8 = 12;
 /// length without the NUL. Does not follow a final symlink. `ENAMETOOLONG` if it
 /// does not fit in the rest of the slot.
 pub const KORU_OP_READLINK: u8 = 13;
+/// Stat the file the path names. No argument: the [`KoruStat`] **replaces the
+/// path it was given**, at `off` in the same slot, and `res` is its size. `off`
+/// must be a multiple of eight and the whole struct must fit in the rest of the
+/// slot, else `EINVAL`. `extra` carries the [`KORU_STAT_INO`]-style mask, as on
+/// `STAT`. Follows a final symlink, as `stat(2)` does.
+///
+/// `len` is the path's length here, so there is no version negotiation as on
+/// `STAT`: a later field comes out of `KoruStat::reserved`, which fixes the
+/// struct's size for every binary at this ABI version.
+pub const KORU_OP_STATX_AT: u8 = 14;
 
 /// Any bit set is rejected.
 pub const KORU_SQE_FLAGS_ALL: u8 = 0;

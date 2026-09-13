@@ -1018,8 +1018,8 @@ or after its end. `TRUNCATE`'s is a `u64` new length, `UTIMES`' is a
 The plan proposed putting `TRUNCATE`'s new length in `off` instead, since `off`
 is a file offset everywhere else. That was not taken. A file length has to be 64
 bits, so `off` is the only field that can hold it, and spending it would leave
-the path with no offset — a second path encoding, for one opcode, where T25 to
-T28 all say they reuse `do_open`'s recipe verbatim. One rule that covers five
+the path with no offset — a second path encoding, for one opcode, where every
+path op after it reuses `do_open`'s recipe verbatim. One rule that covers five
 opcodes is worth more than saving the caller an eight-byte store. What the plan
 was right about is that `len` cannot be the truncate length; it just is not free
 either.
@@ -1134,6 +1134,74 @@ with a few hundred succeeding. **It names only its own scratch file, its own
 symlink and a path that resolves nowhere.** A random path reaching `TRUNCATE`
 would destroy whatever it named; that sandboxing is a property of the test, not
 of the kernel, and it is the most important line in the fuzzer.
+
+### Stat by path, and the first inline op with an `extra`
+
+T25's `STATX_AT` is T23's answer reached by T24's encoding: `kern_path` with
+`LOOKUP_FOLLOW`, the same `vfs_getattr` and the same `KoruStat`. The two
+opcodes now share one `getattr` helper, which takes a `struct path` and a
+`Credential` and returns the filled struct plus `kstat.result_mask`. `STAT`
+hands it `file->f_path` and the cred its `OpWork` carried; `STATX_AT` hands it
+the `Lookup`'s path and `current_cred()`, because it runs in the submitting
+task and there is nothing to carry.
+
+**The answer replaces the path**, at `off` in the same slot, exactly as
+`READLINK`'s target does. One claim covers both halves and the path is consumed
+into a `KVec` before anything is written, so the overlap raises no
+acquisition-order question. The alternative — writing the struct to the
+argument offset after the path — would have kept the path, and cost the caller
+256 bytes of slot it did not ask to spend.
+
+**There is no version negotiation here, because `len` is the path's length.**
+`STAT` spends `len` on the caller's buffer size; this opcode cannot, so it
+writes the whole 256 bytes or refuses with `-EINVAL`. That is safe for the same
+reason `KoruStat`'s size is an assertion rather than a hope: a later field comes
+out of `reserved`, so every binary at this ABI version agrees on 256. A prefix
+would be worse than a refusal — the caller would read its own path bytes back
+as fields.
+
+The two guards that follow from that are `off % 8 == 0`, for `STAT`'s reason,
+and `slot_size - off >= sizeof(KoruStat)`. The second is the only thing between
+a destination near the slot end and a write into the **next slot**: the arena's
+pages are contiguous, so `write_slot` finds a page there and succeeds. That is
+the same shape as T23's finding that only the range half of `check_range` has
+teeth on a stat.
+
+`dispatch` now returns `(res, extra)` rather than `res`. `STATX_AT` is the
+first opcode to complete inline *and* have something to say in `extra`, and
+until T25 the submit loop could only ever post `extra` 0 for one. The tuple is
+`run`'s, so the two completion paths now say the same thing the same way.
+
+#### What was verified, and how
+
+Seven perturbations, each applied and reverted, all seven fail.
+
+- **Defer `STATX_AT` to the workqueue.** The unprivileged child's stat of a
+  file inside a root-only directory succeeds instead of `-EACCES`, in both
+  suites. This is the plan's own done test and finding 3's second regression
+  test after T24's.
+- **Delete the eight-alignment guard.** The unaligned stat succeeds and returns
+  256.
+- **Delete the room check.** A stat eight bytes from the slot end returns 256
+  and writes 248 of them into the neighbouring slot, reporting success.
+- **Drop the slot claim.** The `STATX_AT` behind a whole-slot `CHECKSUM`
+  succeeds where it owes `-EBUSY`.
+- **Take `LOOKUP_FOLLOW` away.** The two-deep symlink stats as a symlink rather
+  than as the regular file at the end of it. One link would have been enough
+  here, unlike `READLINK`, but two costs nothing and matches T24's case.
+- **Post no mask in `extra`.** The "every field but btime was reported"
+  assertion fails — which is what says the inline path really does carry an
+  `extra` now.
+- **Drop the zero-`handle` guard.** A `STATX_AT` naming both a path and a
+  handle succeeds; every path op owes that rejection.
+
+The fuzzer's arm reaches it about 2,300 times per three-second run with about
+750 succeeding — the highest success rate of any path op, since a stat of an
+existing path almost always works. It names the same three sandboxed paths the
+T24 arm does. Its `extra` oracle is the `STAT` one, now shared by the two
+opcodes, and the per-opcode counters stopped being indexed by `op & 15`: with
+fifteen opcodes an unknown one aliased into a real bucket, which could have
+satisfied the reached-once check for an opcode nothing ever submitted.
 
 ### Cancellation
 

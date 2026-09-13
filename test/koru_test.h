@@ -85,7 +85,7 @@ void sqe_write(struct koru_sqe *s, uint32_t handle, uint32_t slot, uint64_t off,
 void sqe_stat(struct koru_sqe *s, uint32_t handle, uint32_t slot, uint64_t off, uint32_t len,
               uint64_t user_data);
 /* A path op: path at (off, len), argument after it. `opcode` is one of
- * KORU_OP_TRUNCATE, KORU_OP_UTIMES, KORU_OP_READLINK. */
+ * KORU_OP_TRUNCATE, KORU_OP_UTIMES, KORU_OP_READLINK, KORU_OP_STATX_AT. */
 void sqe_path(struct koru_sqe *s, uint8_t opcode, uint32_t slot, uint64_t off, uint32_t len,
               uint64_t user_data);
 /* Where a path op's argument goes: the first 8-aligned offset at or after the
@@ -106,6 +106,9 @@ uint32_t put_path(uint8_t *arena, uint32_t slot_size, uint32_t slot, const char 
  * after it, submit, return its res. `arg` may be NULL. */
 int64_t r_path(struct koru_ring *r, uint8_t opcode, uint32_t slot, const char *path,
                const void *arg, size_t argsize);
+/* The same, keeping the CQE's extra. `extra` may be NULL. */
+int64_t r_path_extra(struct koru_ring *r, uint8_t opcode, uint32_t slot, const char *path,
+                     const void *arg, size_t argsize, uint64_t *extra);
 
 /* MemFree from /proc/meminfo, in KB, or -1. */
 long mem_free_kb(void);

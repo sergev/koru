@@ -5,11 +5,12 @@ code in this repository.
 
 ## State of the repository
 
-**T0–T24 are done: Braam's hello world runs through koru, and the ring can
+**T0–T25 are done: Braam's hello world runs through koru, and the ring can
 wait for a descriptor.** The module registers `/dev/koru`, configures a ring
 with `SETUP`, and submits `NOP`, `DELAY_NS`, `CHECKSUM`, `OPEN`, `READ`,
 `WRITE`, `CLOSE`, `CANCEL`, `ADOPT_FD`, `POLL_ADD`, `STAT`, `TRUNCATE`,
-`UTIMES` and `READLINK` through `ENTER`, which blocks for completions. The arena
+`UTIMES`, `READLINK` and `STATX_AT` through `ENTER`, which blocks for
+completions. The arena
 is mmap'd, with slot exclusivity enforced by the kernel. Open files live in a
 generational handle table. A queued op can be genuinely dequeued, and
 `close(fd)` cancels whatever is still queued. The whole validation surface has
@@ -102,6 +103,15 @@ was not taken. `Lookup` and `Link` are `Drop` guards for `path_put` and
 `do_delayed_call`; the `mnt_want_write` guard the plan asked for is not needed
 until T26. doc/Notes.md has the seven perturbations and why kmemleak is the
 wrong instrument for the one leak here.
+
+T25 added `KORU_OP_STATX_AT`, `STAT`'s answer for a path. It shares one
+`getattr` helper with `STAT` and is inline for `OPEN`'s reason, so it needs no
+carried cred. The struct **replaces the path it was given** at `off`, as
+`READLINK`'s target does, which is why `off` must be 8-aligned and the whole
+256 bytes must fit in the rest of the slot; there is no `len` negotiation here,
+because `len` is the path's length. `dispatch` now returns `(res, extra)`: this
+is the first inline op with anything to put in `extra`. doc/Notes.md has the
+seven perturbations.
 
 T14 made the two userspace ABI mirrors a diff rather than a promise.
 `cpp/include/koru_abi.h` and `cpp/include/koru_errno.h` are the C mirrors,
@@ -206,7 +216,7 @@ survived**.
 
 ## Commands
 
-These work today (T0 through T24):
+These work today (T0 through T25):
 
 ```sh
 KDIR=../kernel-dev/linux-source-7.1

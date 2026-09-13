@@ -93,23 +93,6 @@ existing "unimplemented completes `-EINVAL`" rule. A new bit in an existing
 Per-opcode meanings for `Cqe::extra` are within its documented contract. New
 data-plane structs change no existing size or offset.
 
-### T25 [M] — `KORU_OP_STATX_AT`
-
-Stat by path: `kern_path` with `LOOKUP_FOLLOW`, the same `vfs_getattr` and
-`KoruStat` as T23, then `path_put`. Inline, for `OPEN`'s reasons — `current->fs`
-for relative paths, `inode_permission` per component, the LSM seeing the right
-task. Nearly free once T23 and T24 have landed.
-
-Path handling reuses `do_open`'s recipe verbatim: clamp to `PATH_MAX`, copy
-under a slot claim, reject an embedded NUL in the kernel copy, append our own.
-Path in and struct out use one slot under a single claim — the path is consumed
-into a `KVec` before anything is written, so there is no acquisition-order
-question. Document that the op overwrites the path it was given.
-
-Done test: a known path matches `stat(2)` field for field; a path the
-dropped-privilege child cannot traverse gives `-EACCES`, reusing T24's creds
-harness and shown to fail when the op is deferred.
-
 ### T26 [M] — `KORU_OP_MKDIR` and `KORU_OP_SYMLINK`
 
 The `start_creating_path` and `end_creating_path` happy path. `vfs_mkdir`

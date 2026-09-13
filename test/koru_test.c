@@ -295,13 +295,25 @@ int64_t r_write(struct koru_ring *r, uint32_t handle, uint32_t slot, uint64_t of
 int64_t r_path(struct koru_ring *r, uint8_t opcode, uint32_t slot, const char *path,
                const void *arg, size_t argsize)
 {
+    return r_path_extra(r, opcode, slot, path, arg, argsize, NULL);
+}
+
+int64_t r_path_extra(struct koru_ring *r, uint8_t opcode, uint32_t slot, const char *path,
+                     const void *arg, size_t argsize, uint64_t *extra)
+{
     struct koru_sqe s;
-    uint32_t n = put_path(r->arena, r->slot_size, slot, path);
+    struct koru_cqe c;
+    unsigned completed = 0;
+    uint32_t n         = put_path(r->arena, r->slot_size, slot, path);
 
     if (arg && argsize)
         memcpy(r->arena + (size_t)slot * r->slot_size + arg_offset(0, n), arg, argsize);
     sqe_path(&s, opcode, slot, 0, n, 0x106);
-    return run_one(r->fd, &s);
+    if (submit(r->fd, &s, 1, &c, 1, 1, &completed) != 1 || completed != 1)
+        return INT64_MIN;
+    if (extra)
+        *extra = c.extra;
+    return c.res;
 }
 
 int64_t r_stat(struct koru_ring *r, uint32_t handle, uint32_t slot, uint64_t off, uint32_t len,

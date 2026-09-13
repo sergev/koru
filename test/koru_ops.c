@@ -1346,6 +1346,147 @@ static void path_readlink(void)
     unlink(PLINK2);
 }
 
+/* T25: STATX_AT, T23's answer for a path rather than a handle. */
+
+#define STATXSLOT 1u
+
+static int64_t r_statx(struct koru_ring *r, uint32_t slot, const char *path, uint64_t *extra)
+{
+    return r_path_extra(r, KORU_OP_STATX_AT, slot, path, NULL, 0, extra);
+}
+
+/* Stat `path` both ways and require all 256 bytes to match. Returns the CQE's
+ * mask, or 0 on failure. */
+static uint64_t statx_both_ways(const char *path, const char *what)
+{
+    struct koru_sqe s;
+    struct koru_cqe c;
+    struct koru_stat got, want;
+    struct stat sb;
+    uint8_t *slot      = R.arena + (size_t)STATXSLOT * R.slot_size;
+    unsigned completed = 0;
+    uint64_t extra     = 0;
+    uint32_t n;
+    int64_t res;
+    char label[128];
+
+    /* Poisoned after the path goes in: put_path zeroes the whole slot. */
+    n = put_path(R.arena, R.slot_size, STATXSLOT, path);
+    memset(slot + sizeof(struct koru_stat), STAT_POISON, 8);
+    sqe_path(&s, KORU_OP_STATX_AT, STATXSLOT, 0, n, 0x740);
+    if (submit(R.fd, &s, 1, &c, 1, 1, &completed) != 1 || completed != 1) {
+        check(0, what);
+        return 0;
+    }
+    res   = c.res;
+    extra = c.extra;
+    snprintf(label, sizeof(label), "%s: STATX_AT and stat(2) agree field for field", what);
+    if (res != (int64_t)sizeof(struct koru_stat) || stat(path, &sb) != 0) {
+        check(0, label);
+        note("res %lld", (long long)res);
+        return 0;
+    }
+    memcpy(&got, slot, sizeof(got));
+    stat_expect(&sb, &got, &want);
+    check(memcmp(&got, &want, sizeof(got)) == 0, label);
+    if (memcmp(&got, &want, sizeof(got)) != 0)
+        note("ino %llu/%llu size %llu/%llu mode %llo/%llo", (unsigned long long)got.ino,
+             (unsigned long long)want.ino, (unsigned long long)got.size,
+             (unsigned long long)want.size, (unsigned long long)got.mode,
+             (unsigned long long)want.mode);
+    check(slot[sizeof(struct koru_stat)] == STAT_POISON, "  and not one byte past res");
+    return extra;
+}
+
+static void path_statx(void)
+{
+    struct koru_sqe sq[2];
+    struct koru_cqe cq[2];
+    const struct koru_cqe *a, *b;
+    uint8_t *slot = R.arena + (size_t)STATXSLOT * R.slot_size;
+    struct koru_stat got;
+    struct stat sb;
+    unsigned completed = 0;
+    uint64_t extra;
+    uint32_t n;
+
+    /* 1. Every field, against stat(2), for three shapes of file. */
+    extra = statx_both_ways(PATFILE, "a regular file");
+    check((extra & ~(uint64_t)KORU_STAT_ALL) == 0, "  extra carries no bit outside KORU_STAT_ALL");
+    check((extra & (KORU_STAT_ALL & ~KORU_STAT_BTIME)) == (KORU_STAT_ALL & ~KORU_STAT_BTIME),
+          "  and every field but btime was reported");
+    statx_both_ways("/etc", "a directory");
+    statx_both_ways("/dev/null", "a character device");
+
+    /* 2. The answer replaces the path, which is the documented contract. */
+    check(memcmp(slot, PATFILE, strlen(PATFILE)) != 0, "the struct overwrote the path");
+
+    /* 3. A final symlink is followed, as stat(2) follows it: the two-deep link
+     *    resolves to the file, not to the link in between. */
+    unlink(PLINK);
+    unlink(PLINK2);
+    if (symlink(PLINK2, PLINK) == 0 && symlink(PATFILE, PLINK2) == 0) {
+        if (r_statx(&R, STATXSLOT, PLINK, NULL) == (int64_t)sizeof(struct koru_stat) &&
+            stat(PATFILE, &sb) == 0) {
+            memcpy(&got, slot, sizeof(got));
+            check(got.ino == sb.st_ino && (got.mode & KORU_S_IFMT) == KORU_S_IFREG,
+                  "STATX_AT follows a final symlink");
+        } else {
+            check(0, "STATX_AT follows a final symlink");
+        }
+    } else {
+        printf("%-58s SKIP (cannot symlink)\n", "STATX_AT follows a final symlink");
+    }
+    unlink(PLINK);
+    unlink(PLINK2);
+
+    /* 4. Rejections. */
+    check_res(r_statx(&R, STATXSLOT, "/no/such/path", NULL), -ENOENT,
+              "STATX_AT of a missing path is ENOENT");
+    check_res(r_statx(&R, STATXSLOT, PATFILE "/x", NULL), -ENOTDIR,
+              "  of a path through a regular file is ENOTDIR");
+
+    n = put_path(R.arena, R.slot_size, STATXSLOT, PATFILE);
+    sqe_path(&sq[0], KORU_OP_STATX_AT, STATXSLOT, 0, n, 0x730);
+    sq[0].handle = 1;
+    check_res(run_one(R.fd, &sq[0]), -EINVAL, "  a non-zero handle is EINVAL");
+    sqe_path(&sq[0], KORU_OP_STATX_AT, STATXSLOT, 0, 0, 0x731);
+    check_res(run_one(R.fd, &sq[0]), -EINVAL, "  a zero-length path is EINVAL");
+    sqe_path(&sq[0], KORU_OP_STATX_AT, R.slot_count, 0, 8, 0x732);
+    check_res(run_one(R.fd, &sq[0]), -EINVAL, "  a slot past the arena is EINVAL");
+
+    /* An unaligned destination, with a real path at it so only the alignment
+     * can refuse. */
+    memset(slot, 0, R.slot_size);
+    memcpy(slot + 4, PATFILE, strlen(PATFILE));
+    sqe_path(&sq[0], KORU_OP_STATX_AT, STATXSLOT, 4, n, 0x733);
+    check_res(run_one(R.fd, &sq[0]), -EINVAL, "  an unaligned off is EINVAL");
+
+    /* The whole struct has to fit after off, not merely the path. */
+    memset(slot, 0, R.slot_size);
+    memcpy(slot + R.slot_size - 256 + 8, PATFILE, strlen(PATFILE));
+    sqe_path(&sq[0], KORU_OP_STATX_AT, STATXSLOT, R.slot_size - 256 + 8, n, 0x734);
+    check_res(run_one(R.fd, &sq[0]), -EINVAL, "  a struct that does not fit is EINVAL");
+    memcpy(slot + R.slot_size - 256, PATFILE, strlen(PATFILE));
+    sqe_path(&sq[0], KORU_OP_STATX_AT, STATXSLOT, R.slot_size - 256, n, 0x735);
+    check_res(run_one(R.fd, &sq[0]), (int64_t)sizeof(struct koru_stat),
+              "  while one that exactly fits is accepted");
+
+    /* 5. Slot exclusivity, the CHECKSUM idiom STAT uses. */
+    put_path(R.arena, R.slot_size, STATXSLOT, PATFILE);
+    sqe_checksum(&sq[0], STATXSLOT, 0, R.slot_size, 0xd4);
+    sqe_path(&sq[1], KORU_OP_STATX_AT, STATXSLOT, 0, n, 0xd5);
+    submit(R.fd, sq, 2, cq, 2, 2, &completed);
+    a = find_cqe(cq, completed, 0xd4);
+    b = find_cqe(cq, completed, 0xd5);
+    check(completed == 2 && a && b, "a CHECKSUM and a STATX_AT on one slot both complete");
+    if (a && b) {
+        check(a->res >= 0, "  the deferred CHECKSUM holds the slot");
+        check_res(b->res, -EBUSY, "  and the STATX_AT behind it gets -EBUSY");
+        check(b->extra == 0, "  a refused STATX_AT reports no mask");
+    }
+}
+
 /* The whole inline-because-of-creds rule, for something other than OPEN.
  * Deferred to a kworker every one of these would run as root in the initial
  * namespaces, and each EACCES below would become a success. */
@@ -1380,6 +1521,9 @@ static int path_creds_child(struct koru_ring *m)
     /* The link itself is world-readable; the directory it sits in is not. */
     if (r_readlink(m, 0, CREDSLINK) != -EACCES)
         return 8;
+    /* Same directory, and the op that would report its target's every field. */
+    if (r_statx(m, 0, CREDSLINK, NULL) != -EACCES)
+        return 9;
     return 0;
 }
 
@@ -1415,9 +1559,9 @@ static void path_creds(void)
         if (pid < 0 || waitpid(pid, &st, 0) != pid) {
             check(0, "fork the path creds child");
         } else {
-            /* 5 truncate, 6 utimes, 7 touch, 8 readlink. */
+            /* 5 truncate, 6 utimes, 7 touch, 8 readlink, 9 statx. */
             check(WIFEXITED(st) && WEXITSTATUS(st) == 0,
-                  "an unprivileged TRUNCATE, UTIMES and READLINK are refused");
+                  "an unprivileged TRUNCATE, UTIMES, READLINK and STATX_AT are refused");
             if (WIFEXITED(st) && WEXITSTATUS(st) != 0)
                 note("child verdict %d", WEXITSTATUS(st));
         }
@@ -1466,6 +1610,7 @@ void sec_path(void)
     path_truncate();
     path_utimes();
     path_readlink();
+    path_statx();
     path_creds();
     path_readlink_leak();
 }

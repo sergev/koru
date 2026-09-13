@@ -3192,6 +3192,18 @@ fn creds_an_unprivileged_path_op_is_refused() {
         std::fs::set_permissions(f.path(), PermissionsExt::from_mode(0o600)).expect("chmod");
     }
 
+    // A directory the child cannot traverse: a stat needs only search
+    // permission on the way in, so nothing else here would refuse it.
+    let dir = "/tmp/koru-check-rs-credsdir";
+    let inner = format!("{dir}/inside");
+    let _ = std::fs::remove_dir_all(dir);
+    std::fs::create_dir(dir).expect("mkdir");
+    std::fs::write(&inner, b"x").expect("fill");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, PermissionsExt::from_mode(0o700)).expect("chmod");
+    }
+
     let (uid, gid) = nobody_ids();
     // The arena is VM_DONTCOPY, so the child maps it after the fork.
     let ring = Ring::with_config(&SetupConfig::new(32, 64, 8192, 4, 8)).expect("SETUP");
@@ -3228,6 +3240,8 @@ fn creds_an_unprivileged_path_op_is_refused() {
                             6
                         } else if utimes(&m, &path, &touch) != -(EACCES.0 as i64) {
                             7
+                        } else if statx_at(&m, &inner).0 != -(EACCES.0 as i64) {
+                            8
                         } else {
                             0
                         }
@@ -3241,6 +3255,183 @@ fn creds_an_unprivileged_path_op_is_refused() {
     let mut status = 0;
     unsafe { sys::waitpid(pid, &mut status, 0) };
     assert!(sys::wifexited(status), "the child died");
-    // 5 truncate, 6 named utimes, 7 touch.
+    let _ = std::fs::remove_dir_all(dir);
+    // 5 truncate, 6 named utimes, 7 touch, 8 statx.
     assert_eq!(sys::wexitstatus(status), 0, "child verdict");
+}
+
+// ---------------------------------------------------------------------------
+// T25 - STATX_AT
+// ---------------------------------------------------------------------------
+
+/// A path op on slot 1, keeping the mask. The answer replaces the path.
+fn statx_at(m: &Mapped, path: &str) -> (i64, u64) {
+    let n = m.put_path(1, path);
+    m.run_one_extra(&Sqe::path(KORU_OP_STATX_AT, 0x740, 1, 0, n))
+}
+
+/// Every field against `stat(2)`, and every other byte zero, as T23's is.
+#[test]
+fn statx_at_matches_stat_2_field_for_field() {
+    use std::os::linux::fs::MetadataExt;
+
+    ensure_pattern_file();
+    let m = Mapped::shared();
+
+    // Poisoned after the path goes in: `put_path` zeroes the whole slot.
+    let n = m.put_path(1, PATFILE);
+    m.slot(1)[size_of::<KoruStat>()..size_of::<KoruStat>() + 8].fill(POISON);
+    let (res, extra) = m.run_one_extra(&Sqe::path(KORU_OP_STATX_AT, 0x740, 1, 0, n));
+    assert_eq!(res, size_of::<KoruStat>() as i64, "res is the whole struct");
+    let md = std::fs::metadata(PATFILE).expect("metadata");
+
+    let got = KoruStat::read_from(m.slot(1)).expect("a whole struct");
+    assert_eq!(got.ino, md.st_ino(), "ino");
+    assert_eq!(got.size, md.st_size(), "size");
+    assert_eq!(got.blocks, md.st_blocks(), "blocks");
+    assert_eq!(got.blksize, md.st_blksize(), "blksize");
+    assert_eq!(got.nlink, md.st_nlink(), "nlink");
+    assert_eq!(got.mode, u64::from(md.st_mode()), "mode");
+    assert_eq!(got.uid, u64::from(md.st_uid()), "uid");
+    assert_eq!(got.gid, u64::from(md.st_gid()), "gid");
+    assert_eq!(got.dev_major, dev_major(md.st_dev()), "dev_major");
+    assert_eq!(got.dev_minor, dev_minor(md.st_dev()), "dev_minor");
+    assert_eq!(got.mtime_sec, md.st_mtime(), "mtime_sec");
+    assert_eq!(got.mtime_nsec, md.st_mtime_nsec() as u64, "mtime_nsec");
+    assert_eq!(got.reserved, [0u64; 12], "reserved must read as zero");
+    assert_eq!(
+        m.slot(1)[size_of::<KoruStat>()],
+        POISON,
+        "not one byte past"
+    );
+
+    assert_eq!(extra & !KORU_STAT_ALL, 0, "no bit outside KORU_STAT_ALL");
+    let basic = KORU_STAT_ALL & !KORU_STAT_BTIME;
+    assert_eq!(extra & basic, basic, "every field but btime was reported");
+    m.assert_quiesced();
+}
+
+/// The struct lands where the path was, which is the documented contract.
+#[test]
+fn statx_at_overwrites_the_path_it_was_given() {
+    ensure_pattern_file();
+    let m = Mapped::shared();
+
+    let n = m.put_path(1, PATFILE) as usize;
+    assert_eq!(&m.slot(1)[..n], PATFILE.as_bytes(), "the path went in");
+    let res = m.run_one(&Sqe::path(KORU_OP_STATX_AT, 0x741, 1, 0, n as u32));
+    assert_eq!(res, size_of::<KoruStat>() as i64, "STATX_AT");
+    assert_ne!(
+        &m.slot(1)[..n],
+        PATFILE.as_bytes(),
+        "and the answer over it"
+    );
+    m.assert_quiesced();
+}
+
+/// Two links deep, so following is what separates the answers.
+#[test]
+fn statx_at_follows_a_final_symlink() {
+    use std::os::linux::fs::MetadataExt;
+
+    ensure_pattern_file();
+    let Some(inner) = Symlink::new("statxin", PATFILE) else {
+        skip("statx_at", "cannot symlink");
+        return;
+    };
+    let Some(outer) = Symlink::new("statxout", inner.path()) else {
+        skip("statx_at", "cannot symlink");
+        return;
+    };
+    let m = Mapped::shared();
+
+    assert_eq!(statx_at(&m, outer.path()).0, size_of::<KoruStat>() as i64);
+    let got = KoruStat::read_from(m.slot(1)).expect("a whole struct");
+    let md = std::fs::metadata(PATFILE).expect("metadata");
+    assert_eq!(got.ino, md.st_ino(), "the target's inode, not a link's");
+    assert_eq!(got.mode & KORU_S_IFMT, KORU_S_IFREG, "a regular file");
+    m.assert_quiesced();
+}
+
+#[test]
+fn statx_at_rejection_matrix() {
+    ensure_pattern_file();
+    let m = Mapped::shared();
+    let bad = -(EINVAL.0 as i64);
+    let full = size_of::<KoruStat>();
+
+    assert_eq!(
+        statx_at(&m, "/no/such/path").0,
+        -(ENOENT.0 as i64),
+        "a missing path"
+    );
+    assert_eq!(
+        statx_at(&m, &format!("{PATFILE}/x")).0,
+        -(ENOTDIR.0 as i64),
+        "a path through a regular file"
+    );
+
+    let n = m.put_path(1, PATFILE);
+    let mut s = Sqe::path(KORU_OP_STATX_AT, 0x750, 1, 0, n);
+    s.handle = 1;
+    assert_eq!(m.run_one(&s), bad, "a non-zero handle");
+    assert_eq!(
+        m.run_one(&Sqe::path(KORU_OP_STATX_AT, 0x751, 1, 0, 0)),
+        bad,
+        "a zero-length path"
+    );
+    assert_eq!(
+        m.run_one(&Sqe::path(KORU_OP_STATX_AT, 0x752, m.slot_count(), 0, 8)),
+        bad,
+        "a slot past the arena"
+    );
+
+    // A real path at each destination, so only the guard under test refuses.
+    let put = |off: usize| {
+        let s = m.slot(1);
+        s.fill(0);
+        s[off..off + PATFILE.len()].copy_from_slice(PATFILE.as_bytes());
+    };
+    put(4);
+    assert_eq!(
+        m.run_one(&Sqe::path(KORU_OP_STATX_AT, 0x753, 1, 4, n)),
+        bad,
+        "an unaligned off"
+    );
+    let tight = m.slot_size() as usize - full;
+    put(tight + 8);
+    assert_eq!(
+        m.run_one(&Sqe::path(KORU_OP_STATX_AT, 0x754, 1, tight as u64 + 8, n)),
+        bad,
+        "a struct that does not fit"
+    );
+    put(tight);
+    assert_eq!(
+        m.run_one(&Sqe::path(KORU_OP_STATX_AT, 0x755, 1, tight as u64, n)),
+        full as i64,
+        "while one that exactly fits is accepted"
+    );
+    m.assert_quiesced();
+}
+
+/// The CHECKSUM idiom again: it still holds slot 7 when the STATX_AT behind it
+/// is dispatched, and that one is inline.
+#[test]
+fn statx_at_is_refused_a_slot_another_op_holds() {
+    ensure_pattern_file();
+    let m = Mapped::shared();
+    let n = m.put_path(7, PATFILE);
+
+    let sq = [
+        Sqe::checksum(0x760, 7, 0, m.slot_size()),
+        Sqe::path(KORU_OP_STATX_AT, 0x761, 7, 0, n),
+    ];
+    let mut cq = [Cqe::default(); 2];
+    let r = m.ring.enter(&sq, &mut cq, 2, None).expect("ENTER");
+    assert_eq!(r.progress.completed, 2, "both complete");
+
+    let refused = find_cqe(&cq, 0x761);
+    assert_eq!(refused.res, -(EBUSY.0 as i64), "the STATX_AT behind it");
+    assert_eq!(refused.extra, 0, "a refused STATX_AT reports no mask");
+    m.assert_quiesced();
 }

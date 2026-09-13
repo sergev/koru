@@ -225,6 +225,14 @@ KORU_STATIC_ASSERT(KORU_IOC_ENTER == 0xc0406b02u, "ioctl ENTER");
 #define KORU_OP_TRUNCATE 11
 #define KORU_OP_UTIMES   12
 #define KORU_OP_READLINK 13
+/* Stat by path. No argument: the struct koru_stat replaces the path it was
+ * given, at off in the same slot, and res is its size. off must be a multiple
+ * of eight and the whole struct must fit in the rest of the slot, else EINVAL.
+ * extra carries the KORU_STAT_* mask, as on STAT. Follows a final symlink.
+ * len is the path's length here, so there is no version negotiation as on
+ * STAT: a later field comes out of koru_stat.reserved, which fixes the struct's
+ * size for every binary at this ABI version. */
+#define KORU_OP_STATX_AT 14
 
 KORU_STATIC_ASSERT(KORU_OP_NOP == 0, "op NOP");
 KORU_STATIC_ASSERT(KORU_OP_DELAY_NS == 1, "op DELAY_NS");
@@ -240,6 +248,7 @@ KORU_STATIC_ASSERT(KORU_OP_STAT == 10, "op STAT");
 KORU_STATIC_ASSERT(KORU_OP_TRUNCATE == 11, "op TRUNCATE");
 KORU_STATIC_ASSERT(KORU_OP_UTIMES == 12, "op UTIMES");
 KORU_STATIC_ASSERT(KORU_OP_READLINK == 13, "op READLINK");
+KORU_STATIC_ASSERT(KORU_OP_STATX_AT == 14, "op STATX_AT");
 
 /* Any bit set in an SQE's flags is rejected. */
 #define KORU_SQE_FLAGS_ALL 0u

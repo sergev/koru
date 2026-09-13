@@ -70,7 +70,10 @@ static int one_in(uint64_t *s, uint32_t n)
 static atomic_uint handle_pool[POOL];
 static atomic_uint pool_next;
 
-static atomic_ullong op_total[16], op_ok[16];
+/* One per opcode, plus a bucket for everything that is not one. */
+#define NOPCODES (KORU_OP_STATX_AT + 2)
+
+static atomic_ullong op_total[NOPCODES], op_ok[NOPCODES];
 static atomic_ullong open_einval, open_ebusy, open_emfile, open_other;
 
 static uint32_t pool_pick(uint64_t *s)
@@ -95,9 +98,17 @@ static void fail(const char *what)
  * assertion goes green for the wrong reason. */
 static int extra_allowed(uint8_t opcode, const struct koru_cqe *c)
 {
-    if (opcode == KORU_OP_STAT)
+    if (opcode == KORU_OP_STAT || opcode == KORU_OP_STATX_AT)
         return c->res >= 0 ? (c->extra & ~(uint64_t)KORU_STAT_ALL) == 0 : c->extra == 0;
     return c->extra == 0;
+}
+
+/* Which per-opcode counter a completion lands in. Never a mask: an unknown
+ * opcode aliased into a real bucket would satisfy the reached-once check for an
+ * opcode nothing ever submitted. */
+static unsigned op_bucket(uint8_t op)
+{
+    return op <= KORU_OP_STATX_AT ? op : NOPCODES - 1;
 }
 
 /* There is only one Cqe constructor, so any deviation is a real bug. */
@@ -158,6 +169,11 @@ static int res_allowed(uint8_t opcode, int64_t res)
         return (res >= 1 && res < F_SLOT) || res == -EINVAL || res == -EBUSY ||
                res == -ENOMEM || res == -ENOENT || res == -ENOTDIR || res == -EACCES ||
                res == -ELOOP || res == -ENAMETOOLONG;
+    case KORU_OP_STATX_AT:
+        /* The whole struct or nothing: there is no version negotiation here. */
+        return res == (int64_t)sizeof(struct koru_stat) || res == -EINVAL || res == -EBUSY ||
+               res == -ENOMEM || res == -ENOENT || res == -ENOTDIR || res == -EACCES ||
+               res == -ELOOP || res == -ENAMETOOLONG;
     default:
         return res == -EINVAL;
     }
@@ -187,7 +203,7 @@ static void gen_valid(uint64_t *s, struct koru_sqe *q, uint64_t ud, uint32_t pat
 {
     uint32_t slot = rnd_below(s, F_SLOTS);
 
-    switch (rnd_below(s, 20)) {
+    switch (rnd_below(s, 21)) {
     case 0:
         sqe_nop(q, ud);
         break;
@@ -290,6 +306,15 @@ static void gen_valid(uint64_t *s, struct koru_sqe *q, uint64_t ud, uint32_t pat
             memcpy(arena + (size_t)path_slot * F_SLOT + at, &t, sizeof(t));
         }
         sqe_path(q, op, path_slot, 0, n, ud);
+        break;
+    }
+    case 18: {
+        /* The same three sandboxed paths. It writes nothing on disk, but its
+         * answer overwrites the slot the path came out of. */
+        static const char *const paths[] = { FUZZWRFILE, FUZZLINK, "/tmp/koru-fuzz-no-such" };
+        uint32_t n = put_path(arena, F_SLOT, path_slot, paths[rnd_below(s, 3)]);
+
+        sqe_path(q, KORU_OP_STATX_AT, path_slot, 0, n, ud);
         break;
     }
     default:
@@ -433,9 +458,9 @@ static void *worker(void *arg)
                 note("opcode %u res %lld", op, (long long)cq[i].res);
                 fail("every CQE res is in its opcode's allowed set");
             }
-            atomic_fetch_add(&op_total[op & 15], 1);
+            atomic_fetch_add(&op_total[op_bucket(op)], 1);
             if (cq[i].res >= 0)
-                atomic_fetch_add(&op_ok[op & 15], 1);
+                atomic_fetch_add(&op_ok[op_bucket(op)], 1);
             if (op == KORU_OP_OPEN && cq[i].res < 0) {
                 if (cq[i].res == -EINVAL)
                     atomic_fetch_add(&open_einval, 1);
@@ -655,9 +680,10 @@ static unsigned long long drain(void)
 
 int fuzz_main(unsigned secs, uint64_t seed)
 {
-    static const char *names[15] = { "NOP",   "DELAY", "OPEN",  "READ",  "CLOSE",
-                                     "CANCEL", "CKSUM", "WRITE", "ADOPT", "POLL",
-                                     "STAT",  "TRUNC", "UTIMES", "RDLINK", "other" };
+    static const char *names[NOPCODES] = { "NOP",    "DELAY",  "OPEN",   "READ",
+                                           "CLOSE",  "CANCEL", "CKSUM",  "WRITE",
+                                           "ADOPT",  "POLL",   "STAT",   "TRUNC",
+                                           "UTIMES", "RDLINK", "STATXAT", "other" };
     struct koru_ring m;
     pthread_t th[NWORKERS + 2];
     uint64_t seeds[NWORKERS + 2];
@@ -736,7 +762,7 @@ int fuzz_main(unsigned secs, uint64_t seed)
 
         note("%llu ENTERs, %llu SQEs consumed, %llu CQEs reaped (%llu at drain)",
              (unsigned long long)atomic_load(&total_ops), sub, rea, tail);
-        for (op = 0; op < 15; op++)
+        for (op = 0; op < NOPCODES; op++)
             note("%-6s %7llu completed, %7llu succeeded", names[op],
                  (unsigned long long)atomic_load(&op_total[op]),
                  (unsigned long long)atomic_load(&op_ok[op]));
@@ -749,7 +775,7 @@ int fuzz_main(unsigned secs, uint64_t seed)
         check(sub > SUB_FLOOR, "the fuzzer actually exercised the ring");
         /* Completion, not success: the tail sections carry that claim. */
         reached = 1;
-        for (op = 0; op <= KORU_OP_READLINK; op++)
+        for (op = 0; op <= KORU_OP_STATX_AT; op++)
             if (atomic_load(&op_total[op]) == 0) {
                 note("opcode %d never completed once", op);
                 reached = 0;
