@@ -258,6 +258,15 @@ KORU_STATIC_ASSERT(KORU_IOC_ENTER == 0xc0406b02u, "ioctl ENTER");
  * must be zero and res is 0. Both halves must be on one mount, else EXDEV; an
  * existing destination is replaced, as rename(2) replaces it. */
 #define KORU_OP_RENAME 19
+/* Read directory entries into slot `slot` at slot offset 0, as READ does. len
+ * is the byte budget; off is a resume cookie, 0 for the beginning. res is the
+ * bytes written and 0 is end of directory, mirroring READ; extra is the next
+ * cookie. A budget too small for one entry is EINVAL, not 0. ENOTDIR for a
+ * non-directory.
+ *
+ * The first opcode that mutates shared per-file state, f_pos, so it is
+ * serialised per handle: a second concurrent one gets EBUSY. */
+#define KORU_OP_READDIR 20
 
 KORU_STATIC_ASSERT(KORU_OP_NOP == 0, "op NOP");
 KORU_STATIC_ASSERT(KORU_OP_DELAY_NS == 1, "op DELAY_NS");
@@ -279,6 +288,7 @@ KORU_STATIC_ASSERT(KORU_OP_SYMLINK == 16, "op SYMLINK");
 KORU_STATIC_ASSERT(KORU_OP_UNLINK == 17, "op UNLINK");
 KORU_STATIC_ASSERT(KORU_OP_RMDIR == 18, "op RMDIR");
 KORU_STATIC_ASSERT(KORU_OP_RENAME == 19, "op RENAME");
+KORU_STATIC_ASSERT(KORU_OP_READDIR == 20, "op READDIR");
 
 /* Any bit set in an SQE's flags is rejected. */
 #define KORU_SQE_FLAGS_ALL 0u
@@ -323,6 +333,10 @@ KORU_STATIC_ASSERT(KORU_OP_RENAME == 19, "op RENAME");
 
 /* Multishot bit, reserved and never set. */
 #define KORU_CQE_F_MORE (1u << 0)
+
+/* READDIR dropped an entry whose name it could not represent: a NUL or a
+ * separator in it, which means a corrupt filesystem. */
+#define KORU_CQE_F_SKIPPED (1u << 1)
 
 /* File type, the top bits of koru_stat.mode. Unlike the open flags, these
  * values are the same on every Linux architecture, so they pass through. */
@@ -411,6 +425,46 @@ KORU_STATIC_ASSERT(offsetof(struct koru_stat, ctime_nsec) == 136, "stat.ctime_ns
 KORU_STATIC_ASSERT(offsetof(struct koru_stat, btime_sec) == 144, "stat.btime_sec");
 KORU_STATIC_ASSERT(offsetof(struct koru_stat, btime_nsec) == 152, "stat.btime_nsec");
 KORU_STATIC_ASSERT(offsetof(struct koru_stat, reserved) == 160, "stat.reserved");
+
+/* A koru_dirent's type: (i_mode & S_IFMT) >> 12, the same on every
+ * architecture, so they pass through as the S_IF* values do. */
+#define KORU_DT_UNKNOWN 0u
+#define KORU_DT_FIFO    1u
+#define KORU_DT_CHR     2u
+#define KORU_DT_DIR     4u
+#define KORU_DT_BLK     6u
+#define KORU_DT_REG     8u
+#define KORU_DT_LNK     10u
+#define KORU_DT_SOCK    12u
+/* The mask the VFS applies; anything above it is a flag, not a type. */
+#define KORU_DT_MASK 0xfu
+
+/* Every record starts on a multiple of this. */
+#define KORU_DIRENT_ALIGN 8u
+
+/* One entry's header, then namelen name bytes, a NUL, and padding to
+ * KORU_DIRENT_ALIGN. 24 bytes, no padding.
+ *
+ * linux_dirent64 with its annoyances fixed: 8-aligned rather than 2-aligned,
+ * and namelen explicit rather than implied by reclen. The name is
+ * NUL-terminated for a C caller, but namelen is authoritative. */
+struct koru_dirent {
+    uint64_t ino;
+    uint64_t cookie;     /* pass as the next off to resume AFTER this entry */
+    uint16_t reclen;     /* header, name, NUL and padding: the stride */
+    uint16_t namelen;    /* the name's length without its NUL */
+    uint8_t dtype;       /* one of the KORU_DT_* values */
+    uint8_t reserved[3]; /* out: must read as zero */
+};
+
+KORU_STATIC_ASSERT(sizeof(struct koru_dirent) == 24, "dirent size");
+KORU_STATIC_ASSERT(KORU_ALIGNOF(struct koru_dirent) == 8, "dirent align");
+KORU_STATIC_ASSERT(offsetof(struct koru_dirent, ino) == 0, "dirent.ino");
+KORU_STATIC_ASSERT(offsetof(struct koru_dirent, cookie) == 8, "dirent.cookie");
+KORU_STATIC_ASSERT(offsetof(struct koru_dirent, reclen) == 16, "dirent.reclen");
+KORU_STATIC_ASSERT(offsetof(struct koru_dirent, namelen) == 18, "dirent.namelen");
+KORU_STATIC_ASSERT(offsetof(struct koru_dirent, dtype) == 20, "dirent.dtype");
+KORU_STATIC_ASSERT(offsetof(struct koru_dirent, reserved) == 21, "dirent.reserved");
 
 /* Nanosecond sentinels, checked by the kernel itself. Same values everywhere,
  * so they pass through like the S_IF* ones. */

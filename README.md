@@ -144,12 +144,11 @@ thread-local — so those three writes reach the terminal through `ADOPT_FD` and
 The module registers `/dev/koru` and runs `NOP`, `DELAY_NS`, `CHECKSUM`,
 `OPEN`, `READ`, `WRITE`, `CLOSE`, `CANCEL`, `ADOPT_FD`, `POLL_ADD`, `STAT`,
 `TRUNCATE`, `UTIMES`, `READLINK`, `STATX_AT`, `MKDIR`, `SYMLINK`, `UNLINK`,
-`RMDIR` and `RENAME` through `ENTER`. The arena is mapped and slot exclusivity
-is enforced by the kernel, open files live in a generational handle table, a
-queued operation can be genuinely dequeued, and closing the ring cancels
-whatever is still queued. The
-whole validation surface has been fuzzed for ten minutes under KASAN, lockdep
-and kmemleak with no kernel messages.
+`RMDIR`, `RENAME` and `READDIR` through `ENTER`. The arena is mapped and slot
+exclusivity is enforced by the kernel, open files live in a generational handle
+table, a queued operation can be genuinely dequeued, and closing the ring
+cancels whatever is still queued. The whole validation surface has been fuzzed
+for ten minutes under KASAN, lockdep and kmemleak with no kernel messages.
 
 One binary, `test/koru_check`, is the entire test suite for the module.
 `scripts/run.sh` boots a VM, runs it and prints one verdict line in about half a
@@ -200,9 +199,8 @@ permission-checks as root — the check proves that by deliberately moving one t
 a worker and watching an unprivileged process delete a file it had no business
 touching.
 
-Next is the last of the kernel surface — `READDIR` — followed by the rest of
-the operation layer, the terminal, and the C++ binding that has to transcribe
-all of it.
+The kernel surface is complete. Next is the rest of the operation layer, the
+terminal, and the C++ binding that has to transcribe all of it.
 
 [doc/Notes.md](doc/Notes.md) has the design and the reasoning behind it.
 [doc/Plan.md](doc/Plan.md) has the remaining tasks, each with a test.

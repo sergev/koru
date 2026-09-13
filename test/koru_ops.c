@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <dirent.h>
 #include <sys/mman.h>
 #include <sys/mount.h>
 #include <arpa/inet.h>
@@ -1107,8 +1108,7 @@ void sec_stat(void)
  * leaves no room for the argument after it. */
 #define SHORTPATH "/run/abc"
 #define CREDSDIR  "/tmp/koru-check-credsdir"
-/* Searchable but not writable: the lookup succeeds and `vfs_mkdir` itself is
- * what refuses, which is the only way to reach its error path. */
+/* Searchable but not writable, so vfs_mkdir itself is what refuses. */
 #define CREDSRO   "/tmp/koru-check-credsro"
 #define CREDSLINK CREDSDIR "/link"
 /* Longer than tmpfs's SHORT_SYMLINK_LEN, so the target is page-backed and
@@ -1374,7 +1374,7 @@ static uint64_t statx_both_ways(const char *path, const char *what)
     int64_t res;
     char label[128];
 
-    /* Poisoned after the path goes in: put_path zeroes the whole slot. */
+    /* Poisoned after the path: put_path zeroes the whole slot. */
     n = put_path(R.arena, R.slot_size, STATXSLOT, path);
     memset(slot + sizeof(struct koru_stat), STAT_POISON, 8);
     sqe_path(&s, KORU_OP_STATX_AT, STATXSLOT, 0, n, 0x740);
@@ -1634,8 +1634,8 @@ static void path_unlink(void)
     check_res(r_unlink(&R, 1, NEWLINK), 0, "  and a dangling symlink");
     check(GONE(NEWLINK), "  which access(2) also stops finding");
 
-    /* On a writable filesystem: `mnt_want_write` comes first, so a directory
-     * under a read-only mount would answer EROFS and prove nothing. */
+    /* On a writable filesystem: mnt_want_write comes first, so a read-only
+     * mount would answer EROFS and prove nothing. */
     if (mkdir(NEWDIR, 0700) == 0)
         check_res(r_unlink(&R, 1, NEWDIR), -EISDIR, "UNLINK of a directory is EISDIR");
     else
@@ -1645,15 +1645,14 @@ static void path_unlink(void)
     check_res(r_unlink(&R, 1, "/etc/hostname/x"), -ENOTDIR,
               "  through a regular file is ENOTDIR");
 
-    /* Our own rejections, before start_removing sees the name. Every one of
-     * these is -EACCES from the VFS when our check is deleted, never a pass. */
+    /* Ours, before start_removing sees the name: -EACCES without them. */
     check_res(r_unlink(&R, 1, "/tmp/."), -EINVAL, "UNLINK of a path ending in . is EINVAL");
     check_res(r_unlink(&R, 1, "/tmp/.."), -EINVAL, "  ending in .. is EINVAL");
     check_res(r_unlink(&R, 1, "/tmp/"), -EINVAL, "  with a trailing separator is EINVAL");
     check_res(r_unlink(&R, 1, "/"), -EINVAL, "  and the root itself is EINVAL");
 
-    /* A path with no separator at all resolves against the caller's cwd, which
-     * is the submitting task's only because this runs inline. */
+    /* No separator: the cwd, which is the submitter's only because this is
+     * inline. */
     {
         char cwd[256];
 
@@ -1792,13 +1791,9 @@ static void path_rename(void)
     check_res(run_one(R.fd, &s), -EINVAL, "  one path with no NUL between is EINVAL");
     check(access(RENDIR "/f", F_OK) == 0, "and no rejected RENAME moved anything");
 
-    /* 5. Across mounts: EXDEV, before anything is locked.
-     *
-     * Two mounts of **one** filesystem, not two filesystems: for two
-     * superblocks `lock_rename` answers EXDEV on its own, so only a bind mount
-     * puts our own check on trial. Renaming across it would also write through
-     * a mount whose write count we never took, which is T27's read-only bypass
-     * reached from here. */
+    /* 5. Across mounts: EXDEV, before anything is locked. Two mounts of *one*
+     *    filesystem: for two superblocks lock_rename answers EXDEV itself, so
+     *    only a bind mount tries our check. See doc/Notes.md. */
     rmdir(RENMNT);
     rmdir(RENBIND);
     if (mkdir(RENMNT, 0700) == 0 && mount("none", RENMNT, "tmpfs", 0, NULL) == 0) {
@@ -1835,11 +1830,9 @@ static void path_rename(void)
     rmdir(RENDIR);
 }
 
-/* A **read-only bind mount** of a writable filesystem, which is the only shape
- * that isolates our own `mnt_want_write`: with the superblock read-only,
- * `inode_permission` answers EROFS on its own and the guard could be missing
- * without anything saying so. Here the inode is perfectly writable and only the
- * mount refuses. */
+/* A read-only **bind mount** of a writable filesystem: the only shape that
+ * isolates our own mnt_want_write. With the superblock read-only,
+ * inode_permission answers EROFS by itself. See doc/Notes.md. */
 #define ROBIND "/run/koru-check-robind"
 
 static void path_readonly(void)
@@ -1927,11 +1920,9 @@ static void path_rmdir(void)
     rmdir(NEWDIR);
 }
 
-/* Heavy: every create and every removal takes the mount's write count and must
- * put it back — `start_creating_path` for T26's pair, our own `Write` guard for
- * T27's. Nothing else sees an unbalanced one — no splat, no leak report — until
- * the filesystem refuses to go read-only. Its own tmpfs, so the count the
- * remount weighs is ours alone. */
+/* Heavy: every create and removal takes the mount's write count and must put it
+ * back. Nothing sees an unbalanced one until the filesystem refuses to go
+ * read-only. Its own tmpfs, so the count weighed is ours alone. */
 #define BALANCE 2000u
 
 static void path_create_balance(void)
@@ -2020,9 +2011,8 @@ static int path_creds_child(struct koru_ring *m)
         return 10;
     if (r_symlink(m, 0, "/any/target", CREDSDIR "/new") != -EACCES)
         return 11;
-    /* Here the lookup succeeds and vfs_mkdir refuses, so its error path runs:
-     * it has already unlocked and dropped the dentry it was given, and passing
-     * that one to end_creating_path unlocks an inode nobody holds. */
+    /* The lookup succeeds and vfs_mkdir refuses, so its error path runs: it
+     * has already unlocked the dentry it was given. */
     if (r_mkdir(m, 0, CREDSRO "/sub", 0700) != -EACCES)
         return 12;
     if (r_symlink(m, 0, "/any/target", CREDSRO "/new") != -EACCES)
@@ -2676,4 +2666,295 @@ static void poll_udp(void)
     }
     close(rx);
     close(tx);
+}
+
+/* ---------------------------------------------------------------------------
+ * T29: READDIR. The first opcode that moves shared per-file state.
+ * ------------------------------------------------------------------------ */
+
+#define DIRPATH  "/tmp/koru-check-dir"
+#define DIRCOUNT 500u
+/* Small enough that 500 entries need several rounds. */
+#define DIRBUDGET 4096u
+
+/* One decoded entry. The name is bounded by what this test creates. */
+struct dent {
+    uint64_t ino, cookie;
+    uint16_t reclen, namelen;
+    uint8_t dtype;
+    char name[64];
+};
+
+/* Decode `bytes` of records in `slot`. -1 means malformed, which is a finding. */
+static int dents_decode(uint32_t slot, int64_t bytes, struct dent *out, int max)
+{
+    const uint8_t *p = R.arena + (size_t)slot * R.slot_size;
+    int64_t at       = 0;
+    int n            = 0;
+
+    while (at < bytes) {
+        struct koru_dirent h;
+
+        if (bytes - at < (int64_t)sizeof(h) || n >= max)
+            return -1;
+        memcpy(&h, p + at, sizeof(h));
+        if (h.reclen < sizeof(h) + h.namelen + 1 || at + h.reclen > bytes)
+            return -1;
+        if (h.reclen % KORU_DIRENT_ALIGN != 0)
+            return -1;
+        if (h.reserved[0] || h.reserved[1] || h.reserved[2])
+            return -1;
+        if (h.namelen >= sizeof(out[n].name))
+            return -1;
+        /* The NUL the ABI promises, and the length that is authoritative. */
+        if (p[at + sizeof(h) + h.namelen] != 0)
+            return -1;
+        out[n].ino     = h.ino;
+        out[n].cookie  = h.cookie;
+        out[n].reclen  = h.reclen;
+        out[n].namelen = h.namelen;
+        out[n].dtype   = h.dtype;
+        memcpy(out[n].name, p + at + sizeof(h), h.namelen);
+        out[n].name[h.namelen] = 0;
+        at += h.reclen;
+        n++;
+    }
+    return at == bytes ? n : -1;
+}
+
+static int64_t r_readdir(uint32_t handle, uint32_t slot, uint64_t off, uint32_t len,
+                         uint64_t *next, uint32_t *flags)
+{
+    struct koru_sqe s;
+    struct koru_cqe c;
+    unsigned completed = 0;
+
+    memset(&s, 0, sizeof(s));
+    s.opcode    = KORU_OP_READDIR;
+    s.handle    = handle;
+    s.slot      = slot;
+    s.off       = off;
+    s.len       = len;
+    s.user_data = 0x900;
+    if (submit(R.fd, &s, 1, &c, 1, 1, &completed) != 1 || completed != 1)
+        return INT64_MIN;
+    if (next)
+        *next = c.extra;
+    if (flags)
+        *flags = c.flags;
+    return c.res;
+}
+
+static int name_cmp(const void *a, const void *b)
+{
+    return strcmp(((const struct dent *)a)->name, ((const struct dent *)b)->name);
+}
+
+/* Every name in DIRPATH, through readdir(3), sorted. */
+static int host_names(struct dent *out, int max)
+{
+    DIR *d = opendir(DIRPATH);
+    struct dirent *e;
+    int n = 0;
+
+    if (!d)
+        return -1;
+    while ((e = readdir(d)) != NULL) {
+        size_t len = strlen(e->d_name);
+
+        if (n >= max || len >= sizeof(out[n].name))
+            break;
+        memcpy(out[n].name, e->d_name, len + 1);
+        out[n].ino   = e->d_ino;
+        out[n].dtype = e->d_type;
+        n++;
+    }
+    closedir(d);
+    qsort(out, (size_t)n, sizeof(*out), name_cmp);
+    return n;
+}
+
+static int make_dir_entries(void)
+{
+    char path[128];
+    unsigned i;
+
+    for (i = 0; i < DIRCOUNT; i++) {
+        snprintf(path, sizeof(path), DIRPATH "/e%03u", i);
+        if (make_byte(path, (unsigned char)i) != 0)
+            return -1;
+    }
+    return 0;
+}
+
+static void remove_dir_entries(void)
+{
+    char path[128];
+    unsigned i;
+
+    for (i = 0; i < DIRCOUNT; i++) {
+        snprintf(path, sizeof(path), DIRPATH "/e%03u", i);
+        unlink(path);
+    }
+    rmdir(DIRPATH);
+}
+
+/* Read the whole directory in rounds, following the cookie. Returns the count
+ * or -1, and fills `out`. */
+static int read_all(int64_t h, struct dent *out, int max, unsigned *rounds)
+{
+    uint64_t off = 0;
+    int n        = 0;
+
+    *rounds = 0;
+    for (;;) {
+        struct dent batch[128];
+        uint64_t next = 0;
+        int64_t res   = r_readdir((uint32_t)h, 1, off, DIRBUDGET, &next, NULL);
+        int k, i;
+
+        if (res < 0)
+            return -1;
+        if (res == 0)
+            return n; /* end of directory, as READ reports it */
+        k = dents_decode(1, res, batch, 128);
+        if (k <= 0)
+            return -1;
+        for (i = 0; i < k && n < max; i++)
+            out[n++] = batch[i];
+        off = next;
+        (*rounds)++;
+        if (*rounds > DIRCOUNT)
+            return -1;
+    }
+}
+
+void sec_readdir(void)
+{
+    static struct dent got[DIRCOUNT + 8], want[DIRCOUNT + 8];
+    struct koru_sqe sq[2];
+    struct koru_cqe cq[2];
+    const struct koru_cqe *a, *b;
+    unsigned completed = 0, rounds = 0;
+    uint64_t next = 0;
+    uint32_t flags = 0;
+    int64_t h, res;
+    int n, hn, i, ok;
+
+    remove_dir_entries();
+    if (mkdir(DIRPATH, 0700) != 0 || make_dir_entries() != 0) {
+        check(0, "create 500 directory entries");
+        remove_dir_entries();
+        return;
+    }
+
+    h = r_open(&R, 0, DIRPATH, KORU_O_RDONLY | KORU_O_DIRECTORY);
+    check(h > 0, "OPEN the directory");
+    if (h <= 0) {
+        remove_dir_entries();
+        return;
+    }
+
+    /* 1. The whole directory, as a set, against readdir(3). */
+    n  = read_all(h, got, (int)(DIRCOUNT + 8), &rounds);
+    hn = host_names(want, (int)(DIRCOUNT + 8));
+    check(n == hn && n == (int)DIRCOUNT + 2, "READDIR sees every entry, dot and dot-dot too");
+    note("%d entries in %u rounds", n, rounds);
+    check(rounds > 1, "  and the budget forced several rounds");
+    if (n > 0)
+        qsort(got, (size_t)n, sizeof(*got), name_cmp);
+    ok = (n == hn);
+    for (i = 0; ok && i < n; i++)
+        if (strcmp(got[i].name, want[i].name) != 0 || got[i].ino != want[i].ino ||
+            got[i].dtype != want[i].dtype)
+            ok = 0;
+    check(ok, "  name, inode and type all agree with readdir(3)");
+    if (!ok && n > 0 && n == hn)
+        note("first mismatch near %s / %s", got[0].name, want[0].name);
+
+    /* 2. An entry's own cookie must resume after it, not at it. */
+    res = r_readdir((uint32_t)h, 1, 0, DIRBUDGET, &next, NULL);
+    n   = res > 0 ? dents_decode(1, res, got, (int)(DIRCOUNT + 8)) : -1;
+    check(n > 2, "a first round returns entries");
+    if (n > 2) {
+        uint64_t cookie = got[0].cookie;
+        char first[64];
+
+        snprintf(first, sizeof(first), "%s", got[1].name);
+        res = r_readdir((uint32_t)h, 1, cookie, DIRBUDGET, NULL, NULL);
+        i   = res > 0 ? dents_decode(1, res, want, (int)(DIRCOUNT + 8)) : -1;
+        check(i > 0 && strcmp(want[0].name, first) == 0,
+              "  an entry's cookie resumes at the one after it");
+    }
+
+    /* 3. A budget too small for one entry is EINVAL, never 0: 0 is the end. */
+    check_res(r_readdir((uint32_t)h, 1, 0, 8, NULL, NULL), -EINVAL,
+              "a budget too small for one entry is EINVAL");
+    check_res(r_readdir((uint32_t)h, 1, 0, 0, NULL, NULL), -EINVAL, "  a zero budget is EINVAL");
+    check_res(r_readdir((uint32_t)h, 1, 0, R.slot_size + 1, NULL, NULL), -EINVAL,
+              "  a budget past the slot is EINVAL");
+    check_res(r_readdir((uint32_t)h, R.slot_count, 0, DIRBUDGET, NULL, NULL), -EINVAL,
+              "  a slot past the arena is EINVAL");
+    check_res(r_readdir(0, 1, 0, DIRBUDGET, NULL, NULL), -EBADF, "  handle 0 is EBADF");
+
+    /* 4. Reading to the end reports 0, and no flag is set on a sane tmpfs. */
+    n = read_all(h, got, (int)(DIRCOUNT + 8), &rounds);
+    check(n == (int)DIRCOUNT + 2, "a second full pass sees the same count");
+    check(r_readdir((uint32_t)h, 1, next, DIRBUDGET, NULL, &flags) >= 0 && flags == 0,
+          "  and no entry was skipped");
+
+    /* 5. Two concurrent READDIRs on one handle: one wins, one gets EBUSY. */
+    memset(&sq[0], 0, sizeof(sq[0]));
+    sq[0].opcode    = KORU_OP_READDIR;
+    sq[0].handle    = (uint32_t)h;
+    sq[0].slot      = 1;
+    sq[0].len       = DIRBUDGET;
+    sq[0].user_data = 0x910;
+    sq[1]           = sq[0];
+    sq[1].slot      = 2;
+    sq[1].user_data = 0x911;
+    submit(R.fd, sq, 2, cq, 2, 2, &completed);
+    a = find_cqe(cq, completed, 0x910);
+    b = find_cqe(cq, completed, 0x911);
+    check(completed == 2 && a && b, "two READDIRs on one handle both complete");
+    if (a && b) {
+        int busy = (a->res == -EBUSY) + (b->res == -EBUSY);
+
+        check(busy == 1, "  exactly one of them gets EBUSY");
+        check((a->res >= 0) + (b->res >= 0) == 1, "  and exactly one reads");
+    }
+
+    /* 6. The claims came back: the content check, for a claim never returned. */
+    n = read_all(h, got, (int)(DIRCOUNT + 8), &rounds);
+    check(n == (int)DIRCOUNT + 2, "  the handle still iterates the whole directory");
+
+    /* 7. A cancelled READDIR frees both the slot and the handle. */
+    memset(&sq[0], 0, sizeof(sq[0]));
+    sq[0].opcode    = KORU_OP_READDIR;
+    sq[0].handle    = (uint32_t)h;
+    sq[0].slot      = 3;
+    sq[0].len       = DIRBUDGET;
+    sq[0].user_data = 0x920;
+    if (submit(R.fd, sq, 1, cq, 0, 0, &completed) == 1) {
+        sqe_cancel(&sq[0], 0x920, 0x921);
+        submit(R.fd, sq, 1, cq, 2, 2, &completed);
+        check(completed == 2, "a READDIR and its CANCEL both complete");
+        sqe_checksum(&sq[0], 3, 0, R.slot_size, 0x922);
+        check(run_one(R.fd, &sq[0]) >= 0, "  and the cancelled READDIR released its slot");
+        check(r_readdir((uint32_t)h, 1, 0, DIRBUDGET, NULL, NULL) > 0,
+              "  and its handle too");
+    }
+
+    /* 8. A non-directory handle is ENOTDIR. */
+    res = r_open(&R, 0, PATFILE, KORU_O_RDONLY);
+    if (res > 0) {
+        check_res(r_readdir((uint32_t)res, 1, 0, DIRBUDGET, NULL, NULL), -ENOTDIR,
+                  "READDIR of a regular file is ENOTDIR");
+        r_close(&R, (uint32_t)res);
+    } else {
+        check(0, "READDIR of a regular file is ENOTDIR");
+    }
+
+    check_res(r_close(&R, (uint32_t)h), 0, "the directory handle closes");
+    remove_dir_entries();
 }

@@ -285,6 +285,17 @@ pub(crate) const KORU_OP_RMDIR: u8 = 18; // T27
 /// `rename(2)` replaces it.
 pub(crate) const KORU_OP_RENAME: u8 = 19; // T28
 
+/// Read directory entries into slot `slot` at slot offset 0, as `READ` does.
+/// `len` is the byte budget; `off` is a resume cookie, 0 for the beginning.
+/// `res` is the bytes written and 0 is end of directory, mirroring `READ`;
+/// `extra` is the next cookie. A budget too small for one entry is `EINVAL`,
+/// not 0, or a short buffer would read as the end. `ENOTDIR` for a
+/// non-directory.
+///
+/// **The first opcode that mutates shared per-file state**, `f_pos`, so it is
+/// serialised per handle: a second concurrent one gets `EBUSY`.
+pub(crate) const KORU_OP_READDIR: u8 = 20; // T29
+
 // A `UNLINK`, `RMDIR` or `RENAME` whose last component is empty, `.`, `..` or
 // followed by a separator completes `EINVAL`, where the syscalls spread
 // `EISDIR`, `ENOTEMPTY`, `EINVAL` and `EBUSY` over those same four cases.
@@ -352,6 +363,10 @@ pub(crate) const KORU_OPEN_FLAGS_ALL: u32 =
 /// Multishot bit, reserved and never set: admission control forecloses multishot.
 #[expect(dead_code)]
 pub(crate) const KORU_CQE_F_MORE: u32 = 1 << 0;
+
+/// `READDIR` dropped an entry whose name it could not represent: a NUL or a
+/// separator in it, which means a corrupt filesystem.
+pub(crate) const KORU_CQE_F_SKIPPED: u32 = 1 << 1;
 
 /// A submission queue entry. 32 bytes, no padding. Fields an opcode does not
 /// read must be zero, so they stay available for a later meaning.
@@ -540,6 +555,67 @@ pub(crate) struct KoruStat {
 }
 
 // ---------------------------------------------------------------------------
+// Directory entries
+// ---------------------------------------------------------------------------
+
+// A [`KoruDirent`]'s type: `(i_mode & S_IFMT) >> 12`, the same on every
+// architecture, so they pass through as the `S_IF*` values do.
+
+#[expect(dead_code)]
+pub(crate) const KORU_DT_UNKNOWN: u8 = 0;
+#[expect(dead_code)]
+pub(crate) const KORU_DT_FIFO: u8 = 1;
+#[expect(dead_code)]
+pub(crate) const KORU_DT_CHR: u8 = 2;
+#[expect(dead_code)]
+pub(crate) const KORU_DT_DIR: u8 = 4;
+#[expect(dead_code)]
+pub(crate) const KORU_DT_BLK: u8 = 6;
+#[expect(dead_code)]
+pub(crate) const KORU_DT_REG: u8 = 8;
+#[expect(dead_code)]
+pub(crate) const KORU_DT_LNK: u8 = 10;
+#[expect(dead_code)]
+pub(crate) const KORU_DT_SOCK: u8 = 12;
+/// The mask the VFS applies; anything above it is a flag, not a type.
+pub(crate) const KORU_DT_MASK: u8 = 0xf;
+
+/// Every record starts on a multiple of this, so `ino` and `cookie` can be
+/// read in place.
+pub(crate) const KORU_DIRENT_ALIGN: usize = 8;
+
+/// One entry's header, then `namelen` name bytes, a NUL, and padding to
+/// [`KORU_DIRENT_ALIGN`]. 24 bytes, no padding.
+///
+/// `linux_dirent64` with its annoyances fixed: 8-aligned rather than 2-aligned,
+/// and `namelen` explicit rather than implied by `reclen`. The name is
+/// NUL-terminated for a C caller, but **`namelen` is authoritative**.
+#[repr(C)]
+#[derive(Copy, Clone, Default)]
+pub(crate) struct KoruDirent {
+    pub(crate) ino: u64,
+    /// The next `off` to resume **after** this entry. `linux_dirent64::d_off`.
+    pub(crate) cookie: u64,
+    /// Header, name, NUL and padding: the stride to the next record.
+    pub(crate) reclen: u16,
+    /// The name's length without its NUL.
+    pub(crate) namelen: u16,
+    /// One of the `KORU_DT_*` values.
+    pub(crate) dtype: u8,
+    /// out: must read as zero.
+    pub(crate) reserved: [u8; 3],
+}
+
+kernel::static_assert!(core::mem::size_of::<KoruDirent>() == 24);
+kernel::static_assert!(core::mem::align_of::<KoruDirent>() == 8);
+kernel::static_assert!(core::mem::offset_of!(KoruDirent, ino) == 0);
+kernel::static_assert!(core::mem::offset_of!(KoruDirent, cookie) == 8);
+kernel::static_assert!(core::mem::offset_of!(KoruDirent, reclen) == 16);
+kernel::static_assert!(core::mem::offset_of!(KoruDirent, namelen) == 18);
+kernel::static_assert!(core::mem::offset_of!(KoruDirent, dtype) == 20);
+kernel::static_assert!(core::mem::offset_of!(KoruDirent, reserved) == 21);
+
+// ---------------------------------------------------------------------------
 // Times
 // ---------------------------------------------------------------------------
 
@@ -649,3 +725,5 @@ unsafe impl AsBytes for Cqe {}
 unsafe impl AsBytes for KoruEnter {}
 // SAFETY: as above. This is what lets `STAT` copy the struct out as bytes.
 unsafe impl AsBytes for KoruStat {}
+// SAFETY: as above, for `READDIR`'s record headers.
+unsafe impl AsBytes for KoruDirent {}

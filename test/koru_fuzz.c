@@ -81,9 +81,11 @@ static atomic_uint handle_pool[POOL];
 static atomic_uint pool_next;
 
 /* One per opcode, plus a bucket for everything that is not one. */
-#define NOPCODES (KORU_OP_RENAME + 2)
+#define NOPCODES (KORU_OP_READDIR + 2)
 
 static atomic_ullong op_total[NOPCODES], op_ok[NOPCODES];
+/* The last cookie a READDIR returned, fed back in as an off. Racy on purpose. */
+static atomic_ullong dir_cookie;
 static atomic_ullong open_einval, open_ebusy, open_emfile, open_other;
 
 static uint32_t pool_pick(uint64_t *s)
@@ -110,7 +112,18 @@ static int extra_allowed(uint8_t opcode, const struct koru_cqe *c)
 {
     if (opcode == KORU_OP_STAT || opcode == KORU_OP_STATX_AT)
         return c->res >= 0 ? (c->extra & ~(uint64_t)KORU_STAT_ALL) == 0 : c->extra == 0;
+    /* A resume cookie, which is whatever the filesystem's f_pos is. */
+    if (opcode == KORU_OP_READDIR)
+        return c->res >= 0 || c->extra == 0;
     return c->extra == 0;
+}
+
+/* And `flags` stopped being blanket-zero at T29, for the same reason. */
+static int flags_allowed(uint8_t opcode, const struct koru_cqe *c)
+{
+    if (opcode == KORU_OP_READDIR)
+        return c->res >= 0 ? (c->flags & ~(uint32_t)KORU_CQE_F_SKIPPED) == 0 : c->flags == 0;
+    return c->flags == 0;
 }
 
 /* Every opcode that names a file by path. The fuzzer sandboxes all of them. */
@@ -126,13 +139,13 @@ static int is_path_op(uint8_t op)
  * opcode nothing ever submitted. */
 static unsigned op_bucket(uint8_t op)
 {
-    return op <= KORU_OP_RENAME ? op : NOPCODES - 1;
+    return op <= KORU_OP_READDIR ? op : NOPCODES - 1;
 }
 
 /* There is only one Cqe constructor, so any deviation is a real bug. */
 static void check_cqe(const struct koru_cqe *c, uint8_t op)
 {
-    if (c->flags != 0 || c->rsvd0 != 0 || !extra_allowed(op, c)) {
+    if (!flags_allowed(op, c) || c->rsvd0 != 0 || !extra_allowed(op, c)) {
         note("cqe shape: op %u flags %u rsvd0 %u res %lld extra %llu", op, c->flags, c->rsvd0,
              (long long)c->res, (unsigned long long)c->extra);
         fail("every CQE has zero flags and rsvd0, and extra only where its opcode sets it");
@@ -206,6 +219,13 @@ static int res_allowed(uint8_t opcode, int64_t res)
                res == -ENOENT || res == -ENOTDIR || res == -EISDIR || res == -ENOTEMPTY ||
                res == -EACCES || res == -EPERM || res == -ELOOP || res == -ENAMETOOLONG ||
                res == -EROFS;
+    case KORU_OP_READDIR:
+        /* Its own claim on the handle makes EBUSY ordinary with eight threads;
+         * a budget too small for one entry is EINVAL, never 0. */
+        return (res >= 0 && res <= F_SLOT) || res == -EINVAL || res == -EBADF ||
+               res == -EBUSY || res == -ENOMEM || res == -ENOTDIR || res == -EACCES ||
+               res == -ECANCELED || res == -EIO || res == -EINTR || res == -ESPIPE ||
+               res == -ENOENT;
     case KORU_OP_RENAME:
         /* Both names are inside FUZZDIR, so EXDEV never comes up here; the
          * deterministic matrix owns that one. */
@@ -336,7 +356,7 @@ static void gen_valid(uint64_t *s, struct koru_sqe *q, uint64_t ud, uint32_t pat
      * that an inline path op is copying out of at that moment. */
     uint32_t slot = rnd_below(s, F_SHARED);
 
-    switch (rnd_below(s, 23)) {
+    switch (rnd_below(s, 24)) {
     case 0:
         sqe_nop(q, ud);
         break;
@@ -353,6 +373,12 @@ static void gen_valid(uint64_t *s, struct koru_sqe *q, uint64_t ud, uint32_t pat
          * plus a random offset would otherwise corrupt whatever it names.
          * No FIFO here either: the hostile generator can clear O_NONBLOCK,
          * and filp_open on a peerless FIFO would then hang a worker. */
+        if (one_in(s, 4)) {
+            /* A directory, so READDIR has something to iterate. */
+            sqe_open(q, path_slot, 0, put_path(arena, F_SLOT, path_slot, FUZZDIR),
+                     KORU_O_RDONLY | KORU_O_DIRECTORY, ud);
+            break;
+        }
         if (one_in(s, 3)) {
             path  = FUZZWRFILE;
             flags = KORU_O_RDWR;
@@ -407,6 +433,20 @@ static void gen_valid(uint64_t *s, struct koru_sqe *q, uint64_t ud, uint32_t pat
         sqe_poll(q, one_in(s, 4) ? (uint32_t)rnd(s) : pool_pick(s),
                  one_in(s, 8) ? (uint32_t)rnd(s) : (1u + rnd_below(s, KORU_POLL_EVENTS_ALL)), ud);
         break;
+    case 21: {
+        /* Mostly a regular file's handle, which is ENOTDIR; sometimes a real
+         * directory. The cookie is whatever the last one returned, or junk. */
+        struct koru_sqe *d = q;
+
+        memset(d, 0, sizeof(*d));
+        d->opcode    = KORU_OP_READDIR;
+        d->handle    = one_in(s, 4) ? (uint32_t)rnd(s) : pool_pick(s);
+        d->slot      = slot;
+        d->off       = one_in(s, 4) ? rnd(s) : atomic_load(&dir_cookie);
+        d->len       = 1 + rnd_below(s, F_SLOT);
+        d->user_data = ud;
+        break;
+    }
     case 15:
         /* Aligned by construction; the hostile generator's random off is what
          * probes the rejection. */
@@ -589,6 +629,8 @@ static void *worker(void *arg)
                 else
                     atomic_fetch_add(&open_other, 1);
             }
+            if (op == KORU_OP_READDIR && cq[i].res > 0)
+                atomic_store(&dir_cookie, cq[i].extra);
             if (op == KORU_OP_OPEN && cq[i].res >= 0x10000) {
                 unsigned k = atomic_fetch_add(&pool_next, 1) % POOL;
 
@@ -825,7 +867,7 @@ int fuzz_main(unsigned secs, uint64_t seed)
                                            "ADOPT",   "POLL",   "STAT",    "TRUNC",
                                            "UTIMES",  "RDLINK", "STATXAT", "MKDIR",
                                            "SYMLINK", "UNLINK",  "RMDIR",   "RENAME",
-                                           "other" };
+                                           "RDDIR",   "other" };
     struct koru_ring m;
     pthread_t th[NWORKERS + 3];
     uint64_t seeds[NWORKERS + 3];
@@ -924,7 +966,7 @@ int fuzz_main(unsigned secs, uint64_t seed)
         check(sub > SUB_FLOOR, "the fuzzer actually exercised the ring");
         /* Completion, not success: the tail sections carry that claim. */
         reached = 1;
-        for (op = 0; op <= KORU_OP_RENAME; op++)
+        for (op = 0; op <= KORU_OP_READDIR; op++)
             if (atomic_load(&op_total[op]) == 0) {
                 note("opcode %d never completed once", op);
                 reached = 0;

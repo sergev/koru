@@ -137,9 +137,16 @@ impl OpWork {
     /// `CANCEL` must free exactly what `run` would have.
     fn held_slot(sqe: &Sqe) -> Option<u32> {
         match sqe.opcode {
-            KORU_OP_CHECKSUM | KORU_OP_READ | KORU_OP_WRITE | KORU_OP_STAT => Some(sqe.slot),
+            KORU_OP_CHECKSUM | KORU_OP_READ | KORU_OP_WRITE | KORU_OP_STAT | KORU_OP_READDIR => {
+                Some(sqe.slot)
+            }
             _ => None,
         }
+    }
+
+    /// The handle this op owns while deferred. `READDIR` alone claims one.
+    pub(crate) fn held_handle(sqe: &Sqe) -> Option<u32> {
+        (sqe.opcode == KORU_OP_READDIR).then_some(sqe.handle)
     }
 
     /// The `struct work_struct` inside this op, for `queue_work_on`.
@@ -263,6 +270,8 @@ impl WorkItem for OpWork {
         let sqe = &this.sqe;
         // `STAT` is the first opcode to set `extra`, so every arm carries one.
         let failed = |e: Error| (i64::from(e.to_errno()), 0u64);
+        // `READDIR` is the first opcode to set `Cqe::flags`, and the only one.
+        let mut flags = 0u32;
         let (res, extra) = match sqe.opcode {
             KORU_OP_DELAY_NS => (0, 0),
             KORU_OP_CHECKSUM => this.ring.checksum(sqe).map_or_else(failed, |r| (r, 0)),
@@ -278,6 +287,13 @@ impl WorkItem for OpWork {
                 .ring
                 .do_stat(sqe, this.file.as_deref(), &this.cred)
                 .unwrap_or_else(failed),
+            KORU_OP_READDIR => match this.ring.do_readdir(sqe, this.file.as_deref()) {
+                Ok((res, extra, f)) => {
+                    flags = f;
+                    (res, extra)
+                }
+                Err(e) => failed(e),
+            },
             // Only a fired poll reaches here, once: the callback won the token
             // before queueing. Off the waitqueue first.
             KORU_OP_POLL_ADD => {
@@ -299,8 +315,11 @@ impl WorkItem for OpWork {
             }
             _ => (i64::from(EINVAL.to_errno()), 0),
         };
+        // Before the completion, as the slot is: userspace may reuse the
+        // handle the moment it sees the CQE.
+        this.ring.release_handle(sqe);
         this.ring
-            .complete(RingCtx::cqe_extra(sqe, res, extra), OpWork::held_slot(sqe));
+            .complete(RingCtx::cqe_full(sqe, res, extra, flags), OpWork::held_slot(sqe));
 
         // Unregister *after* completing, so a `CANCEL` arriving while this ran
         // still finds the entry and reports `EALREADY` rather than `ENOENT`.
@@ -356,6 +375,7 @@ impl RingCtx {
             KORU_OP_ADOPT_FD => plain(me.adopt_op(ring, sqe)),
             KORU_OP_POLL_ADD => RingCtx::poll_op(me, sqe).map(|res| (res, 0)),
             KORU_OP_STAT => RingCtx::stat_op(me, sqe).map(|res| (res, 0)),
+            KORU_OP_READDIR => RingCtx::readdir_op(me, sqe).map(|res| (res, 0)),
             // Inline for `OPEN`'s reason, and permanently. See `path_op`.
             KORU_OP_TRUNCATE
             | KORU_OP_UTIMES
@@ -848,6 +868,129 @@ impl RingCtx {
             done += n;
         }
         Ok(())
+    }
+
+    /// Give back a `READDIR`'s claim. Every completion path calls this, or the
+    /// handle stays wedged for the life of the ring.
+    pub(crate) fn release_handle(&self, sqe: &Sqe) {
+        if let Some(handle) = OpWork::held_handle(sqe) {
+            self.handles.lock().unclaim(handle);
+        }
+    }
+
+    /// `READDIR`: deferred, and the only op that claims a handle as well as a
+    /// slot. Both claims are taken here, in ioctl context, and both are given
+    /// back by whichever path completes it.
+    fn readdir_op(me: ArcBorrow<'_, RingCtx>, sqe: &Sqe) -> Option<i64> {
+        let file = match RingCtx::readdir_validate(&me, sqe) {
+            Ok(file) => file,
+            Err(e) => return Some(i64::from(e.to_errno())),
+        };
+        // The handle first: a slot claim would have to be unwound if this one
+        // failed, and this one is the op's own rule.
+        if let Err(e) = me.handles.lock().try_claim(sqe.handle) {
+            return Some(i64::from(e.to_errno()));
+        }
+        if !me.state.lock().slot_try_acquire(sqe.slot) {
+            me.handles.lock().unclaim(sqe.handle);
+            return Some(i64::from(EBUSY.to_errno()));
+        }
+        match RingCtx::defer(me, sqe, 0, Some(file)) {
+            None => None,
+            Some(res) => {
+                me.state.lock().slot_release(sqe.slot);
+                me.handles.lock().unclaim(sqe.handle);
+                Some(res)
+            }
+        }
+    }
+
+    /// Everything `READDIR` can reject before it costs a work item.
+    fn readdir_validate(&self, sqe: &Sqe) -> Result<ARef<File>> {
+        let Some(cfg) = *self.config.lock() else {
+            return Err(EINVAL);
+        };
+        if sqe.slot >= cfg.slot_count {
+            return Err(EINVAL);
+        }
+        // Entries land at slot offset 0, so `len` alone has to fit.
+        if sqe.len == 0 || sqe.len > cfg.slot_size {
+            return Err(EINVAL);
+        }
+        // `off` is a resume cookie, and `loff_t` is signed.
+        if sqe.off > i64::MAX as u64 {
+            return Err(EINVAL);
+        }
+
+        let file = self.handles.lock().resolve(sqe.handle)?;
+        // What `iterate_dir` itself would answer, without costing a worker.
+        if !is_directory(&file) {
+            return Err(ENOTDIR);
+        }
+        if !is_seekable(&file) {
+            return Err(EINVAL);
+        }
+        Ok(file)
+    }
+
+    /// Runs in a kworker. Returns the bytes written, the next cookie and the
+    /// CQE flags. The arena is written **after** `iterate_dir` returns, never
+    /// in the callback, which holds the directory's `i_rwsem`.
+    fn do_readdir(&self, sqe: &Sqe, file: Option<&File>) -> Result<(i64, u64, u32)> {
+        let file = file.ok_or(EINVAL)?;
+        let budget = sqe.len as usize;
+
+        // Up front: the callback runs under the rwsem and must not allocate.
+        let mut buf = KVec::with_capacity(budget, GFP_KERNEL)?;
+        buf.resize(budget, 0u8, GFP_KERNEL)?;
+
+        // `iterate_dir` reads `f_pos`, not `ctx.pos`. Hence the handle claim.
+        // SAFETY: the op holds an `ARef<File>`, and `is_seekable` was checked.
+        let pos = unsafe { bindings::vfs_llseek(file.as_ptr(), sqe.off as i64, SEEK_SET) };
+        if pos < 0 {
+            return Err(Error::from_errno(pos as i32));
+        }
+
+        let mut ctx = KoruDirContext {
+            ctx: bindings::dir_context {
+                actor: Some(koru_filldir),
+                pos: 0,
+                // A hint only, and the one filldir64 passes.
+                count: i32::try_from(budget).unwrap_or(i32::MAX),
+                dt_flags_mask: 0,
+            },
+            buf: buf.as_mut_ptr(),
+            budget,
+            used: 0,
+            prev: usize::MAX,
+            full: false,
+            skipped: false,
+        };
+
+        // SAFETY: the file is a live directory and `ctx` outlives the call.
+        // The arena mutex is not held: this reaches the filesystem.
+        let ret = unsafe { bindings::iterate_dir(file.as_ptr(), &mut ctx.ctx) };
+        if ret < 0 {
+            return Err(Error::from_errno(ret));
+        }
+
+        let used = ctx.used;
+        let flags = if ctx.skipped { KORU_CQE_F_SKIPPED } else { 0 };
+        // A caller bug, not the end: `res == 0` already means the end.
+        if used == 0 && ctx.full {
+            return Err(EINVAL);
+        }
+        // The last cookie is where iteration stopped, as `getdents64` patches
+        // its last `d_off` from `ctx.pos`.
+        let next = ctx.ctx.pos as u64;
+        if ctx.prev != usize::MAX {
+            let at = ctx.prev + core::mem::offset_of!(KoruDirent, cookie);
+            buf[at..at + 8].copy_from_slice(&next.to_le_bytes());
+        }
+
+        let base = self.slot_pos(sqe.slot, 0)?;
+        self.write_slot(base, &buf[..used])?;
+        Ok((used as i64, next, flags))
     }
 
     /// `STAT`: deferred, because `vfs_getattr` blocks on NFS and FUSE. Like
@@ -1494,6 +1637,7 @@ impl RingCtx {
         // C1: the target still gets its own completion, releasing whatever it
         // held. The ring `SpinLock` is taken only after the registry is unlocked.
         let target = op.sqe;
+        self.release_handle(&target);
         self.complete(
             RingCtx::cqe(&target, i64::from(ecanceled().to_errno())),
             OpWork::held_slot(&target),
@@ -1542,6 +1686,121 @@ fn qstr(name: &[u8]) -> bindings::qstr {
         },
         name: name.as_ptr(),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Readdir
+// ---------------------------------------------------------------------------
+
+/// `SEEK_SET`, from include/uapi/linux/fs.h. Same value everywhere.
+const SEEK_SET: ffi::c_int = 0;
+
+/// Our `dir_context`, with the buffer it fills after it. First, so its offset
+/// is zero; [`koru_filldir`] uses `container_of!` anyway, so a reorder cannot
+/// break it silently.
+#[repr(C)]
+struct KoruDirContext {
+    ctx: bindings::dir_context,
+    /// The preallocated output. A pointer, not a slice: no borrow survives
+    /// the trip through `*mut dir_context`.
+    buf: *mut u8,
+    budget: usize,
+    used: usize,
+    /// The previous record's offset, or `usize::MAX`. Its cookie is patched
+    /// with the *next* entry's position — `filldir64`'s `prev_reclen` trick.
+    prev: usize,
+    /// An entry did not fit. With `used == 0` that is `EINVAL`, not the end.
+    full: bool,
+    /// An entry was dropped for a name that cannot be represented.
+    skipped: bool,
+}
+
+/// The record size for a name of `namelen` bytes: header, name, NUL, padding.
+fn dirent_reclen(namelen: usize) -> usize {
+    let n = core::mem::size_of::<KoruDirent>() + namelen + 1;
+    n.next_multiple_of(KORU_DIRENT_ALIGN)
+}
+
+/// `iterate_dir`'s actor. **Runs under the directory's `i_rwsem`**: no koru
+/// lock, no allocation, no panic. `false` is "stop here", so running out of
+/// room needs no other channel. See doc/Notes.md.
+unsafe extern "C" fn koru_filldir(
+    ctx: *mut bindings::dir_context,
+    name: *const ffi::c_char,
+    namelen: ffi::c_int,
+    offset: bindings::loff_t,
+    ino: u64,
+    dtype: ffi::c_uint,
+) -> bool {
+    // SAFETY: `ctx` is the one `do_readdir` passed to `iterate_dir`, which is
+    // the first field of a live `KoruDirContext`.
+    let this = unsafe { &mut *kernel::container_of!(ctx, KoruDirContext, ctx) };
+
+    let Ok(namelen) = usize::try_from(namelen) else {
+        this.skipped = true;
+        return true; // Skip it, but keep going: the rest are fine.
+    };
+    // SAFETY: the VFS guarantees `name` is valid for `namelen` bytes.
+    let name = unsafe { core::slice::from_raw_parts(name.cast::<u8>(), namelen) };
+    // A corrupt filesystem. Truncating it silently is how a wrong path gets
+    // used, so drop it and say so in the CQE. `verify_dirent_name`'s check.
+    if namelen == 0 || name.iter().any(|&b| b == 0 || b == b'/') {
+        this.skipped = true;
+        return true;
+    }
+
+    let reclen = dirent_reclen(namelen);
+    // Pure arithmetic, and the only thing that stops the iteration.
+    let Some(end) = this.used.checked_add(reclen) else {
+        this.full = true;
+        return false;
+    };
+    if end > this.budget {
+        this.full = true;
+        return false;
+    }
+
+    let header = KoruDirent {
+        ino,
+        // Patched by the *next* entry, or from `ctx.pos` at the end.
+        cookie: 0,
+        reclen: reclen as u16,
+        namelen: namelen as u16,
+        dtype: (dtype as u8) & KORU_DT_MASK,
+        reserved: [0; 3],
+    };
+    let at = this.used;
+    // SAFETY: `buf` is valid for `budget` bytes and `at + reclen <= budget`,
+    // checked above. Written whole, padding included, so no stale byte shows.
+    unsafe {
+        let dst = this.buf.add(at);
+        core::ptr::write_bytes(dst, 0, reclen);
+        core::ptr::copy_nonoverlapping(
+            header.as_bytes().as_ptr(),
+            dst,
+            core::mem::size_of::<KoruDirent>(),
+        );
+        core::ptr::copy_nonoverlapping(
+            name.as_ptr(),
+            dst.add(core::mem::size_of::<KoruDirent>()),
+            namelen,
+        );
+        // This entry's position belongs to the *previous* record.
+        if this.prev != usize::MAX {
+            let prev = this.buf.add(this.prev + core::mem::offset_of!(KoruDirent, cookie));
+            core::ptr::copy_nonoverlapping((offset as u64).to_le_bytes().as_ptr(), prev, 8);
+        }
+    }
+    this.prev = at;
+    this.used = end;
+    true
+}
+
+/// `iterate_dir`'s own first test, made here so a non-directory costs no work
+/// item.
+fn is_directory(file: &File) -> bool {
+    // SAFETY: an `ARef<File>` holds a reference, and `f_op` is set at open.
+    unsafe { (*(*file.as_ptr()).f_op).iterate_shared.is_some() }
 }
 
 // ---------------------------------------------------------------------------

@@ -50,6 +50,7 @@ static const struct sec sections[] = {
     { "write", sec_write, 1 },
     { "adopt", sec_adopt, 1 },
     { "path", sec_path, 1 },
+    { "readdir", sec_readdir, 1 },
 
     /* Tail: deterministic matrices and the timing checks. */
     { "setup", sec_setup, 0 },

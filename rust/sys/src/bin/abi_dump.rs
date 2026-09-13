@@ -10,25 +10,28 @@
 //! field count and checks that the field sizes sum to `sizeof`.
 
 use koru_sys::abi::{
-    Cqe, KoruEnter, KoruParams, KoruStat, KoruTimes, Sqe, handle_generation, handle_index,
-    make_handle,
+    Cqe, KoruDirent, KoruEnter, KoruParams, KoruStat, KoruTimes, Sqe, handle_generation,
+    handle_index, make_handle,
 };
 use koru_sys::abi::{
-    KORU_ABI_VERSION, KORU_CQE_F_MORE, KORU_DEFAULT_HANDLES, KORU_ENTER_FLAGS_ALL, KORU_IOC_TYPE,
-    KORU_MAGIC, KORU_MAX_ARENA_BYTES, KORU_MAX_CQ_ENTRIES, KORU_MAX_DELAY_NS, KORU_MAX_HANDLES,
+    KORU_ABI_VERSION, KORU_CQE_F_MORE, KORU_CQE_F_SKIPPED, KORU_DEFAULT_HANDLES, KORU_DIRENT_ALIGN,
+    KORU_DT_BLK, KORU_DT_CHR, KORU_DT_DIR, KORU_DT_FIFO, KORU_DT_LNK, KORU_DT_MASK, KORU_DT_REG,
+    KORU_DT_SOCK, KORU_DT_UNKNOWN, KORU_ENTER_FLAGS_ALL, KORU_IOC_TYPE, KORU_MAGIC,
+    KORU_MAX_ARENA_BYTES, KORU_MAX_CQ_ENTRIES, KORU_MAX_DELAY_NS, KORU_MAX_HANDLES,
     KORU_MAX_SLOT_COUNT, KORU_MAX_SLOT_SIZE, KORU_MAX_SQ_ENTRIES, KORU_MKDIR_MODE_ALL,
     KORU_NR_ENTER, KORU_NR_GET_PARAMS, KORU_NR_SETUP, KORU_O_ACCMODE, KORU_O_DIRECTORY,
     KORU_O_NOFOLLOW, KORU_O_NONBLOCK, KORU_O_RDONLY, KORU_O_RDWR, KORU_O_WRONLY, KORU_OP_ADOPT_FD,
     KORU_OP_CANCEL, KORU_OP_CHECKSUM, KORU_OP_CLOSE, KORU_OP_DELAY_NS, KORU_OP_MKDIR, KORU_OP_NOP,
-    KORU_OP_OPEN, KORU_OP_POLL_ADD, KORU_OP_READ, KORU_OP_READLINK, KORU_OP_RENAME, KORU_OP_RMDIR,
-    KORU_OP_STAT, KORU_OP_STATX_AT, KORU_OP_SYMLINK, KORU_OP_TRUNCATE, KORU_OP_UNLINK,
-    KORU_OP_UTIMES, KORU_OP_WRITE, KORU_OPEN_FLAGS_ALL, KORU_POLL_ERR, KORU_POLL_EVENTS_ALL,
-    KORU_POLL_HUP, KORU_POLL_IN, KORU_POLL_OUT, KORU_POLL_PRI, KORU_POLL_RDHUP, KORU_S_IFBLK,
-    KORU_S_IFCHR, KORU_S_IFDIR, KORU_S_IFIFO, KORU_S_IFLNK, KORU_S_IFMT, KORU_S_IFREG,
-    KORU_S_IFSOCK, KORU_SETUP_FLAGS_ALL, KORU_SQE_FLAGS_ALL, KORU_STAT_ALL, KORU_STAT_ATIME,
-    KORU_STAT_BLKSIZE, KORU_STAT_BLOCKS, KORU_STAT_BTIME, KORU_STAT_CTIME, KORU_STAT_DEV,
-    KORU_STAT_GID, KORU_STAT_INO, KORU_STAT_MODE, KORU_STAT_MTIME, KORU_STAT_NLINK, KORU_STAT_RDEV,
-    KORU_STAT_SIZE, KORU_STAT_TYPE, KORU_STAT_UID, KORU_UTIME_NOW, KORU_UTIME_OMIT,
+    KORU_OP_OPEN, KORU_OP_POLL_ADD, KORU_OP_READ, KORU_OP_READDIR, KORU_OP_READLINK,
+    KORU_OP_RENAME, KORU_OP_RMDIR, KORU_OP_STAT, KORU_OP_STATX_AT, KORU_OP_SYMLINK,
+    KORU_OP_TRUNCATE, KORU_OP_UNLINK, KORU_OP_UTIMES, KORU_OP_WRITE, KORU_OPEN_FLAGS_ALL,
+    KORU_POLL_ERR, KORU_POLL_EVENTS_ALL, KORU_POLL_HUP, KORU_POLL_IN, KORU_POLL_OUT, KORU_POLL_PRI,
+    KORU_POLL_RDHUP, KORU_S_IFBLK, KORU_S_IFCHR, KORU_S_IFDIR, KORU_S_IFIFO, KORU_S_IFLNK,
+    KORU_S_IFMT, KORU_S_IFREG, KORU_S_IFSOCK, KORU_SETUP_FLAGS_ALL, KORU_SQE_FLAGS_ALL,
+    KORU_STAT_ALL, KORU_STAT_ATIME, KORU_STAT_BLKSIZE, KORU_STAT_BLOCKS, KORU_STAT_BTIME,
+    KORU_STAT_CTIME, KORU_STAT_DEV, KORU_STAT_GID, KORU_STAT_INO, KORU_STAT_MODE, KORU_STAT_MTIME,
+    KORU_STAT_NLINK, KORU_STAT_RDEV, KORU_STAT_SIZE, KORU_STAT_TYPE, KORU_STAT_UID, KORU_UTIME_NOW,
+    KORU_UTIME_OMIT,
 };
 use koru_sys::error::{KINDS, KORU_ERRNOS};
 use koru_sys::ring::DEV_KORU;
@@ -283,6 +286,13 @@ fn main() {
     konst(
         &mut out,
         &mut c,
+        "KORU_CQE_F_SKIPPED",
+        "u32",
+        KORU_CQE_F_SKIPPED as u64,
+    );
+    konst(
+        &mut out,
+        &mut c,
         "KORU_CQE_F_MORE",
         "u32",
         KORU_CQE_F_MORE as u64,
@@ -361,6 +371,26 @@ fn main() {
         konst(&mut out, &mut c, name, "u64", v);
     }
     for (name, v) in [
+        ("KORU_DT_UNKNOWN", KORU_DT_UNKNOWN),
+        ("KORU_DT_FIFO", KORU_DT_FIFO),
+        ("KORU_DT_CHR", KORU_DT_CHR),
+        ("KORU_DT_DIR", KORU_DT_DIR),
+        ("KORU_DT_BLK", KORU_DT_BLK),
+        ("KORU_DT_REG", KORU_DT_REG),
+        ("KORU_DT_LNK", KORU_DT_LNK),
+        ("KORU_DT_SOCK", KORU_DT_SOCK),
+        ("KORU_DT_MASK", KORU_DT_MASK),
+    ] {
+        konst(&mut out, &mut c, name, "u8", u64::from(v));
+    }
+    konst(
+        &mut out,
+        &mut c,
+        "KORU_DIRENT_ALIGN",
+        "u64",
+        KORU_DIRENT_ALIGN as u64,
+    );
+    for (name, v) in [
         ("KORU_UTIME_NOW", KORU_UTIME_NOW),
         ("KORU_UTIME_OMIT", KORU_UTIME_OMIT),
     ] {
@@ -397,6 +427,7 @@ fn main() {
         ("KORU_OP_UNLINK", KORU_OP_UNLINK),
         ("KORU_OP_RMDIR", KORU_OP_RMDIR),
         ("KORU_OP_RENAME", KORU_OP_RENAME),
+        ("KORU_OP_READDIR", KORU_OP_READDIR),
     ] {
         let _ = writeln!(out, "opcode {name} {v}");
         c.opcodes += 1;
@@ -525,6 +556,25 @@ fn main() {
         "koru_stat",
         size_of::<KoruStat>(),
         align_of::<KoruStat>(),
+        body,
+        n,
+        sum,
+    );
+
+    let (body, n, sum) = fields!(KoruDirent, "koru_dirent", [
+        ino: "u64",
+        cookie: "u64",
+        reclen: "u16",
+        namelen: "u16",
+        dtype: "u8",
+        reserved: "u8[3]",
+    ]);
+    emit_struct(
+        &mut out,
+        &mut c,
+        "koru_dirent",
+        size_of::<KoruDirent>(),
+        align_of::<KoruDirent>(),
         body,
         n,
         sum,

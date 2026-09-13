@@ -526,6 +526,20 @@ impl Sqe {
         }
     }
 
+    /// `off` is a resume cookie, 0 for the beginning; `len` is the byte budget
+    /// and the entries land at slot offset 0.
+    pub fn readdir(user_data: u64, handle: u32, slot: u32, off: u64, len: u32) -> Sqe {
+        Sqe {
+            opcode: KORU_OP_READDIR,
+            len,
+            off,
+            user_data,
+            slot,
+            handle,
+            ..Sqe::default()
+        }
+    }
+
     /// `off` carries the descriptor; every other field must be zero.
     pub fn adopt_fd(user_data: u64, fd: i32) -> Sqe {
         Sqe {
@@ -577,6 +591,18 @@ impl KoruStat {
             return None;
         }
         // SAFETY: every bit pattern is a valid `KoruStat`, the length is
+        // checked, and an unaligned read is allowed for.
+        Some(unsafe { std::ptr::read_unaligned(bytes.as_ptr().cast()) })
+    }
+}
+
+impl KoruDirent {
+    /// Decode one record header. `None` if there are not 24 bytes there.
+    pub fn read_from(bytes: &[u8]) -> Option<KoruDirent> {
+        if bytes.len() < size_of::<KoruDirent>() {
+            return None;
+        }
+        // SAFETY: every bit pattern is a valid `KoruDirent`, the length is
         // checked, and an unaligned read is allowed for.
         Some(unsafe { std::ptr::read_unaligned(bytes.as_ptr().cast()) })
     }

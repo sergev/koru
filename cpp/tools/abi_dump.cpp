@@ -117,6 +117,7 @@ int main()
     konst("KORU_O_NONBLOCK", "u32", KORU_O_NONBLOCK);
     konst("KORU_OPEN_FLAGS_ALL", "u32", KORU_OPEN_FLAGS_ALL);
     konst("KORU_MKDIR_MODE_ALL", "u32", KORU_MKDIR_MODE_ALL);
+    konst("KORU_CQE_F_SKIPPED", "u32", KORU_CQE_F_SKIPPED);
     konst("KORU_CQE_F_MORE", "u32", KORU_CQE_F_MORE);
     konst("KORU_POLL_IN", "u32", KORU_POLL_IN);
     konst("KORU_POLL_OUT", "u32", KORU_POLL_OUT);
@@ -149,6 +150,16 @@ int main()
     konst("KORU_STAT_CTIME", "u64", KORU_STAT_CTIME);
     konst("KORU_STAT_BTIME", "u64", KORU_STAT_BTIME);
     konst("KORU_STAT_ALL", "u64", KORU_STAT_ALL);
+    konst("KORU_DT_UNKNOWN", "u8", KORU_DT_UNKNOWN);
+    konst("KORU_DT_FIFO", "u8", KORU_DT_FIFO);
+    konst("KORU_DT_CHR", "u8", KORU_DT_CHR);
+    konst("KORU_DT_DIR", "u8", KORU_DT_DIR);
+    konst("KORU_DT_BLK", "u8", KORU_DT_BLK);
+    konst("KORU_DT_REG", "u8", KORU_DT_REG);
+    konst("KORU_DT_LNK", "u8", KORU_DT_LNK);
+    konst("KORU_DT_SOCK", "u8", KORU_DT_SOCK);
+    konst("KORU_DT_MASK", "u8", KORU_DT_MASK);
+    konst("KORU_DIRENT_ALIGN", "u64", KORU_DIRENT_ALIGN);
     konst("KORU_UTIME_NOW", "i64", (unsigned long long)KORU_UTIME_NOW);
     konst("KORU_UTIME_OMIT", "i64", (unsigned long long)KORU_UTIME_OMIT);
 
@@ -187,6 +198,7 @@ int main()
     OPCODE(KORU_OP_UNLINK);
     OPCODE(KORU_OP_RMDIR);
     OPCODE(KORU_OP_RENAME);
+    OPCODE(KORU_OP_READDIR);
 #undef OPCODE
 
     {
@@ -271,6 +283,16 @@ int main()
         FIELD(koru_stat, btime_nsec, "u64");
         FIELD(koru_stat, reserved, "u64[12]");
         END_FIELDS(koru_stat);
+    }
+    {
+        BEGIN_FIELDS();
+        FIELD(koru_dirent, ino, "u64");
+        FIELD(koru_dirent, cookie, "u64");
+        FIELD(koru_dirent, reclen, "u16");
+        FIELD(koru_dirent, namelen, "u16");
+        FIELD(koru_dirent, dtype, "u8");
+        FIELD(koru_dirent, reserved, "u8[3]");
+        END_FIELDS(koru_dirent);
     }
     {
         BEGIN_FIELDS();

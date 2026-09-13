@@ -3939,3 +3939,298 @@ fn rename_rejection_matrix() {
     assert!(!gone(&file), "no rejected RENAME moved anything");
     m.assert_quiesced();
 }
+
+// ---------------------------------------------------------------------------
+// T29 - READDIR
+// ---------------------------------------------------------------------------
+
+/// One decoded entry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Dent {
+    ino: u64,
+    cookie: u64,
+    dtype: u8,
+    name: String,
+}
+
+/// Decode a whole record stream, checking the framing as it goes.
+fn decode_dents(bytes: &[u8]) -> Vec<Dent> {
+    let mut out = Vec::new();
+    let mut at = 0usize;
+    while at < bytes.len() {
+        let h = KoruDirent::read_from(&bytes[at..]).expect("a header");
+        let reclen = h.reclen as usize;
+        let namelen = h.namelen as usize;
+        assert!(
+            reclen >= size_of::<KoruDirent>() + namelen + 1 && at + reclen <= bytes.len(),
+            "record {at} is framed wrong: reclen {reclen}, namelen {namelen}"
+        );
+        assert_eq!(reclen % KORU_DIRENT_ALIGN, 0, "records are 8-aligned");
+        assert_eq!(h.reserved, [0u8; 3], "reserved must read as zero");
+        let name_at = at + size_of::<KoruDirent>();
+        assert_eq!(bytes[name_at + namelen], 0, "the name is NUL-terminated");
+        out.push(Dent {
+            ino: h.ino,
+            cookie: h.cookie,
+            dtype: h.dtype,
+            name: String::from_utf8(bytes[name_at..name_at + namelen].to_vec()).expect("utf8"),
+        });
+        at += reclen;
+    }
+    out
+}
+
+/// A directory of `n` files, removed when the guard drops.
+struct Entries {
+    dir: String,
+    n: usize,
+}
+
+impl Entries {
+    fn new(tag: &str, n: usize) -> Entries {
+        let dir = format!("/tmp/koru-check-rs-readdir-{tag}");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).expect("mkdir");
+        for i in 0..n {
+            std::fs::write(format!("{dir}/e{i:03}"), b"x").expect("fill");
+        }
+        Entries { dir, n }
+    }
+
+    /// Every name `readdir(3)` reports, sorted. Dot and dot-dot included.
+    fn host_names(&self) -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(&self.dir)
+            .expect("read_dir")
+            .map(|e| e.expect("entry").file_name().into_string().expect("utf8"))
+            .collect();
+        v.push(".".to_string());
+        v.push("..".to_string());
+        v.sort();
+        v
+    }
+}
+
+impl Drop for Entries {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// Read the whole directory in rounds, following the cookie.
+fn read_all_dents(m: &Mapped, h: u32, budget: u32) -> (Vec<Dent>, usize) {
+    let mut all = Vec::new();
+    let mut off = 0u64;
+    let mut rounds = 0;
+    loop {
+        let mut cq = [Cqe::default(); 1];
+        let r = m
+            .ring
+            .enter(&[Sqe::readdir(0x900, h, 1, off, budget)], &mut cq, 1, None)
+            .expect("ENTER");
+        assert_eq!(r.progress.completed, 1, "READDIR did not complete");
+        assert!(cq[0].res >= 0, "READDIR failed: {}", cq[0].res);
+        if cq[0].res == 0 {
+            return (all, rounds);
+        }
+        all.extend(decode_dents(&m.slot(1)[..cq[0].res as usize]));
+        off = cq[0].extra;
+        rounds += 1;
+        assert!(rounds < 200, "no progress");
+    }
+}
+
+#[test]
+fn readdir_sees_every_entry_readdir_3_does() {
+    let e = Entries::new("all", 500);
+    let m = Mapped::shared();
+    let h = m.open_path(0, &e.dir, KORU_O_RDONLY | KORU_O_DIRECTORY) as u32;
+    assert!(h > 0, "OPEN the directory");
+
+    // Small enough that 500 entries need several rounds.
+    let (dents, rounds) = read_all_dents(&m, h, 4096);
+    assert!(rounds > 1, "the budget forced several rounds: {rounds}");
+
+    let mut got: Vec<String> = dents.iter().map(|d| d.name.clone()).collect();
+    got.sort();
+    assert_eq!(got.len(), e.n + 2, "every entry, dot and dot-dot too");
+    assert_eq!(got, e.host_names(), "the same set readdir(3) reports");
+
+    // Types and inodes, against the filesystem itself.
+    for d in &dents {
+        if d.name == "." || d.name == ".." {
+            assert_eq!(d.dtype, KORU_DT_DIR, "{} is a directory", d.name);
+            continue;
+        }
+        assert_eq!(d.dtype, KORU_DT_REG, "{} is a regular file", d.name);
+        let md = std::fs::metadata(format!("{}/{}", e.dir, d.name)).expect("stat");
+        use std::os::linux::fs::MetadataExt;
+        assert_eq!(d.ino, md.st_ino(), "{}'s inode", d.name);
+    }
+
+    assert_eq!(m.close_handle(h), 0);
+    m.assert_quiesced();
+}
+
+/// A per-entry cookie means "resume after this one", which is the only reading
+/// that makes partial consumption work.
+#[test]
+fn readdir_resumes_after_the_entry_whose_cookie_it_gets() {
+    let e = Entries::new("resume", 40);
+    let m = Mapped::shared();
+    let h = m.open_path(0, &e.dir, KORU_O_RDONLY | KORU_O_DIRECTORY) as u32;
+    assert!(h > 0, "OPEN");
+
+    let (all, _) = read_all_dents(&m, h, 65536);
+    assert!(all.len() > 3, "the whole directory in one round");
+
+    // From the first entry's own cookie: iteration restarts at the second.
+    let mut cq = [Cqe::default(); 1];
+    let r = m
+        .ring
+        .enter(
+            &[Sqe::readdir(0x901, h, 1, all[0].cookie, 65536)],
+            &mut cq,
+            1,
+            None,
+        )
+        .expect("ENTER");
+    assert_eq!(r.progress.completed, 1);
+    assert!(cq[0].res > 0, "entries after the first");
+    let rest = decode_dents(&m.slot(1)[..cq[0].res as usize]);
+    assert_eq!(rest[0].name, all[1].name, "restarts after that entry");
+    assert_eq!(rest.len(), all.len() - 1, "and loses none of the rest");
+
+    // Reading from the last entry's cookie is the end of the directory.
+    let last = all.last().expect("entries").cookie;
+    let r = m
+        .ring
+        .enter(&[Sqe::readdir(0x902, h, 1, last, 65536)], &mut cq, 1, None)
+        .expect("ENTER");
+    assert_eq!(r.progress.completed, 1);
+    assert_eq!(cq[0].res, 0, "res 0 is the end, as on READ");
+    assert_eq!(cq[0].flags, 0, "and nothing was skipped");
+
+    assert_eq!(m.close_handle(h), 0);
+    m.assert_quiesced();
+}
+
+/// One handle, two reads: `f_pos` is shared, so one of them has to lose.
+#[test]
+fn readdir_is_serialised_per_handle() {
+    let e = Entries::new("busy", 200);
+    let m = Mapped::shared();
+    let h = m.open_path(0, &e.dir, KORU_O_RDONLY | KORU_O_DIRECTORY) as u32;
+    assert!(h > 0, "OPEN");
+
+    let sq = [
+        Sqe::readdir(0x910, h, 1, 0, 4096),
+        Sqe::readdir(0x911, h, 2, 0, 4096),
+    ];
+    let mut cq = [Cqe::default(); 2];
+    let r = m.ring.enter(&sq, &mut cq, 2, None).expect("ENTER");
+    assert_eq!(r.progress.completed, 2, "both complete");
+
+    let a = find_cqe(&cq, 0x910).res;
+    let b = find_cqe(&cq, 0x911).res;
+    let busy = (a == -(EBUSY.0 as i64)) as u32 + (b == -(EBUSY.0 as i64)) as u32;
+    assert_eq!(busy, 1, "exactly one gets EBUSY: {a}, {b}");
+    assert_eq!(
+        (a >= 0) as u32 + (b >= 0) as u32,
+        1,
+        "and exactly one reads"
+    );
+
+    // And the claim came back: the whole directory still reads.
+    let (all, _) = read_all_dents(&m, h, 4096);
+    assert_eq!(all.len(), e.n + 2, "the handle is usable again");
+
+    assert_eq!(m.close_handle(h), 0);
+    m.assert_quiesced();
+}
+
+#[test]
+fn readdir_rejection_matrix() {
+    let e = Entries::new("reject", 4);
+    ensure_pattern_file();
+    let m = Mapped::shared();
+    let h = m.open_path(0, &e.dir, KORU_O_RDONLY | KORU_O_DIRECTORY) as u32;
+    assert!(h > 0, "OPEN");
+    let bad = -(EINVAL.0 as i64);
+
+    // A budget too small for one entry is EINVAL, never 0: 0 means the end.
+    assert_eq!(
+        m.run_one(&Sqe::readdir(0x920, h, 1, 0, 8)),
+        bad,
+        "too small"
+    );
+    assert_eq!(m.run_one(&Sqe::readdir(0x921, h, 1, 0, 0)), bad, "zero");
+    assert_eq!(
+        m.run_one(&Sqe::readdir(0x922, h, 1, 0, m.slot_size() + 1)),
+        bad,
+        "a budget past the slot"
+    );
+    assert_eq!(
+        m.run_one(&Sqe::readdir(0x923, h, m.slot_count(), 0, 4096)),
+        bad,
+        "a slot past the arena"
+    );
+    assert_eq!(
+        m.run_one(&Sqe::readdir(0x924, h, 1, u64::MAX, 4096)),
+        bad,
+        "a negative cookie"
+    );
+    assert_eq!(
+        m.run_one(&Sqe::readdir(0x925, 0, 1, 0, 4096)),
+        -(EBADF.0 as i64),
+        "handle 0"
+    );
+
+    let f = m.open_path(0, PATFILE, KORU_O_RDONLY) as u32;
+    assert!(f > 0, "OPEN a regular file");
+    assert_eq!(
+        m.run_one(&Sqe::readdir(0x926, f, 1, 0, 4096)),
+        -(ENOTDIR.0 as i64),
+        "a regular file is ENOTDIR"
+    );
+
+    assert_eq!(m.close_handle(f), 0);
+    assert_eq!(m.close_handle(h), 0);
+    m.assert_quiesced();
+}
+
+/// The only thing that says `KORU_OP_READDIR` reached both `held_slot` and
+/// `held_handle`.
+#[test]
+fn readdir_releases_its_slot_and_handle_when_cancelled() {
+    let e = Entries::new("cancel", 200);
+    let m = Mapped::shared();
+    let h = m.open_path(0, &e.dir, KORU_O_RDONLY | KORU_O_DIRECTORY) as u32;
+    assert!(h > 0, "OPEN");
+
+    let r = m
+        .ring
+        .enter(&[Sqe::readdir(0x930, h, 6, 0, 4096)], &mut [], 0, None)
+        .expect("ENTER");
+    assert_eq!(r.consumed, 1, "the READDIR is queued");
+
+    let mut cq = [Cqe::default(); 4];
+    let r = m
+        .ring
+        .enter(&[Sqe::cancel(0x931, 0x930)], &mut cq, 2, None)
+        .expect("ENTER");
+    assert_eq!(r.progress.completed, 2, "both complete");
+
+    // Not -EBUSY either way: the claims came back whether the cancel won or
+    // the read ran.
+    assert!(
+        m.run_one(&Sqe::checksum(0x932, 6, 0, m.slot_size())) >= 0,
+        "the slot came back"
+    );
+    assert!(
+        m.run_one(&Sqe::readdir(0x933, h, 1, 0, 4096)) > 0,
+        "and the handle too"
+    );
+
+    assert_eq!(m.close_handle(h), 0);
+    m.assert_quiesced();
+}

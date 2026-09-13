@@ -40,6 +40,7 @@ void sec_write(void);
 void sec_nonblock(void);
 void sec_stat(void);
 void sec_path(void);
+void sec_readdir(void);
 void sec_adopt(void);
 void sec_poll(void);
 void sec_delay(void);

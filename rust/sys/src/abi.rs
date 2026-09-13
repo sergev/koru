@@ -189,6 +189,17 @@ pub const KORU_OP_RMDIR: u8 = 18;
 /// replaces it.
 pub const KORU_OP_RENAME: u8 = 19;
 
+/// Read directory entries into slot `slot` at slot offset 0, as `READ` does.
+/// `len` is the byte budget; `off` is a resume cookie, 0 for the beginning.
+/// `res` is the bytes written and 0 is end of directory, mirroring `READ`;
+/// `extra` is the next cookie. A budget too small for one entry is `EINVAL`,
+/// not 0, or a short buffer would read as the end. `ENOTDIR` for a
+/// non-directory.
+///
+/// **The first opcode that mutates shared per-file state**, `f_pos`, so it is
+/// serialised per handle: a second concurrent one gets `EBUSY`.
+pub const KORU_OP_READDIR: u8 = 20;
+
 // A `UNLINK`, `RMDIR` or `RENAME` whose last component is empty, `.`, `..` or
 // followed by a separator completes `EINVAL`, where the syscalls spread `EISDIR`,
 // `ENOTEMPTY`, `EINVAL` and `EBUSY` over those same four cases. Naming the thing
@@ -248,6 +259,10 @@ pub const KORU_OPEN_FLAGS_ALL: u32 =
 
 /// Multishot bit, reserved and never set.
 pub const KORU_CQE_F_MORE: u32 = 1 << 0;
+
+/// `READDIR` dropped an entry whose name it could not represent: a NUL or a
+/// separator in it, which means a corrupt filesystem.
+pub const KORU_CQE_F_SKIPPED: u32 = 1 << 1;
 
 /// A submission queue entry. Fields an opcode does not read must be zero.
 #[repr(C)]
@@ -466,6 +481,58 @@ const _: () = assert!(core::mem::offset_of!(KoruStat, ctime_nsec) == 136);
 const _: () = assert!(core::mem::offset_of!(KoruStat, btime_sec) == 144);
 const _: () = assert!(core::mem::offset_of!(KoruStat, btime_nsec) == 152);
 const _: () = assert!(core::mem::offset_of!(KoruStat, reserved) == 160);
+
+// ---------------------------------------------------------------------------
+// Directory entries
+// ---------------------------------------------------------------------------
+
+// A [`KoruDirent`]'s type: `(i_mode & S_IFMT) >> 12`, the same on every
+// architecture, so they pass through as the `S_IF*` values do.
+
+pub const KORU_DT_UNKNOWN: u8 = 0;
+pub const KORU_DT_FIFO: u8 = 1;
+pub const KORU_DT_CHR: u8 = 2;
+pub const KORU_DT_DIR: u8 = 4;
+pub const KORU_DT_BLK: u8 = 6;
+pub const KORU_DT_REG: u8 = 8;
+pub const KORU_DT_LNK: u8 = 10;
+pub const KORU_DT_SOCK: u8 = 12;
+/// The mask the VFS applies; anything above it is a flag, not a type.
+pub const KORU_DT_MASK: u8 = 0xf;
+
+/// Every record starts on a multiple of this.
+pub const KORU_DIRENT_ALIGN: usize = 8;
+
+/// One entry's header, then `namelen` name bytes, a NUL, and padding to
+/// [`KORU_DIRENT_ALIGN`]. 24 bytes, no padding.
+///
+/// `linux_dirent64` with its annoyances fixed: 8-aligned rather than 2-aligned,
+/// and `namelen` explicit rather than implied by `reclen`. The name is
+/// NUL-terminated for a C caller, but **`namelen` is authoritative**.
+#[repr(C)]
+#[derive(Copy, Clone, Default, Debug, PartialEq, Eq)]
+pub struct KoruDirent {
+    pub ino: u64,
+    /// Pass this as the next `off` to resume **after** this entry.
+    pub cookie: u64,
+    /// Header, name, NUL and padding: the stride to the next record.
+    pub reclen: u16,
+    /// The name's length without its NUL.
+    pub namelen: u16,
+    /// One of the `KORU_DT_*` values.
+    pub dtype: u8,
+    /// out: must read as zero.
+    pub reserved: [u8; 3],
+}
+
+const _: () = assert!(size_of::<KoruDirent>() == 24);
+const _: () = assert!(align_of::<KoruDirent>() == 8);
+const _: () = assert!(core::mem::offset_of!(KoruDirent, ino) == 0);
+const _: () = assert!(core::mem::offset_of!(KoruDirent, cookie) == 8);
+const _: () = assert!(core::mem::offset_of!(KoruDirent, reclen) == 16);
+const _: () = assert!(core::mem::offset_of!(KoruDirent, namelen) == 18);
+const _: () = assert!(core::mem::offset_of!(KoruDirent, dtype) == 20);
+const _: () = assert!(core::mem::offset_of!(KoruDirent, reserved) == 21);
 
 // ---------------------------------------------------------------------------
 // Times

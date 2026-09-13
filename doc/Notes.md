@@ -1494,6 +1494,132 @@ The fuzzer's arm renames between the same `FUZZDIR` names its creates and
 removals use, so all three race each other; `EXDEV` never comes up there, and
 the deterministic matrix owns that case.
 
+### Reading a directory, and the first shared state koru serialises
+
+T29's `READDIR` is the last kernel opcode and the only one whose work is done by
+a **callback the VFS calls back into us**. `iterate_dir` takes the directory's
+`i_rwsem` for read and calls the actor once per entry.
+
+**The new invariant, plainly: `READDIR` is the first opcode that mutates shared
+per-file state, and it is serialised per handle for that reason.** `iterate_dir`
+reads and writes `file->f_pos` and ignores `ctx->pos`, so `READ`'s
+caller-owned-offset escape is not available: two concurrent reads of one handle
+would interleave one position and lose or duplicate entries. The handle table
+grew a busy flag, claimed at submit in ioctl context and released on every
+completion path, so the second one gets `-EBUSY`. The slot bitmap's argument
+transfers verbatim — userspace naming one resource twice is the kernel's problem
+to refuse, not userspace's to avoid.
+
+The claim is taken *before* the slot claim and given back if the slot fails, and
+`OpWork::held_handle` sits beside `held_slot` so that `run`, `CANCEL` and the
+`-EBUSY` unwind all release it. That is T17's refcount trap in its third
+costume, and the check has an assertion for each of the three paths.
+
+**A `CLOSE` during a `READDIR` leaves the entry claimed but empty**, so `insert`
+skips a busy entry even when its file is gone. Without that the claim would
+outlive the file and be given back against whatever `OPEN` reused the index —
+a flag pointing at the wrong object, which is the same shape as a stale handle
+and is what generations exist to prevent.
+
+#### Three rules for the callback, and the one the plan got wrong
+
+The actor runs under the directory's rwsem, in a kworker, so:
+
+- **It allocates nothing.** The output buffer is `KVec`-allocated to the full
+  budget before `iterate_dir`, and running out of room is `checked_add` and a
+  comparison returning false — which is exactly what false means to
+  `iterate_dir`, so there is no second channel to get wrong.
+- **It cannot panic.** A Rust panic unwinding into C is `BUG()` on this kernel.
+  Every fallible step returns false or skips the entry; there is no `?`, no
+  `unwrap`, and no bounds-checked indexing — the writes go through
+  `copy_nonoverlapping` after the arithmetic has already proved they fit.
+- **It touches no koru lock**, and the arena write happens after `iterate_dir`
+  returns.
+
+The plan says that last one is "Notes' lockdep cycle reached from the other
+end", and asks for a circular-locking report from taking the arena mutex inside
+the callback. **That is not what happens.** Perturbed that way, the whole check
+passes and lockdep says nothing, and the reason is worth keeping: the cycle
+needs three edges, and the arena mutex has no outgoing edge to the VFS any more.
+`mmap` gives `mmap_lock → arena`; a filesystem read gives `i_rwsem → mmap_lock`;
+T10's bug gave `arena → i_rwsem` and was fixed. Adding `i_rwsem → arena` to the
+first two is acyclic.
+
+Perturbing *both* halves — the arena mutex in the callback and T10's bug
+restored — does produce the report, and it is worth reading:
+
+    kworker is trying to acquire (&sb->s_type->i_mutex_key)
+      at netfs_start_io_direct, but already holds (koru.rs:418)
+    -> #2 (koru.rs:418): koru's mmap, under mmap_region
+    -> #1 (&mm->mmap_lock): gup_fast_fallback, under vfs_read
+
+So the rule survives, but as a different rule: **do not add the second edge of
+an inversion whose first edge is one mistake away.** It is a latent inversion,
+not a live one, and the arena mutex is not otherwise held across anything that
+can reach the VFS. That makes it an untested guard in the same sense as the
+`STAT` one, and the entry above is the evidence that it is a real rule rather
+than a superstition.
+
+#### The entry format, and what `linux_dirent64` gets wrong
+
+`KoruDirent` is `linux_dirent64` with its annoyances fixed, since there is no
+compatibility to keep: a gap-free, **eight-aligned** 24-byte header — inode,
+cookie, record length, name length, type — then the name, a NUL and padding to
+eight. Eight-aligned is the point: every libc copies a `linux_dirent64` out of
+its buffer because `d_ino` and `d_off` land on two-byte alignment, and here they
+do not. `namelen` is explicit rather than implied by `reclen` minus a header
+size, and the name is NUL-terminated anyway, because a C caller should not have
+to build a string to call `open`. **`namelen` is authoritative**; the NUL is a
+convenience.
+
+**The cookie is `d_off`, and `d_off` does not mean what its name suggests.** The
+offset the actor is handed is the position of the entry it is being given, and
+`filldir64` stores it into the **previous** record — so a record's `d_off` is
+where to seek to get the entry *after* it. The last record's cookie comes from
+`ctx.pos` once `iterate_dir` has returned. koru copies that convention exactly,
+including the back-patching, because a per-entry cookie that meant "this entry"
+would make resumption re-deliver the entry the caller had already consumed. The
+check asserts the distinction directly: resuming from entry zero's cookie must
+return entry one first.
+
+`res` is the total bytes written and `res == 0` is the end of the directory,
+mirroring `READ` — which makes a budget too small for even the first entry a
+trap, because it would otherwise look like the end. That case is `-EINVAL`, and
+`getdents64` answers the same way for the same reason.
+
+A name containing a NUL or a separator means a corrupt filesystem. koru skips
+the entry and sets `KORU_CQE_F_SKIPPED` in the CQE rather than truncating
+silently — the first use of `Cqe::flags`, which makes the fuzzer's shape oracle
+per-opcode for `flags` as T23 made it for `extra`. No filesystem in this tree
+can produce such a name, so that path is untested.
+
+#### What was verified, and how
+
+Five perturbations, each applied and reverted, all five fail.
+
+- **Drop `KORU_OP_READDIR` from `held_slot`.** Ten assertions fail.
+- **Forget the handle on the cancel path.** One fails, and it is the one that
+  exists for it: the handle is still busy after the cancel.
+- **Drop the per-handle claim entirely.** Two concurrent reads both succeed.
+  The plan expected this to show up as duplicated or missing entries rather
+  than as an errno, but the claim is taken at submit in ioctl context, which
+  the submit lock already serialises, so exactly-one-`EBUSY` is deterministic.
+  The content assertion is there as well, and catches a claim that is taken and
+  never returned.
+- **Return 0 for a budget too small for one entry.** The caller cannot tell a
+  short buffer from the end of the directory.
+- **Make the cookie name its own entry instead of the next.** Resumption
+  re-delivers the entry the caller already had.
+
+The sixth is the plan's own, recorded above: the arena mutex in the callback is
+benign on its own and needs T10's bug beside it to close a cycle.
+
+The check builds a directory of 500 entries and reads it with a 4 KB budget,
+which takes four rounds, comparing the result as a **set** against `readdir(3)`
+— name, inode and type — with dot and dot-dot included. The fuzzer opens the
+directory it creates and feeds the last cookie any thread saw back in as a
+random `off`, so a bogus resume position is exercised too.
+
 ### Cancellation
 
 `CANCEL` names its target by `user_data` in `off`. A duplicate `user_data`

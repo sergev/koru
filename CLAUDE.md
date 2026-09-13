@@ -5,12 +5,13 @@ code in this repository.
 
 ## State of the repository
 
-**T0–T28 are done: Braam's hello world runs through koru, and the ring can
-wait for a descriptor.** The module registers `/dev/koru`, configures a ring
-with `SETUP`, and submits `NOP`, `DELAY_NS`, `CHECKSUM`, `OPEN`, `READ`,
-`WRITE`, `CLOSE`, `CANCEL`, `ADOPT_FD`, `POLL_ADD`, `STAT`, `TRUNCATE`,
-`UTIMES`, `READLINK`, `STATX_AT`, `MKDIR`, `SYMLINK`, `UNLINK`, `RMDIR` and
-`RENAME` through `ENTER`, which blocks for completions. The arena
+**T0–T29 are done, and the kernel surface is complete.** Braam's hello world
+runs through koru, and the ring can wait for a descriptor. The module registers
+`/dev/koru`, configures a ring with `SETUP`, and submits `NOP`, `DELAY_NS`,
+`CHECKSUM`, `OPEN`, `READ`, `WRITE`, `CLOSE`, `CANCEL`, `ADOPT_FD`,
+`POLL_ADD`, `STAT`, `TRUNCATE`,
+`UTIMES`, `READLINK`, `STATX_AT`, `MKDIR`, `SYMLINK`, `UNLINK`, `RMDIR`,
+`RENAME` and `READDIR` through `ENTER`, which blocks for completions. The arena
 is mmap'd, with slot exclusivity enforced by the kernel. Open files live in a
 generational handle table. A queued op can be genuinely dequeued, and
 `close(fd)` cancels whatever is still queued. The whole validation surface has
@@ -148,6 +149,18 @@ only be tested with **two mounts of one filesystem**: across two filesystems
 `lock_rename` answers `EXDEV` on its own, so the first version of that test
 passed with the check deleted. doc/Notes.md has the four perturbations.
 
+T29 added `KORU_OP_READDIR` and `KoruDirent`, the last kernel opcode and the
+only one whose work happens in a callback the VFS makes into us. That callback
+runs under the directory's `i_rwsem`, so it allocates nothing, takes no koru
+lock and cannot panic; the arena is written after `iterate_dir` returns.
+**`READDIR` is the first opcode that mutates shared per-file state** — `f_pos` —
+so it is serialised per handle, and `OpWork::held_handle` sits beside
+`held_slot`. A record's cookie means "resume *after* this entry", which is what
+`linux_dirent64::d_off` means and needs the same back-patching. The plan's
+deliberate breakage — the arena mutex inside the callback — turns out to be
+benign on its own: the cycle needs T10's bug beside it. doc/Notes.md has the
+five perturbations and that finding.
+
 T14 made the two userspace ABI mirrors a diff rather than a promise.
 `cpp/include/koru_abi.h` and `cpp/include/koru_errno.h` are the C mirrors,
 shared with `test/`, and an `abi_dump` on each side emits a canonical record
@@ -251,7 +264,7 @@ survived**.
 
 ## Commands
 
-These work today (T0 through T28):
+These work today (T0 through T29):
 
 ```sh
 KDIR=../kernel-dev/linux-source-7.1

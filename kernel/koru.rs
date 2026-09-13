@@ -200,6 +200,9 @@ impl RingState {
 pub(crate) struct HandleEntry {
     file: Option<ARef<File>>,
     generation: u16,
+    /// A `READDIR` is in flight: it moves `f_pos`, which is shared, so it is
+    /// serialised per handle the way a slot is per index.
+    busy: bool,
 }
 
 /// Fixed-size open-file table, sized at `SETUP`.
@@ -225,6 +228,7 @@ impl HandleTable {
                 HandleEntry {
                     file: None,
                     generation: 1,
+                    busy: false,
                 },
                 GFP_KERNEL,
             )?;
@@ -236,7 +240,9 @@ impl HandleTable {
     /// caller can drop it outside the lock.
     pub(crate) fn insert(&mut self, file: ARef<File>) -> core::result::Result<u32, ARef<File>> {
         for (i, e) in self.entries.iter_mut().enumerate() {
-            if e.file.is_none() {
+            // Never a busy one: a `CLOSE` mid-`READDIR` leaves the entry free
+            // but claimed, and the claim belongs to no new file.
+            if e.file.is_none() && !e.busy {
                 e.file = Some(file);
                 return Ok((i as u32) | (u32::from(e.generation) << 16));
             }
@@ -255,6 +261,28 @@ impl HandleTable {
             return Err(EBADF);
         }
         e.file.clone().ok_or(EBADF)
+    }
+
+    /// Claim a handle for a `READDIR`. `EBUSY` when one already holds it.
+    pub(crate) fn try_claim(&mut self, handle: u32) -> Result<()> {
+        let (index, generation) = Self::split(handle)?;
+        let e = self.entries.get_mut(index as usize).ok_or(EBADF)?;
+        if e.generation != generation || e.file.is_none() {
+            return Err(EBADF);
+        }
+        if e.busy {
+            return Err(EBUSY);
+        }
+        e.busy = true;
+        Ok(())
+    }
+
+    /// Give the claim back. **By index, not by handle**: a `CLOSE` may have
+    /// bumped the generation, and the claim is on the entry, not the name.
+    pub(crate) fn unclaim(&mut self, handle: u32) {
+        if let Some(e) = self.entries.get_mut((handle & 0xffff) as usize) {
+            e.busy = false;
+        }
     }
 
     /// Split a handle into `(index, generation)`. Generation 0 is never valid.
@@ -872,10 +900,15 @@ impl RingCtx {
     /// The only constructor that sets `extra`. `STAT` is the first opcode with
     /// anything to put there; every other completion passes 0.
     pub(crate) fn cqe_extra(sqe: &Sqe, res: i64, extra: u64) -> Cqe {
+        Self::cqe_full(sqe, res, extra, 0)
+    }
+
+    /// And the only one that sets `flags`, which `READDIR` alone uses.
+    pub(crate) fn cqe_full(sqe: &Sqe, res: i64, extra: u64, flags: u32) -> Cqe {
         Cqe {
             user_data: sqe.user_data,
             res,
-            flags: 0,
+            flags,
             rsvd0: 0,
             extra,
         }
