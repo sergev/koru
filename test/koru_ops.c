@@ -26,10 +26,10 @@
 
 #include "koru_check.h"
 
-#define PATH_SLOT 0u /* every OPEN below reads its path from here */
+#define PATH_SLOT 0u // every OPEN below reads its path from here
 #define PATH_MAX_ 4096u
 
-/* ------------------------------------------------------------------------- */
+// ---------------------------------------------------------------------------
 
 void sec_checksum(void)
 {
@@ -66,7 +66,7 @@ void sec_checksum(void)
     sqe_checksum(&s, R.slot_count - 1, 0, n, 0xc0de);
     check_res(run_one(R.fd, &s), want, "  and the last slot");
 
-    /* Position-sensitive: the same bytes reordered must differ. */
+    // Position-sensitive: the same bytes reordered must differ.
     memcpy(rot, pattern + 1, n - 1);
     rot[n - 1] = pattern[0];
     memcpy(R.arena + 1 * n, rot, n);
@@ -76,7 +76,7 @@ void sec_checksum(void)
     sqe_checksum(&s, 3, 100, 1000, 0xc0de);
     check_res(run_one(R.fd, &s), fnv1a(pattern + 100, 1000), "a sub-range at off 100 len 1000");
 
-    /* An empty range is legal. */
+    // An empty range is legal.
     sqe_checksum(&s, 3, 0, 0, 0xc0de);
     check_res(run_one(R.fd, &s), fnv1a(pattern, 0), "a zero-length CHECKSUM is the offset basis");
 
@@ -92,7 +92,7 @@ void sec_checksum(void)
     free(rot);
 }
 
-/* ------------------------------------------------------------------------- */
+// ---------------------------------------------------------------------------
 
 #define LINKPATH "/tmp/koru-check-symlink"
 #define SHADOW   "/etc/shadow"
@@ -109,7 +109,7 @@ static void handle_matrix(void)
         return;
     idx = KORU_HANDLE_INDEX(h);
     gen = KORU_HANDLE_GEN(h);
-    /* Generations start at 1 and skip 0 on wrap, so a handle is never 0. */
+    // Generations start at 1 and skip 0 on wrap, so a handle is never 0.
     check(gen != 0 && idx < R.handle_count, "  index inside the table, generation non-zero");
     check_res(r_close(&R, (uint32_t)h), 0, "  CLOSE retires it");
 
@@ -125,7 +125,7 @@ static void handle_matrix(void)
     if (h2 > 0)
         check_res(r_close(&R, (uint32_t)h2), 0, "  while the new one closes");
 
-    /* A rejected CLOSE must not consume the handle. */
+    // A rejected CLOSE must not consume the handle.
     h = r_open(&R, PATH_SLOT, HOSTNAME, KORU_O_RDONLY);
     if (h > 0) {
         sqe_close(&s, (uint32_t)h, 0x200);
@@ -164,7 +164,7 @@ static void path_matrix(void)
     sqe_open(&s, R.slot_count, 0, n, KORU_O_RDONLY, 0x304);
     check_res(run_one(R.fd, &s), -EINVAL, "a slot past the arena is EINVAL");
 
-    /* "/a/a/a..." resolves nowhere, so only the length clamp separates these. */
+    // "/a/a/a..." resolves nowhere, so only the length clamp separates these.
     for (i = 0; i < PATH_MAX_; i++)
         R.arena[i] = (i % 2) ? 'a' : '/';
     sqe_open(&s, PATH_SLOT, 0, PATH_MAX_ - 1, KORU_O_RDONLY, 0x305);
@@ -189,8 +189,8 @@ static void flag_matrix(void)
     check_res(r_open(&R, PATH_SLOT, "/etc", KORU_O_WRONLY), -EISDIR,
               "O_WRONLY on a directory is EISDIR");
 
-    /* Since T18 OPEN gates on nothing: READ and WRITE carry the file-type
-     * rule, and sec_nonblock proves it. */
+    // Since T18 OPEN gates on nothing: READ and WRITE carry the file-type
+    // rule, and sec_nonblock proves it.
     h = r_open(&R, PATH_SLOT, "/dev/null", KORU_O_RDONLY);
     check(h > 0, "OPEN of a device node yields a handle");
     if (h > 0)
@@ -210,7 +210,7 @@ static void flag_matrix(void)
     }
 }
 
-/* Its own ring: a table of eight makes exhaustion cheap to reach. */
+// Its own ring: a table of eight makes exhaustion cheap to reach.
 static void exhaustion(void)
 {
     struct koru_ring m;
@@ -249,7 +249,7 @@ static void exhaustion(void)
     ring_close(&m);
 }
 
-/* OPEN reads its path from a slot, so it claims that slot like any other op. */
+// OPEN reads its path from a slot, so it claims that slot like any other op.
 static void open_slot_test(void)
 {
     struct koru_sqe sq[2];
@@ -281,9 +281,9 @@ void sec_open(void)
     exhaustion();
 }
 
-/* ------------------------------------------------------------------------- */
+// ---------------------------------------------------------------------------
 
-/* The slot's bytes must equal the pattern starting at file offset `off`. */
+// The slot's bytes must equal the pattern starting at file offset `off`.
 static int slot_matches(uint32_t slot, uint64_t off, size_t n)
 {
     const uint8_t *p = R.arena + (size_t)slot * R.slot_size;
@@ -304,7 +304,7 @@ void sec_read(void)
     ssize_t n;
     int f;
 
-    /* 1. The bytes must be what read(2) gives. */
+    // 1. The bytes must be what read(2) gives.
     f = open(HOSTNAME, O_RDONLY);
     n = f >= 0 ? read(f, want, sizeof(want)) : -1;
     if (f >= 0)
@@ -324,7 +324,7 @@ void sec_read(void)
         printf("%-58s SKIP (no readable " HOSTNAME ")\n", "READ matches read(2)");
     }
 
-    /* 2. The pattern file, every byte predictable. */
+    // 2. The pattern file, every byte predictable.
     h = r_open(&R, PATH_SLOT, PATFILE, KORU_O_RDONLY);
     check(h > 0, "OPEN the pattern file");
     if (h <= 0)
@@ -343,7 +343,7 @@ void sec_read(void)
     check(r_read(&R, (uint32_t)h, 4, 123, 1) == 1 && slot_matches(4, 123, 1),
           "a one-byte READ works");
 
-    /* 3. Rejections. */
+    // 3. Rejections.
     check_res(r_read(&R, 0, 1, 0, 64), -EBADF, "READ with handle 0 is EBADF");
     check_res(r_read(&R, (uint32_t)h + (1u << 16), 1, 0, 64), -EBADF,
               "  a stale generation is EBADF");
@@ -357,7 +357,7 @@ void sec_read(void)
     check_res(r_read(&R, (uint32_t)h, 1, (uint64_t)1 << 63, 64), -EINVAL,
               "  a negative file offset is EINVAL");
 
-    /* 4. A CHECKSUM holding the slot refuses the READ behind it. */
+    // 4. A CHECKSUM holding the slot refuses the READ behind it.
     {
         struct koru_sqe sq[2];
         struct koru_cqe cq[2];
@@ -377,7 +377,7 @@ void sec_read(void)
     check_res(r_close(&R, (uint32_t)h), 0, "the handle closes");
     check_res(r_read(&R, (uint32_t)stale, 1, 0, 64), -EBADF, "  and a closed handle is EBADF");
 
-    /* 5. Rejected before kernel_read can warn; the script greps for that text. */
+    // 5. Rejected before kernel_read can warn; the script greps for that text.
     h = r_open(&R, PATH_SLOT, "/etc", KORU_O_RDONLY | KORU_O_DIRECTORY);
     check(h > 0, "OPEN /etc as a directory");
     if (h > 0) {
@@ -386,9 +386,9 @@ void sec_read(void)
     }
 }
 
-/* ------------------------------------------------------------------------- */
+// ---------------------------------------------------------------------------
 
-/* Fill slot `slot` with the pattern for file offset `off`. */
+// Fill slot `slot` with the pattern for file offset `off`.
 static void fill_slot(uint32_t slot, uint64_t off, size_t n)
 {
     uint8_t *p = R.arena + (size_t)slot * R.slot_size;
@@ -398,7 +398,7 @@ static void fill_slot(uint32_t slot, uint64_t off, size_t n)
         p[i] = pattern_byte(off + i);
 }
 
-/* The file's bytes at `off` must be the pattern for `off`. */
+// The file's bytes at `off` must be the pattern for `off`.
 static int file_matches(int fd, uint64_t off, size_t n)
 {
     uint8_t buf[8192];
@@ -446,21 +446,21 @@ void sec_write(void)
         return;
     }
 
-    /* 1. A whole slot out, then back through pread(2). */
+    // 1. A whole slot out, then back through pread(2).
     fill_slot(1, 0, R.slot_size);
     check_res(r_write(&R, (uint32_t)h, 1, 0, R.slot_size), R.slot_size,
               "a multi-page WRITE reports every byte");
     check(file_matches(fd, 0, R.slot_size), "  and pread(2) reads the pattern back");
 
-    /* 2. Into a hole, at an unaligned offset. Never rewritten, so the file
-     *    stays sparse below it. */
+    // 2. Into a hole, at an unaligned offset. Never rewritten, so the file
+    // stays sparse below it.
     fill_slot(2, 1 << 20, 4096);
     check_res(r_write(&R, (uint32_t)h, 2, 1 << 20, 4096), 4096,
               "a WRITE into a sparse hole lands at its offset");
     check(file_matches(fd, 1 << 20, 4096), "  and reads back there");
     check_res(r_write(&R, (uint32_t)h, 2, 4097, 1), 1, "a one-byte WRITE at an odd offset works");
 
-    /* 3. Rejections. */
+    // 3. Rejections.
     check_res(r_write(&R, 0, 1, 0, 64), -EBADF, "WRITE with handle 0 is EBADF");
     check_res(r_write(&R, (uint32_t)h + (1u << 16), 1, 0, 64), -EBADF,
               "  a stale generation is EBADF");
@@ -474,7 +474,7 @@ void sec_write(void)
     check_res(r_write(&R, (uint32_t)h, 1, (uint64_t)1 << 63, 64), -EINVAL,
               "  a negative file offset is EINVAL");
 
-    /* A read-only handle has no FMODE_WRITE. */
+    // A read-only handle has no FMODE_WRITE.
     ro = r_open(&R, PATH_SLOT, WRFILE, KORU_O_RDONLY);
     check(ro > 0, "OPEN the same file read-only");
     if (ro > 0) {
@@ -482,7 +482,7 @@ void sec_write(void)
         check_res(r_close(&R, (uint32_t)ro), 0, "  and it closes");
     }
 
-    /* 4. Two WRITEs on one slot: one wins, one gets -EBUSY. */
+    // 4. Two WRITEs on one slot: one wins, one gets -EBUSY.
     fill_slot(3, 0, R.slot_size);
     sqe_write(&sq[0], (uint32_t)h, 3, 0, R.slot_size, 0xb0);
     sqe_write(&sq[1], (uint32_t)h, 3, 0, R.slot_size, 0xb1);
@@ -494,8 +494,8 @@ void sec_write(void)
         check(((a->res >= 0) ^ (b->res >= 0)) && ((a->res == -EBUSY) ^ (b->res == -EBUSY)),
               "  exactly one succeeds, the other gets -EBUSY");
 
-    /* 5. A cancelled WRITE must release its slot. Without KORU_OP_WRITE in
-     *    OpWork::held_slot this is the only thing that says so. */
+    // 5. A cancelled WRITE must release its slot. Without KORU_OP_WRITE in
+    // OpWork::held_slot this is the only thing that says so.
     fill_slot(4, 0, R.slot_size);
     sqe_write(&sq[0], (uint32_t)h, 4, 0, R.slot_size, 0x50);
     if (submit(R.fd, sq, 1, cq, 0, 0, &completed) == 1) {
@@ -511,7 +511,7 @@ void sec_write(void)
     unlink(WRFILE);
 }
 
-/* T18: KORU_O_NONBLOCK, and the gate that moved off OPEN onto READ/WRITE. */
+// T18: KORU_O_NONBLOCK, and the gate that moved off OPEN onto READ/WRITE.
 
 #define FIFOPATH "/tmp/koru-check-fifo"
 
@@ -529,23 +529,23 @@ void sec_nonblock(void)
         return;
     }
 
-    /* Closes the stall: without the flag filp_open blocks for ever. */
+    // Closes the stall: without the flag filp_open blocks for ever.
     t0 = now_ms();
     h  = r_open(&R, PATH_SLOT, FIFOPATH, KORU_O_RDONLY | KORU_O_NONBLOCK);
     check(h > 0, "a peerless FIFO opens with KORU_O_NONBLOCK");
     check(now_ms() - t0 < 500, "  and returns at once rather than waiting for a writer");
 
-    /* No writer is EOF, not EAGAIN: pipe_read checks writers first. */
+    // No writer is EOF, not EAGAIN: pipe_read checks writers first.
     if (h > 0) {
         check_res(r_read(&R, (uint32_t)h, 1, 0, 64), 0, "  READ with no writer is 0, not EAGAIN");
         check_res(r_close(&R, (uint32_t)h), 0, "  and it closes");
     }
 
-    /* fifo_open owes ENXIO here. */
+    // fifo_open owes ENXIO here.
     check_res(r_open(&R, PATH_SLOT, FIFOPATH, KORU_O_WRONLY | KORU_O_NONBLOCK), -ENXIO,
               "a peerless FIFO opened write-only is ENXIO");
 
-    /* O_RDWR is both peers, so nothing below blocks and no fork is needed. */
+    // O_RDWR is both peers, so nothing below blocks and no fork is needed.
     peer = open(FIFOPATH, O_RDWR | O_NONBLOCK);
     if (peer < 0) {
         check(0, "hold the FIFO open as its own peer");
@@ -553,7 +553,7 @@ void sec_nonblock(void)
         return;
     }
 
-    /* A writer exists and the pipe is empty: now it is EAGAIN. */
+    // A writer exists and the pipe is empty: now it is EAGAIN.
     h = r_open(&R, PATH_SLOT, FIFOPATH, KORU_O_RDONLY | KORU_O_NONBLOCK);
     check(h > 0, "OPEN the FIFO non-blocking with a peer attached");
     if (h > 0) {
@@ -565,13 +565,13 @@ void sec_nonblock(void)
                   memcmp(R.arena + R.slot_size, "koru", 4) == 0,
               "  and READ returns them");
 
-        /* No FMODE_LSEEK, so `off` names nothing. */
+        // No FMODE_LSEEK, so `off` names nothing.
         check_res(r_read(&R, (uint32_t)h, 1, 1, 64), -EINVAL,
                   "  a non-zero off on an unseekable READ is EINVAL");
         check_res(r_close(&R, (uint32_t)h), 0, "  and it closes");
     }
 
-    /* Delete the gate and this hangs rather than fails. */
+    // Delete the gate and this hangs rather than fails.
     h = r_open(&R, PATH_SLOT, FIFOPATH, KORU_O_RDONLY);
     check(h > 0, "OPEN the FIFO without the flag, which the peer makes possible");
     if (h > 0) {
@@ -580,7 +580,7 @@ void sec_nonblock(void)
         check_res(r_close(&R, (uint32_t)h), 0, "  and it closes");
     }
 
-    /* WRITE takes the same gate. */
+    // WRITE takes the same gate.
     wh = r_open(&R, PATH_SLOT, FIFOPATH, KORU_O_WRONLY | KORU_O_NONBLOCK);
     check(wh > 0, "OPEN the FIFO for writing, non-blocking");
     if (wh > 0) {
@@ -596,7 +596,7 @@ void sec_nonblock(void)
     close(peer);
     unlink(FIFOPATH);
 
-    /* Non-blocking clears the type check, so only the f_op guard is left. */
+    // Non-blocking clears the type check, so only the f_op guard is left.
     h = r_open(&R, PATH_SLOT, "/etc", KORU_O_RDONLY | KORU_O_DIRECTORY | KORU_O_NONBLOCK);
     check(h > 0, "OPEN a directory non-blocking");
     if (h > 0) {
@@ -605,7 +605,7 @@ void sec_nonblock(void)
         check_res(r_close(&R, (uint32_t)h), 0, "  and it closes");
     }
 
-    /* OPEN no longer gates on the file type; READ does. */
+    // OPEN no longer gates on the file type; READ does.
     h = r_open(&R, PATH_SLOT, "/dev/null", KORU_O_RDONLY);
     check(h > 0, "OPEN of a device node now yields a handle");
     if (h > 0) {
@@ -615,9 +615,9 @@ void sec_nonblock(void)
     }
 }
 
-/* T19: a handle for a descriptor the caller already holds. */
+// T19: a handle for a descriptor the caller already holds.
 
-/* Child: stdout is the pipe, so it must print nothing. Verdict is the code. */
+// Child: stdout is the pipe, so it must print nothing. Verdict is the code.
 static int adopt_stdout_child(struct koru_ring *m, int wr)
 {
     int64_t h;
@@ -635,7 +635,7 @@ static int adopt_stdout_child(struct koru_ring *m, int wr)
     return r_close(m, (uint32_t)h) == 0 ? 0 : 6;
 }
 
-/* Child: the parent opened `fd` on a root-only file before the fork. */
+// Child: the parent opened `fd` on a root-only file before the fork.
 static int adopt_creds_child(struct koru_ring *m, int fd)
 {
     struct passwd *pw = getpwnam("nobody");
@@ -651,7 +651,7 @@ static int adopt_creds_child(struct koru_ring *m, int fd)
     if (geteuid() == 0)
         return 4;
 
-    /* OPEN would be EACCES here. ADOPT_FD must not be: no permission check. */
+    // OPEN would be EACCES here. ADOPT_FD must not be: no permission check.
     if (r_open(m, 0, SHADOW, KORU_O_RDONLY) != -EACCES)
         return 5;
     h = r_adopt(m, fd);
@@ -674,8 +674,8 @@ void sec_adopt(void)
     int st = 0;
     unsigned i;
 
-    /* 1. Stdout is usable. The pipe is non-blocking because T18's gate needs
-     *    it and koru must never set that bit on a file it did not open. */
+    // 1. Stdout is usable. The pipe is non-blocking because T18's gate needs
+    // it and koru must never set that bit on a file it did not open.
     if (pipe2(pipefd, O_NONBLOCK) != 0) {
         check(0, "create the stdout pipe");
         return;
@@ -693,7 +693,7 @@ void sec_adopt(void)
     if (pid < 0 || waitpid(pid, &st, 0) != pid) {
         check(0, "fork the stdout child");
     } else {
-        /* 2 map, 3 dup2, 4 adopt, 5 write, 6 close. */
+        // 2 map, 3 dup2, 4 adopt, 5 write, 6 close.
         check(WIFEXITED(st) && WEXITSTATUS(st) == 0, "a child writes to adopted stdout");
         if (WIFEXITED(st) && WEXITSTATUS(st) != 0)
             note("child verdict %d", WEXITSTATUS(st));
@@ -703,14 +703,14 @@ void sec_adopt(void)
     close(pipefd[0]);
     ring_close(&m);
 
-    /* 2. Adopting any koru fd would make release unreachable. */
+    // 2. Adopting any koru fd would make release unreachable.
     check_res(r_adopt(&R, R.fd), -ELOOP, "adopting our own ring fd is ELOOP");
     if (ring_open(&m, 32, 64, 4096, 4, 8) == 0) {
         check_res(r_adopt(&R, m.fd), -ELOOP, "  and a second ring's fd too");
         ring_close(&m);
     }
 
-    /* 3. Rejections. */
+    // 3. Rejections.
     check_res(r_adopt(&R, 9999), -EBADF, "an out-of-range fd is EBADF");
     fd = open(PATFILE, O_RDONLY);
     check(fd >= 0, "open the pattern file");
@@ -731,7 +731,7 @@ void sec_adopt(void)
     s.handle = 1;
     check_res(run_one(R.fd, &s), -EINVAL, "  a non-zero handle is EINVAL");
 
-    /* 4. The reference is ours: closing the descriptor changes nothing. */
+    // 4. The reference is ours: closing the descriptor changes nothing.
     fd = open(PATFILE, O_RDONLY);
     if (fd >= 0) {
         h = r_adopt(&R, fd);
@@ -746,8 +746,8 @@ void sec_adopt(void)
         }
     }
 
-    /* 5. The mirror of OPEN's creds test, asserting the opposite. If this ever
-     *    starts failing, something began re-checking permissions at use time. */
+    // 5. The mirror of OPEN's creds test, asserting the opposite. If this ever
+    // starts failing, something began re-checking permissions at use time.
     if (geteuid() != 0) {
         printf("%-58s SKIP (not root)\n", "an unprivileged child adopts a root-only fd");
     } else {
@@ -765,7 +765,7 @@ void sec_adopt(void)
             if (pid < 0 || waitpid(pid, &st, 0) != pid) {
                 check(0, "fork the creds child");
             } else {
-                /* 5 OPEN not EACCES, 6 adopt failed, 7 read failed. */
+                // 5 OPEN not EACCES, 6 adopt failed, 7 read failed.
                 check(WIFEXITED(st) && WEXITSTATUS(st) == 0,
                       "an unprivileged child adopts a root-only fd");
                 if (WIFEXITED(st) && WEXITSTATUS(st) != 0)
@@ -776,8 +776,8 @@ void sec_adopt(void)
         }
     }
 
-    /* 6. Heavy: adopt and close in bulk. filp_open installs no descriptor, but
-     *    fget takes a real reference, so file-nr is the instrument. */
+    // 6. Heavy: adopt and close in bulk. filp_open installs no descriptor, but
+    // fget takes a real reference, so file-nr is the instrument.
     before = file_nr_settled();
     for (i = 0; i < 2000; i++) {
         fd = open(PATFILE, O_RDONLY);
@@ -795,14 +795,14 @@ void sec_adopt(void)
         note("file-nr leaked %ld", leaked);
 }
 
-/* T23: KORU_OP_STAT, whose result goes in the slot rather than in res. */
+// T23: KORU_OP_STAT, whose result goes in the slot rather than in res.
 
 #define STAT_SLOT  1u
 #define STAT_POISON 0xa5
 #define STATNS     "/tmp/koru-check-statns"
 
-/* What fstat(2) says the struct must contain. btime is copied through: fstat
- * cannot report it, and `extra` is what says whether it was real. */
+// What fstat(2) says the struct must contain. btime is copied through: fstat
+// cannot report it, and `extra` is what says whether it was real.
 static void stat_expect(const struct stat *sb, const struct koru_stat *got,
                         struct koru_stat *want)
 {
@@ -829,10 +829,10 @@ static void stat_expect(const struct stat *sb, const struct koru_stat *got,
     want->btime_nsec = got->btime_nsec;
 }
 
-/* Poison the slot, stat `path` both ways, and require all 256 bytes to match:
- * every byte is a field fstat(2) agrees with, or a zeroed reserved word. A
- * partly filled struct shows up here as poison read back as a kernel value.
- * Returns the CQE's mask, or 0 on failure. */
+// Poison the slot, stat `path` both ways, and require all 256 bytes to match:
+// every byte is a field fstat(2) agrees with, or a zeroed reserved word. A
+// partly filled struct shows up here as poison read back as a kernel value.
+// Returns the CQE's mask, or 0 on failure.
 static uint64_t stat_both_ways(const char *path, const char *what)
 {
     struct koru_stat got, want;
@@ -876,7 +876,7 @@ static uint64_t stat_both_ways(const char *path, const char *what)
              (unsigned long long)got.uid, (unsigned long long)want.uid);
     }
 
-    /* The sentinel past the struct: res says where the kernel stopped. */
+    // The sentinel past the struct: res says where the kernel stopped.
     snprintf(label, sizeof(label), "  and it wrote not one byte past res");
     check(slot[sizeof(struct koru_stat)] == STAT_POISON, label);
     return extra;
@@ -917,11 +917,11 @@ static int write_file(const char *path, const char *text)
     return close(fd);
 }
 
-/* In its own user namespace, root's files must stat as the shifted id, and
- * koru must agree with fstat(2). The kernel translates in a kworker, where
- * current_user_ns() is init's — so this is what proves OpWork carries the
- * submitter's creds rather than the worker's. Delete that and every uid below
- * comes back unshifted. */
+// In its own user namespace, root's files must stat as the shifted id, and
+// koru must agree with fstat(2). The kernel translates in a kworker, where
+// current_user_ns() is init's — so this is what proves OpWork carries the
+// submitter's creds rather than the worker's. Delete that and every uid below
+// comes back unshifted.
 static int stat_ns_child(struct koru_ring *m)
 {
     struct koru_stat ks;
@@ -933,9 +933,9 @@ static int stat_ns_child(struct koru_ring *m)
         return 2;
     if (unshare(CLONE_NEWUSER) != 0)
         return 3;
-    /* gid_map needs this unless we hold CAP_SETGID in the parent namespace,
-     * which unshare has just taken away. uid_map needs no equivalent: the
-     * single mapped id is our own. */
+    // gid_map needs this unless we hold CAP_SETGID in the parent namespace,
+    // which unshare has just taken away. uid_map needs no equivalent: the
+    // single mapped id is our own.
     if (write_file("/proc/self/setgroups", "deny") != 0)
         return 4;
     if (write_file("/proc/self/uid_map", "100 0 1\n") != 0)
@@ -954,7 +954,7 @@ static int stat_ns_child(struct koru_ring *m)
     close(fd);
     r_close(m, (uint32_t)h);
 
-    /* Shifted, and the same shift fstat(2) reports. */
+    // Shifted, and the same shift fstat(2) reports.
     if (sb.st_uid != 100 || sb.st_gid != 200)
         return 9;
     if (ks.uid != sb.st_uid || ks.gid != sb.st_gid)
@@ -982,7 +982,7 @@ static void stat_namespace(void)
     }
     close(fd);
 
-    /* VM_DONTCOPY: the parent leaves this ring unmapped, the child maps it. */
+    // VM_DONTCOPY: the parent leaves this ring unmapped, the child maps it.
     if (ring_open(&m, 32, 64, 8192, 4, 8) != 0) {
         check(0, "a ring for the namespace child");
         unlink(STATNS);
@@ -997,7 +997,7 @@ static void stat_namespace(void)
         printf("%-58s SKIP (no CONFIG_USER_NS)\n",
                "a stat in a user namespace reports the shifted uid");
     } else {
-        /* 4-6 map writes, 7 open, 8 stat, 9 fstat unshifted, 10 disagreed. */
+        // 4-6 map writes, 7 open, 8 stat, 9 fstat unshifted, 10 disagreed.
         check(WIFEXITED(st) && WEXITSTATUS(st) == 0,
               "a stat in a user namespace reports the shifted uid");
         if (WIFEXITED(st) && WEXITSTATUS(st) != 0)
@@ -1017,19 +1017,19 @@ void sec_stat(void)
     uint64_t extra;
     int64_t h, res;
 
-    /* 1. Every field, against fstat(2), for three shapes of file. */
+    // 1. Every field, against fstat(2), for three shapes of file.
     extra = stat_both_ways(PATFILE, "a regular file");
     check((extra & ~(uint64_t)KORU_STAT_ALL) == 0, "  extra carries no bit outside KORU_STAT_ALL");
     check((extra & (KORU_STAT_ALL & ~KORU_STAT_BTIME)) == (KORU_STAT_ALL & ~KORU_STAT_BTIME),
           "  and every field but btime was reported");
     check((extra & KORU_STAT_BTIME) != 0, "  tmpfs reports a creation time too");
-    /* The mask is koru's own, so the statx one must not read as valid here. */
+    // The mask is koru's own, so the statx one must not read as valid here.
     check(extra != 4095, "  and it is not the statx mask passed through");
 
     stat_both_ways("/etc", "a directory");
     stat_both_ways("/dev/null", "a character device");
 
-    /* 2. len is the caller's buffer size, and its version negotiation. */
+    // 2. len is the caller's buffer size, and its version negotiation.
     h = r_open(&R, PATH_SLOT, PATFILE, KORU_O_RDONLY);
     check(h > 0, "OPEN the pattern file");
     if (h <= 0)
@@ -1046,7 +1046,7 @@ void sec_stat(void)
               "a len past the struct is clamped to the struct");
     check(slot[sizeof(struct koru_stat)] == STAT_POISON, "  and nothing beyond it is touched");
 
-    /* 3. A destination straddling a page boundary, which write_slot must split. */
+    // 3. A destination straddling a page boundary, which write_slot must split.
     {
         struct koru_stat got, want;
         struct stat sb;
@@ -1063,11 +1063,11 @@ void sec_stat(void)
         check(memcmp(&got, &want, sizeof(got)) == 0, "  and lands intact on both pages");
     }
 
-    /* 4. Rejections. */
+    // 4. Rejections.
     stat_rejections(h);
 
-    /* 5. Slot exclusivity. A whole-slot CHECKSUM is slow enough to still hold
-     *    the slot when the STAT behind it is dispatched. */
+    // 5. Slot exclusivity. A whole-slot CHECKSUM is slow enough to still hold
+    // the slot when the STAT behind it is dispatched.
     sqe_checksum(&sq[0], STAT_SLOT, 0, R.slot_size, 0xd0);
     sqe_stat(&sq[1], (uint32_t)h, STAT_SLOT, 0, sizeof(struct koru_stat), 0xd1);
     submit(R.fd, sq, 2, cq, 2, 2, &completed);
@@ -1080,8 +1080,8 @@ void sec_stat(void)
         check(b->extra == 0, "  a refused STAT reports no mask");
     }
 
-    /* 6. A cancelled STAT must release its slot: KORU_OP_STAT in held_slot is
-     *    the only thing that does it, and nothing else says so. */
+    // 6. A cancelled STAT must release its slot: KORU_OP_STAT in held_slot is
+    // the only thing that does it, and nothing else says so.
     sqe_stat(&sq[0], (uint32_t)h, STAT_SLOT, 0, sizeof(struct koru_stat), 0x70);
     if (submit(R.fd, sq, 1, cq, 0, 0, &completed) == 1) {
         sqe_cancel(&sq[0], 0x70, 0x71);
@@ -1093,26 +1093,26 @@ void sec_stat(void)
 
     check_res(r_close(&R, (uint32_t)h), 0, "the handle closes");
 
-    /* 7. The ids are the submitter's, not the kworker's. */
+    // 7. The ids are the submitter's, not the kworker's.
     stat_namespace();
 }
 
-/* T24: TRUNCATE, UTIMES and READLINK, the kern_path plumbing. */
+// T24: TRUNCATE, UTIMES and READLINK, the kern_path plumbing.
 
 #define TRFILE   "/tmp/koru-check-trunc"
 #define TRLINK   "/tmp/koru-check-trunclink"
 #define PLINK    "/tmp/koru-check-plink"
 #define PLINK2   "/tmp/koru-check-plink2"
 #define LONGLINK "/run/koru-check-longlink"
-/* Exactly eight characters, so a path op can name it from a slot offset that
- * leaves no room for the argument after it. */
+// Exactly eight characters, so a path op can name it from a slot offset that
+// leaves no room for the argument after it.
 #define SHORTPATH "/run/abc"
 #define CREDSDIR  "/tmp/koru-check-credsdir"
-/* Searchable but not writable, so vfs_mkdir itself is what refuses. */
+// Searchable but not writable, so vfs_mkdir itself is what refuses.
 #define CREDSRO   "/tmp/koru-check-credsro"
 #define CREDSLINK CREDSDIR "/link"
-/* Longer than tmpfs's SHORT_SYMLINK_LEN, so the target is page-backed and
- * vfs_get_link arms a delayed call. A short one arms none and leaks nothing. */
+// Longer than tmpfs's SHORT_SYMLINK_LEN, so the target is page-backed and
+// vfs_get_link arms a delayed call. A short one arms none and leaks nothing.
 #define LONGTARGET                                                                                 \
     "/tmp/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/"                      \
     "cccccccccccccccccccccccccccccccc/dddddddddddddddddddddddddddddddd/target"
@@ -1133,7 +1133,7 @@ static int64_t r_readlink(struct koru_ring *r, uint32_t slot, const char *path)
     return r_path(r, KORU_OP_READLINK, slot, path, NULL, 0);
 }
 
-/* st_size of `path`, or -1. */
+// st_size of `path`, or -1.
 static int64_t path_size(const char *path)
 {
     struct stat sb;
@@ -1179,7 +1179,7 @@ static void path_truncate(void)
     check_res(r_truncate(&R, 1, TRFILE, 0), 0, "  and truncates to nothing");
     check(path_size(TRFILE) == 0, "  leaving an empty file");
 
-    /* A final symlink is followed, as truncate(2) follows it. */
+    // A final symlink is followed, as truncate(2) follows it.
     unlink(TRLINK);
     if (symlink(TRFILE, TRLINK) == 0) {
         check_res(r_truncate(&R, 1, TRLINK, 4096), 0, "TRUNCATE follows a final symlink");
@@ -1189,7 +1189,7 @@ static void path_truncate(void)
         printf("%-58s SKIP (cannot symlink)\n", "TRUNCATE follows a final symlink");
     }
 
-    /* Rejections. vfs_truncate owns the first two. */
+    // Rejections. vfs_truncate owns the first two.
     check_res(r_truncate(&R, 1, "/etc", 0), -EISDIR, "TRUNCATE of a directory is EISDIR");
     check_res(r_truncate(&R, 1, "/dev/null", 0), -EINVAL, "  of a device node is EINVAL");
     check_res(r_truncate(&R, 1, "/no/such/path", 0), -ENOENT, "  of a missing path is ENOENT");
@@ -1207,8 +1207,8 @@ static void path_truncate(void)
     sqe_path(&s, KORU_OP_TRUNCATE, R.slot_count, 0, 8, 0x702);
     check_res(run_one(R.fd, &s), -EINVAL, "  a slot past the arena is EINVAL");
 
-    /* The argument has to fit after the path, not merely the path itself. The
-     * path here is real and in range, so only the argument bound can refuse. */
+    // The argument has to fit after the path, not merely the path itself. The
+    // path here is real and in range, so only the argument bound can refuse.
     if (make_file(SHORTPATH, 0) == 0) {
         memcpy(R.arena + R.slot_size + R.slot_size - 12, SHORTPATH, 8);
         sqe_path(&s, KORU_OP_TRUNCATE, 1, R.slot_size - 12, 8, 0x703);
@@ -1247,7 +1247,7 @@ static void path_utimes(void)
         check(0, "  stat(2) reports the exact atime");
     }
 
-    /* OMIT leaves one alone; the kernel's own sentinel, checked by vfs_utimes. */
+    // OMIT leaves one alone; the kernel's own sentinel, checked by vfs_utimes.
     t.atime_nsec = KORU_UTIME_OMIT;
     t.mtime_sec  = 1200000000;
     t.mtime_nsec = 1;
@@ -1273,7 +1273,7 @@ static void path_utimes(void)
         check(0, "  and the atime is now");
     }
 
-    /* vfs_utimes validates the nanoseconds itself. */
+    // vfs_utimes validates the nanoseconds itself.
     t.atime_nsec = 1000000000;
     t.mtime_nsec = 0;
     check_res(r_utimes(&R, 1, TRFILE, &t), -EINVAL, "a nanosecond field past 999999999 is EINVAL");
@@ -1286,7 +1286,7 @@ static void path_utimes(void)
     unlink(TRFILE);
 }
 
-/* The slot's bytes at `off` must be `want` followed by a NUL. */
+// The slot's bytes at `off` must be `want` followed by a NUL.
 static int link_matches(uint32_t slot, uint64_t off, const char *want)
 {
     const char *p = (const char *)R.arena + (size_t)slot * R.slot_size + off;
@@ -1315,8 +1315,8 @@ static void path_readlink(void)
         want[n] = 0;
         check_res(r_readlink(&R, 1, PLINK), n, "READLINK returns the length without the NUL");
         check(link_matches(1, 0, want), "  and the slot holds what readlink(2) gave");
-        /* PLINK points at PLINK2, which points at a file. Following would give
-         * neither of these answers. */
+        // PLINK points at PLINK2, which points at a file. Following would give
+        // neither of these answers.
         check(strcmp(want, PLINK2) == 0, "  which is the first target, not the last");
     }
 
@@ -1324,8 +1324,8 @@ static void path_readlink(void)
     check_res(r_readlink(&R, 1, "/etc"), -EINVAL, "  of a directory is EINVAL");
     check_res(r_readlink(&R, 1, "/no/such/path"), -ENOENT, "  of a missing path is ENOENT");
 
-    /* The answer replaces the path, so the room is the rest of the slot.
-     * Truncating silently is how a wrong path gets used. */
+    // The answer replaces the path, so the room is the rest of the slot.
+    // Truncating silently is how a wrong path gets used.
     unlink(LONGLINK);
     if (symlink(LONGTARGET, LONGLINK) == 0) {
         check_res(r_readlink(&R, 1, LONGLINK), (int64_t)strlen(LONGTARGET),
@@ -1350,7 +1350,7 @@ static void path_readlink(void)
     unlink(PLINK2);
 }
 
-/* T25: STATX_AT, T23's answer for a path rather than a handle. */
+// T25: STATX_AT, T23's answer for a path rather than a handle.
 
 #define STATXSLOT 1u
 
@@ -1359,8 +1359,8 @@ static int64_t r_statx(struct koru_ring *r, uint32_t slot, const char *path, uin
     return r_path_extra(r, KORU_OP_STATX_AT, slot, path, NULL, 0, extra);
 }
 
-/* Stat `path` both ways and require all 256 bytes to match. Returns the CQE's
- * mask, or 0 on failure. */
+// Stat `path` both ways and require all 256 bytes to match. Returns the CQE's
+// mask, or 0 on failure.
 static uint64_t statx_both_ways(const char *path, const char *what)
 {
     struct koru_sqe s;
@@ -1374,7 +1374,7 @@ static uint64_t statx_both_ways(const char *path, const char *what)
     int64_t res;
     char label[128];
 
-    /* Poisoned after the path: put_path zeroes the whole slot. */
+    // Poisoned after the path: put_path zeroes the whole slot.
     n = put_path(R.arena, R.slot_size, STATXSLOT, path);
     memset(slot + sizeof(struct koru_stat), STAT_POISON, 8);
     sqe_path(&s, KORU_OP_STATX_AT, STATXSLOT, 0, n, 0x740);
@@ -1414,7 +1414,7 @@ static void path_statx(void)
     uint64_t extra;
     uint32_t n;
 
-    /* 1. Every field, against stat(2), for three shapes of file. */
+    // 1. Every field, against stat(2), for three shapes of file.
     extra = statx_both_ways(PATFILE, "a regular file");
     check((extra & ~(uint64_t)KORU_STAT_ALL) == 0, "  extra carries no bit outside KORU_STAT_ALL");
     check((extra & (KORU_STAT_ALL & ~KORU_STAT_BTIME)) == (KORU_STAT_ALL & ~KORU_STAT_BTIME),
@@ -1422,11 +1422,11 @@ static void path_statx(void)
     statx_both_ways("/etc", "a directory");
     statx_both_ways("/dev/null", "a character device");
 
-    /* 2. The answer replaces the path, which is the documented contract. */
+    // 2. The answer replaces the path, which is the documented contract.
     check(memcmp(slot, PATFILE, strlen(PATFILE)) != 0, "the struct overwrote the path");
 
-    /* 3. A final symlink is followed, as stat(2) follows it: the two-deep link
-     *    resolves to the file, not to the link in between. */
+    // 3. A final symlink is followed, as stat(2) follows it: the two-deep link
+    // resolves to the file, not to the link in between.
     unlink(PLINK);
     unlink(PLINK2);
     if (symlink(PLINK2, PLINK) == 0 && symlink(PATFILE, PLINK2) == 0) {
@@ -1444,7 +1444,7 @@ static void path_statx(void)
     unlink(PLINK);
     unlink(PLINK2);
 
-    /* 4. Rejections. */
+    // 4. Rejections.
     check_res(r_statx(&R, STATXSLOT, "/no/such/path", NULL), -ENOENT,
               "STATX_AT of a missing path is ENOENT");
     check_res(r_statx(&R, STATXSLOT, PATFILE "/x", NULL), -ENOTDIR,
@@ -1459,14 +1459,14 @@ static void path_statx(void)
     sqe_path(&sq[0], KORU_OP_STATX_AT, R.slot_count, 0, 8, 0x732);
     check_res(run_one(R.fd, &sq[0]), -EINVAL, "  a slot past the arena is EINVAL");
 
-    /* An unaligned destination, with a real path at it so only the alignment
-     * can refuse. */
+    // An unaligned destination, with a real path at it so only the alignment
+    // can refuse.
     memset(slot, 0, R.slot_size);
     memcpy(slot + 4, PATFILE, strlen(PATFILE));
     sqe_path(&sq[0], KORU_OP_STATX_AT, STATXSLOT, 4, n, 0x733);
     check_res(run_one(R.fd, &sq[0]), -EINVAL, "  an unaligned off is EINVAL");
 
-    /* The whole struct has to fit after off, not merely the path. */
+    // The whole struct has to fit after off, not merely the path.
     memset(slot, 0, R.slot_size);
     memcpy(slot + R.slot_size - 256 + 8, PATFILE, strlen(PATFILE));
     sqe_path(&sq[0], KORU_OP_STATX_AT, STATXSLOT, R.slot_size - 256 + 8, n, 0x734);
@@ -1476,7 +1476,7 @@ static void path_statx(void)
     check_res(run_one(R.fd, &sq[0]), (int64_t)sizeof(struct koru_stat),
               "  while one that exactly fits is accepted");
 
-    /* 5. Slot exclusivity, the CHECKSUM idiom STAT uses. */
+    // 5. Slot exclusivity, the CHECKSUM idiom STAT uses.
     put_path(R.arena, R.slot_size, STATXSLOT, PATFILE);
     sqe_checksum(&sq[0], STATXSLOT, 0, R.slot_size, 0xd4);
     sqe_path(&sq[1], KORU_OP_STATX_AT, STATXSLOT, 0, n, 0xd5);
@@ -1491,14 +1491,14 @@ static void path_statx(void)
     }
 }
 
-/* T26: MKDIR and SYMLINK, the start_creating_path pair. */
+// T26: MKDIR and SYMLINK, the start_creating_path pair.
 
 #define NEWDIR   "/tmp/koru-check-newdir"
 #define NEWLINK  "/tmp/koru-check-newlink"
-/* Its own mount, so the write count the remount sees is only ours. */
+// Its own mount, so the write count the remount sees is only ours.
 #define BALDIR   "/run/koru-check-mnt"
 
-/* mode & 07777 of `path`, or -1. */
+// mode & 07777 of `path`, or -1.
 static int path_mode(const char *path)
 {
     struct stat sb;
@@ -1525,19 +1525,19 @@ static void path_mkdir(void)
     check_res(r_mkdir(&R, 1, NEWDIR, 0755), -EEXIST, "  a second one is EEXIST");
     rmdir(NEWDIR);
 
-    /* The VFS applies the submitter's umask, as mkdir(2) does. */
+    // The VFS applies the submitter's umask, as mkdir(2) does.
     umask(022);
     check_res(r_mkdir(&R, 1, NEWDIR, 0777), 0, "MKDIR under umask 022");
     check(path_mode(NEWDIR) == 0755, "  has the umask applied by the VFS");
     rmdir(NEWDIR);
     umask(0);
 
-    /* The sticky bit is the one non-permission bit vfs_mkdir keeps. */
+    // The sticky bit is the one non-permission bit vfs_mkdir keeps.
     check_res(r_mkdir(&R, 1, NEWDIR, 01777), 0, "MKDIR accepts the sticky bit");
     check(path_mode(NEWDIR) == 01777, "  and sets it");
     rmdir(NEWDIR);
 
-    /* LOOKUP_DIRECTORY is what lets a trailing slash through. */
+    // LOOKUP_DIRECTORY is what lets a trailing slash through.
     check_res(r_mkdir(&R, 1, NEWDIR "/", 0700), 0, "MKDIR accepts a trailing slash");
     check(is_dir(NEWDIR), "  and creates the directory named");
     rmdir(NEWDIR);
@@ -1557,7 +1557,7 @@ static void path_mkdir(void)
     umask(old);
 }
 
-/* The slot's two paths, as SYMLINK reads them. Returns the SQE's len. */
+// The slot's two paths, as SYMLINK reads them. Returns the SQE's len.
 static uint32_t put_pair(uint32_t slot, const char *a, const char *b)
 {
     return put_paths(R.arena, R.slot_size, slot, a, b);
@@ -1583,8 +1583,8 @@ static void path_symlink(void)
     check_res(r_symlink(&R, 1, "/any/target", "/no/such/parent/x"), -ENOENT,
               "SYMLINK under a missing parent is ENOENT");
 
-    /* The two-path parse. Each of these is one deleted check away from
-     * splitting somewhere the caller did not ask for. */
+    // The two-path parse. Each of these is one deleted check away from
+    // splitting somewhere the caller did not ask for.
     n = put_pair(1, "/any/target", NEWLINK);
     sqe_path(&s, KORU_OP_SYMLINK, 1, 0, n, 0x770);
     s.handle = 1;
@@ -1612,7 +1612,7 @@ static void path_symlink(void)
     check(readlink(NEWLINK, got, sizeof(got)) < 0, "and no rejected SYMLINK left a link behind");
 }
 
-/* T27: UNLINK and RMDIR, the hand-assembled removal. */
+// T27: UNLINK and RMDIR, the hand-assembled removal.
 
 #define GONE(path) (access(path, F_OK) != 0 && errno == ENOENT)
 
@@ -1630,12 +1630,12 @@ static void path_unlink(void)
 
     check_res(r_unlink(&R, 1, TRFILE), 0, "UNLINK removes a file");
     check(GONE(TRFILE), "  and access(2) says it is gone");
-    /* The link itself, never what it points at. */
+    // The link itself, never what it points at.
     check_res(r_unlink(&R, 1, NEWLINK), 0, "  and a dangling symlink");
     check(GONE(NEWLINK), "  which access(2) also stops finding");
 
-    /* On a writable filesystem: mnt_want_write comes first, so a read-only
-     * mount would answer EROFS and prove nothing. */
+    // On a writable filesystem: mnt_want_write comes first, so a read-only
+    // mount would answer EROFS and prove nothing.
     if (mkdir(NEWDIR, 0700) == 0)
         check_res(r_unlink(&R, 1, NEWDIR), -EISDIR, "UNLINK of a directory is EISDIR");
     else
@@ -1645,14 +1645,14 @@ static void path_unlink(void)
     check_res(r_unlink(&R, 1, "/etc/hostname/x"), -ENOTDIR,
               "  through a regular file is ENOTDIR");
 
-    /* Ours, before start_removing sees the name: -EACCES without them. */
+    // Ours, before start_removing sees the name: -EACCES without them.
     check_res(r_unlink(&R, 1, "/tmp/."), -EINVAL, "UNLINK of a path ending in . is EINVAL");
     check_res(r_unlink(&R, 1, "/tmp/.."), -EINVAL, "  ending in .. is EINVAL");
     check_res(r_unlink(&R, 1, "/tmp/"), -EINVAL, "  with a trailing separator is EINVAL");
     check_res(r_unlink(&R, 1, "/"), -EINVAL, "  and the root itself is EINVAL");
 
-    /* No separator: the cwd, which is the submitter's only because this is
-     * inline. */
+    // No separator: the cwd, which is the submitter's only because this is
+    // inline.
     {
         char cwd[256];
 
@@ -1677,7 +1677,7 @@ static void path_unlink(void)
     sqe_path(&s, KORU_OP_UNLINK, R.slot_count, 0, 8, 0x7a2);
     check_res(run_one(R.fd, &s), -EINVAL, "  a slot past the arena is EINVAL");
 
-    /* Deep enough that the parent lookup is doing real work. */
+    // Deep enough that the parent lookup is doing real work.
     snprintf(deep, sizeof(deep), "%s/a/b", NEWDIR);
     if (mkdir(NEWDIR, 0700) == 0 && mkdir(NEWDIR "/a", 0700) == 0 &&
         make_file(NEWDIR "/a/b", 3) == 0) {
@@ -1691,7 +1691,7 @@ static void path_unlink(void)
     rmdir(NEWDIR);
 }
 
-/* T28: RENAME, the only op that locks two directories. */
+// T28: RENAME, the only op that locks two directories.
 
 #define RENSRC  "/tmp/koru-check-ren-a"
 #define RENDST  "/tmp/koru-check-ren-b"
@@ -1699,7 +1699,7 @@ static void path_unlink(void)
 #define RENMNT  "/run/koru-check-renmnt"
 #define RENBIND "/run/koru-check-renbind"
 
-/* The file's first byte, or -1. Identity across a rename. */
+// The file's first byte, or -1. Identity across a rename.
 static int first_byte(const char *path)
 {
     unsigned char c;
@@ -1736,7 +1736,7 @@ static void path_rename(void)
     unlink(RENDIR "/f");
     rmdir(RENDIR);
 
-    /* 1. Within one directory. */
+    // 1. Within one directory.
     if (make_byte(RENSRC, 0x41) != 0) {
         check(0, "create the RENAME source");
         return;
@@ -1744,7 +1744,7 @@ static void path_rename(void)
     check_res(r_rename(&R, 1, RENSRC, RENDST), 0, "RENAME within a directory");
     check(GONE(RENSRC) && first_byte(RENDST) == 0x41, "  and the bytes moved with the name");
 
-    /* 2. Across directories, and onto an existing file. */
+    // 2. Across directories, and onto an existing file.
     if (mkdir(RENDIR, 0700) != 0 || make_byte(RENDIR "/f", 0x42) != 0) {
         check(0, "create the RENAME destination directory");
         unlink(RENDST);
@@ -1756,7 +1756,7 @@ static void path_rename(void)
     check(first_byte(RENDIR "/f") == 0x41, "  which is replaced, not merged");
     check(GONE(RENDIR "/moved"), "  and the source is gone");
 
-    /* 3. A directory moves too, and onto a non-empty one it does not. */
+    // 3. A directory moves too, and onto a non-empty one it does not.
     if (mkdir(RENDIR "/sub", 0700) == 0 && make_byte(RENDIR "/sub/x", 0x43) == 0) {
         check_res(r_rename(&R, 1, RENDIR "/sub", RENDIR "/sub2"), 0, "RENAME moves a directory");
         check(first_byte(RENDIR "/sub2/x") == 0x43, "  with what was in it");
@@ -1770,7 +1770,7 @@ static void path_rename(void)
         check(0, "RENAME moves a directory");
     }
 
-    /* 4. Rejections. */
+    // 4. Rejections.
     check_res(r_rename(&R, 1, "/no/such/path", RENDST), -ENOENT,
               "RENAME of a missing source is ENOENT");
     check_res(r_rename(&R, 1, RENDIR "/f", "/no/such/dir/x"), -ENOENT,
@@ -1791,9 +1791,9 @@ static void path_rename(void)
     check_res(run_one(R.fd, &s), -EINVAL, "  one path with no NUL between is EINVAL");
     check(access(RENDIR "/f", F_OK) == 0, "and no rejected RENAME moved anything");
 
-    /* 5. Across mounts: EXDEV, before anything is locked. Two mounts of *one*
-     *    filesystem: for two superblocks lock_rename answers EXDEV itself, so
-     *    only a bind mount tries our check. See doc/Notes.md. */
+    // 5. Across mounts: EXDEV, before anything is locked. Two mounts of *one*
+    // filesystem: for two superblocks lock_rename answers EXDEV itself, so
+    // only a bind mount tries our check. See doc/Notes.md.
     rmdir(RENMNT);
     rmdir(RENBIND);
     if (mkdir(RENMNT, 0700) == 0 && mount("none", RENMNT, "tmpfs", 0, NULL) == 0) {
@@ -1805,15 +1805,15 @@ static void path_rename(void)
                       "RENAME across two mounts of one filesystem is EXDEV");
             check(access(RENMNT "/f", F_OK) == 0 && GONE(RENMNT "/g"),
                   "  and nothing moved");
-            /* The same two names through one mount, so the mount is
-             * demonstrably the only thing that refused. */
+            // The same two names through one mount, so the mount is
+            // demonstrably the only thing that refused.
             check_res(r_rename(&R, 1, RENMNT "/f", RENMNT "/g"), 0,
                       "  while one mount renames them happily");
             if (umount(RENBIND) != 0)
                 note("could not unmount %s", RENBIND);
         }
         rmdir(RENBIND);
-        /* Two filesystems: the VFS's own EXDEV, from lock_rename. */
+        // Two filesystems: the VFS's own EXDEV, from lock_rename.
         check_res(r_rename(&R, 1, RENDIR "/f", RENMNT "/f"), -EXDEV,
                   "  and across two filesystems too");
         unlink(RENMNT "/f");
@@ -1830,9 +1830,9 @@ static void path_rename(void)
     rmdir(RENDIR);
 }
 
-/* A read-only **bind mount** of a writable filesystem: the only shape that
- * isolates our own mnt_want_write. With the superblock read-only,
- * inode_permission answers EROFS by itself. See doc/Notes.md. */
+// A read-only **bind mount** of a writable filesystem: the only shape that
+// isolates our own mnt_want_write. With the superblock read-only,
+// inode_permission answers EROFS by itself. See doc/Notes.md.
 #define ROBIND "/run/koru-check-robind"
 
 static void path_readonly(void)
@@ -1855,8 +1855,8 @@ static void path_readonly(void)
         check_res(r_rmdir(&R, 1, ROBIND "/d"), -EROFS, "  and so is RMDIR");
         check_res(r_rename(&R, 1, ROBIND "/f", ROBIND "/g"), -EROFS, "  and RENAME");
         check(access(BALDIR "/f", F_OK) == 0, "  and the file is still there");
-        /* The same two through the writable view of the same inodes, so the
-         * mount is demonstrably the only thing that refused. */
+        // The same two through the writable view of the same inodes, so the
+        // mount is demonstrably the only thing that refused.
         check_res(r_unlink(&R, 1, BALDIR "/f"), 0, "  while the writable mount still removes it");
         check_res(r_rmdir(&R, 1, BALDIR "/d"), 0, "  and the directory too");
     }
@@ -1907,8 +1907,8 @@ static void path_rmdir(void)
     s.handle = 1;
     check_res(run_one(R.fd, &s), -EINVAL, "  a non-zero handle is EINVAL");
 
-    /* A symlink to a directory is not a directory: RMDIR must not follow it,
-     * and the link must survive being refused. */
+    // A symlink to a directory is not a directory: RMDIR must not follow it,
+    // and the link must survive being refused.
     unlink(NEWLINK);
     if (mkdir(NEWDIR, 0700) == 0 && symlink(NEWDIR, NEWLINK) == 0) {
         check_res(r_rmdir(&R, 1, NEWLINK), -ENOTDIR, "RMDIR does not follow a final symlink");
@@ -1920,9 +1920,9 @@ static void path_rmdir(void)
     rmdir(NEWDIR);
 }
 
-/* Heavy: every create and removal takes the mount's write count and must put it
- * back. Nothing sees an unbalanced one until the filesystem refuses to go
- * read-only. Its own tmpfs, so the count weighed is ours alone. */
+// Heavy: every create and removal takes the mount's write count and must put it
+// back. Nothing sees an unbalanced one until the filesystem refuses to go
+// read-only. Its own tmpfs, so the count weighed is ours alone.
 #define BALANCE 2000u
 
 static void path_create_balance(void)
@@ -1944,8 +1944,8 @@ static void path_create_balance(void)
         snprintf(moved, sizeof(moved), BALDIR "/m%u", i);
         if (r_mkdir(&R, 1, dir, 0700) != 0 || r_symlink(&R, 1, LONGTARGET, link) != 0)
             break;
-        /* Renamed in place first, so the rename's own write count is on trial
-         * with the rest. */
+        // Renamed in place first, so the rename's own write count is on trial
+        // with the rest.
         if (r_rename(&R, 1, link, moved) != 0 || r_rmdir(&R, 1, dir) != 0 ||
             r_unlink(&R, 1, moved) != 0) {
             ok = 0;
@@ -1955,7 +1955,7 @@ static void path_create_balance(void)
     }
     check(made == BALANCE && ok, "2,000 create-rename-remove rounds, all five opcodes");
 
-    /* A leaked mnt_want_write is EBUSY here and nothing anywhere else. */
+    // A leaked mnt_want_write is EBUSY here and nothing anywhere else.
     if (mount(NULL, BALDIR, NULL, MS_REMOUNT | MS_RDONLY, NULL) == 0) {
         check(1, "  and the filesystem still goes read-only");
     } else {
@@ -1969,9 +1969,9 @@ static void path_create_balance(void)
     rmdir(BALDIR);
 }
 
-/* The whole inline-because-of-creds rule, for something other than OPEN.
- * Deferred to a kworker every one of these would run as root in the initial
- * namespaces, and each EACCES below would become a success. */
+// The whole inline-because-of-creds rule, for something other than OPEN.
+// Deferred to a kworker every one of these would run as root in the initial
+// namespaces, and each EACCES below would become a success.
 static int path_creds_child(struct koru_ring *m)
 {
     struct passwd *pw = getpwnam("nobody");
@@ -1989,41 +1989,41 @@ static int path_creds_child(struct koru_ring *m)
 
     if (r_truncate(m, 0, TRFILE, 0) != -EACCES)
         return 5;
-    /* Explicit times need ownership, so setattr_prepare gives EPERM. */
+    // Explicit times need ownership, so setattr_prepare gives EPERM.
     memset(&t, 0, sizeof(t));
     t.atime_sec = 1;
     t.mtime_sec = 1;
     if (r_utimes(m, 0, TRFILE, &t) != -EPERM)
         return 6;
-    /* Both UTIME_NOW is a touch, which needs only write: EACCES instead. */
+    // Both UTIME_NOW is a touch, which needs only write: EACCES instead.
     t.atime_nsec = KORU_UTIME_NOW;
     t.mtime_nsec = KORU_UTIME_NOW;
     if (r_utimes(m, 0, TRFILE, &t) != -EACCES)
         return 7;
-    /* The link itself is world-readable; the directory it sits in is not. */
+    // The link itself is world-readable; the directory it sits in is not.
     if (r_readlink(m, 0, CREDSLINK) != -EACCES)
         return 8;
-    /* Same directory, and the op that would report its target's every field. */
+    // Same directory, and the op that would report its target's every field.
     if (r_statx(m, 0, CREDSLINK, NULL) != -EACCES)
         return 9;
-    /* Creating in it needs write and search, and the child has neither. */
+    // Creating in it needs write and search, and the child has neither.
     if (r_mkdir(m, 0, CREDSDIR "/sub", 0700) != -EACCES)
         return 10;
     if (r_symlink(m, 0, "/any/target", CREDSDIR "/new") != -EACCES)
         return 11;
-    /* The lookup succeeds and vfs_mkdir refuses, so its error path runs: it
-     * has already unlocked the dentry it was given. */
+    // The lookup succeeds and vfs_mkdir refuses, so its error path runs: it
+    // has already unlocked the dentry it was given.
     if (r_mkdir(m, 0, CREDSRO "/sub", 0700) != -EACCES)
         return 12;
     if (r_symlink(m, 0, "/any/target", CREDSRO "/new") != -EACCES)
         return 13;
-    /* Removing needs write on the parent, which CREDSRO does not give. The
-     * lookup succeeds, so this reaches vfs_unlink's own permission check. */
+    // Removing needs write on the parent, which CREDSRO does not give. The
+    // lookup succeeds, so this reaches vfs_unlink's own permission check.
     if (r_unlink(m, 0, CREDSRO "/victim") != -EACCES)
         return 14;
     if (r_rmdir(m, 0, CREDSRO "/victimdir") != -EACCES)
         return 15;
-    /* And the unreachable directory refuses before that. */
+    // And the unreachable directory refuses before that.
     if (r_unlink(m, 0, CREDSLINK) != -EACCES)
         return 16;
     if (r_rename(m, 0, CREDSRO "/victim", CREDSRO "/moved") != -EACCES)
@@ -2056,7 +2056,7 @@ static void path_creds(void)
         return;
     }
 
-    /* VM_DONTCOPY: the parent leaves this ring unmapped, the child maps it. */
+    // VM_DONTCOPY: the parent leaves this ring unmapped, the child maps it.
     if (ring_open(&m, 32, 64, 8192, 4, 8) != 0) {
         check(0, "a ring for the path creds child");
     } else {
@@ -2066,10 +2066,10 @@ static void path_creds(void)
         if (pid < 0 || waitpid(pid, &st, 0) != pid) {
             check(0, "fork the path creds child");
         } else {
-            /* 5 truncate, 6 utimes, 7 touch, 8 readlink, 9 statx, 10 mkdir,
-             * 11 symlink, 12 and 13 the same two where the lookup succeeds,
-             * 14 unlink, 15 rmdir, 16 unlink behind the unreachable one,
-             * 17 rename. */
+            // 5 truncate, 6 utimes, 7 touch, 8 readlink, 9 statx, 10 mkdir,
+            // 11 symlink, 12 and 13 the same two where the lookup succeeds,
+            // 14 unlink, 15 rmdir, 16 unlink behind the unreachable one,
+            // 17 rename.
             check(WIFEXITED(st) && WEXITSTATUS(st) == 0,
                   "every unprivileged path op is refused");
             if (WIFEXITED(st) && WEXITSTATUS(st) != 0)
@@ -2085,10 +2085,10 @@ static void path_creds(void)
     unlink(TRFILE);
 }
 
-/* Heavy: a page-backed symlink's get_link takes a folio reference and the
- * delayed call is the only thing that puts it back. kmemleak cannot see that —
- * the page is still referenced, just for ever — so the instrument is MemFree,
- * with each link unlinked so its page would otherwise be freed. */
+// Heavy: a page-backed symlink's get_link takes a folio reference and the
+// delayed call is the only thing that puts it back. kmemleak cannot see that —
+// the page is still referenced, just for ever — so the instrument is MemFree,
+// with each link unlinked so its page would otherwise be freed.
 #define LEAKLINKS 4000u
 
 static void path_readlink_leak(void)
@@ -2111,7 +2111,7 @@ static void path_readlink_leak(void)
     }
     check(made == LEAKLINKS && ok, "4,000 readlinks of page-backed symlinks");
 
-    /* Each leak is one page; the loop's own churn is the noise floor. */
+    // Each leak is one page; the loop's own churn is the noise floor.
     after = mem_free_kb();
     note("MemFree %ld -> %ld kB (%ld)", before, after, before - after);
     check(before > 0 && after > 0 && before - after < (long)LEAKLINKS * 2,
@@ -2145,7 +2145,7 @@ void sec_delay(void)
     unsigned i, completed = 0;
     int ret, ok;
 
-    /* 1. Concurrent, not serial. */
+    // 1. Concurrent, not serial.
     for (i = 0; i < 4; i++)
         sqe_delay(&sq[i], 0x1000 + i, 50 * MS);
     enter_init(&e, sq, 4, cq, 8);
@@ -2163,7 +2163,7 @@ void sec_delay(void)
             ok = 0;
     check(ok, "  each completes res 0, and every user_data comes back");
 
-    /* 2. timeout_ns caps the wait; min_complete decides whether to wait. */
+    // 2. timeout_ns caps the wait; min_complete decides whether to wait.
     sqe_delay(&sq[0], 0x2000, 2000 * MS);
     enter_init(&e, sq, 1, cq, 8);
     e.min_complete = 1;
@@ -2184,7 +2184,7 @@ void sec_delay(void)
     check(submit(R.fd, sq, 1, cq, 8, 2, &completed) == 1 && completed == 2,
           "  and the delay can be cancelled rather than waited out");
 
-    /* 3. Unreachable means inflight == 0, not len == 0 && inflight == 0. */
+    // 3. Unreachable means inflight == 0, not len == 0 && inflight == 0.
     sqe_nop(&sq[0], 0x3000);
     t0  = now_ms();
     ret = submit(R.fd, sq, 1, cq, 8, 3, &completed);
@@ -2198,7 +2198,7 @@ void sec_delay(void)
     dt             = now_ms() - t0;
     check(ret == 0 && e.completed == 0 && dt < 200, "  and an idle ring returns at once");
 
-    /* 4. DELAY_NS reads only off. */
+    // 4. DELAY_NS reads only off.
     sqe_delay(&sq[0], 0x4000, MS);
     sq[0].len = 1;
     check_res(run_one(R.fd, &sq[0]), -EINVAL, "DELAY_NS with a non-zero len is EINVAL");
@@ -2209,7 +2209,7 @@ void sec_delay(void)
     sq[0].slot = 1;
     check_res(run_one(R.fd, &sq[0]), -EINVAL, "  a non-zero slot is EINVAL");
 
-    /* 5. Both sides of the cap; the accepted one can only be cancelled. */
+    // 5. Both sides of the cap; the accepted one can only be cancelled.
     memset(&p, 0, sizeof(p));
     if (ioctl(R.fd, KORU_IOC_GET_PARAMS, &p) == 0 && p.max_delay_ns > 0) {
         sqe_delay(&sq[0], 0x5000, p.max_delay_ns);
@@ -2225,8 +2225,8 @@ void sec_delay(void)
     }
 }
 
-/* Only the elapsed time distinguishes a real dequeue: the res values are the
- * same either way. */
+// Only the elapsed time distinguishes a real dequeue: the res values are the
+// same either way.
 
 void sec_cancel(void)
 {
@@ -2237,7 +2237,7 @@ void sec_cancel(void)
     uint64_t t0, elapsed;
     int ret;
 
-    /* cq_space 0, so the cancel's own ENTER reaps both completions. */
+    // cq_space 0, so the cancel's own ENTER reaps both completions.
     sqe_delay(&sq[0], 0x10, 2000 * MS);
     check(submit(R.fd, sq, 1, cq, 0, 0, &completed) == 1 && completed == 0,
           "a 2 s DELAY_NS is queued");
@@ -2260,7 +2260,7 @@ void sec_cancel(void)
     if (elapsed >= 500)
         note("elapsed %llu ms", (unsigned long long)elapsed);
 
-    /* Rejections. */
+    // Rejections.
     sqe_cancel(&sq[0], 0xdeadbeef, 0x20);
     check_res(run_one(R.fd, &sq[0]), -ENOENT, "CANCEL of an unknown user_data is ENOENT");
     sqe_nop(&sq[0], 0x21);
@@ -2280,7 +2280,7 @@ void sec_cancel(void)
     sq[0].handle = 1;
     check_res(run_one(R.fd, &sq[0]), -EINVAL, "  a non-zero handle is EINVAL");
 
-    /* A cancelled op must release its slot. */
+    // A cancelled op must release its slot.
     memset(R.arena + 2 * (size_t)R.slot_size, 0xa5, R.slot_size);
     sqe_checksum(&sq[0], 2, 0, R.slot_size, 0x40);
     if (submit(R.fd, sq, 1, cq, 0, 0, &completed) == 1) {
@@ -2292,14 +2292,14 @@ void sec_cancel(void)
     }
 }
 
-/* ------------------------------------------------------------------------- */
+// ---------------------------------------------------------------------------
 
 static void sigint_noop(int sig)
 {
     (void)sig;
 }
 
-/* Block in ENTER, then die as told. The pipe is the readiness signal. */
+// Block in ENTER, then die as told. The pipe is the readiness signal.
 static void blocked_child(int wfd, int catch_sigint, uint64_t ns)
 {
     struct koru_ring m;
@@ -2319,13 +2319,13 @@ static void blocked_child(int wfd, int catch_sigint, uint64_t ns)
         _exit(2);
     r = ioctl(m.fd, KORU_IOC_ENTER, &e);
     if (!catch_sigint)
-        _exit(0); /* SIGKILL case: getting here at all is a failure */
+        _exit(0); // SIGKILL case: getting here at all is a failure
     if (r >= 0)
         _exit(3);
     if (errno != EINTR)
         _exit(4);
     if (e.submitted != 1)
-        _exit(5); /* EINTR must still report what it consumed */
+        _exit(5); // EINTR must still report what it consumed
     _exit(0);
 }
 
@@ -2369,8 +2369,8 @@ void sec_signals(void)
     close(pipefd[1]);
 }
 
-/* OPEN resolves in the submitting task's context. In a kworker current_cred()
- * would be init_cred and this would succeed. */
+// OPEN resolves in the submitting task's context. In a kworker current_cred()
+// would be init_cred and this would succeed.
 
 static int creds_child(struct koru_ring *m)
 {
@@ -2380,7 +2380,7 @@ static int creds_child(struct koru_ring *m)
     int64_t r;
     int bad = 0;
 
-    /* VM_DONTCOPY: the parent leaves this ring unmapped, the child maps it. */
+    // VM_DONTCOPY: the parent leaves this ring unmapped, the child maps it.
     if (ring_map(m) != 0)
         return 2;
     if (setgroups(0, NULL) != 0 || setresgid(nogroup, nogroup, nogroup) != 0 ||
@@ -2441,13 +2441,13 @@ void sec_creds(void)
     ring_close(&m);
 }
 
-/* T22: a one-shot poll, armed on the file's own waitqueue. */
+// T22: a one-shot poll, armed on the file's own waitqueue.
 
 #define POLLFIFO "/tmp/koru-check-pollfifo"
 
 static void poll_udp(void);
 
-/* An armed poll must produce nothing until its event arrives. */
+// An armed poll must produce nothing until its event arrives.
 static int poll_quiet(struct koru_ring *r, struct koru_cqe *cq, unsigned space)
 {
     struct koru_enter e;
@@ -2462,7 +2462,7 @@ static int poll_quiet(struct koru_ring *r, struct koru_cqe *cq, unsigned space)
     return (int)e.completed;
 }
 
-/* Wait for one completion, up to a second. */
+// Wait for one completion, up to a second.
 static int poll_wait_one(struct koru_ring *r, struct koru_cqe *cq, unsigned space)
 {
     struct koru_enter e;
@@ -2477,8 +2477,8 @@ static int poll_wait_one(struct koru_ring *r, struct koru_cqe *cq, unsigned spac
     return (int)e.completed;
 }
 
-/* Arm on `handle`, then have `poke` make it ready. The FIFO and the socket
- * differ in exactly one thing: a socket wakes from softirq. */
+// Arm on `handle`, then have `poke` make it ready. The FIFO and the socket
+// differ in exactly one thing: a socket wakes from softirq.
 static void poll_stream(struct koru_ring *r, int64_t h, int poke, const char *what)
 {
     struct koru_sqe sq[1];
@@ -2513,7 +2513,7 @@ void sec_poll(void)
     int64_t h;
     uint8_t buf[8];
 
-    /* 1. A regular file has no poll method, so it is always ready. */
+    // 1. A regular file has no poll method, so it is always ready.
     h = r_open(&R, PATH_SLOT, PATFILE, KORU_O_RDONLY);
     check(h > 0, "OPEN a regular file");
     if (h > 0) {
@@ -2523,7 +2523,7 @@ void sec_poll(void)
         sqe_poll(&sq[0], (uint32_t)h, KORU_POLL_OUT, 0x201);
         check_res(run_one(R.fd, &sq[0]), KORU_POLL_OUT, "  and writable, from the default mask");
 
-        /* Rejection matrix. */
+        // Rejection matrix.
         sqe_poll(&sq[0], (uint32_t)h, KORU_POLL_IN, 0x202);
         sq[0].off = 1;
         check_res(run_one(R.fd, &sq[0]), -EINVAL, "  POLL_ADD with a non-zero off is EINVAL");
@@ -2539,7 +2539,7 @@ void sec_poll(void)
     sqe_poll(&sq[0], 0, KORU_POLL_IN, 0x206);
     check_res(run_one(R.fd, &sq[0]), -EBADF, "POLL_ADD on a zero handle is EBADF");
 
-    /* 2. A FIFO: read-only, so pipe_poll asks for one waitqueue. */
+    // 2. A FIFO: read-only, so pipe_poll asks for one waitqueue.
     unlink(POLLFIFO);
     if (mkfifo(POLLFIFO, 0600) != 0) {
         check(0, "create the poll FIFO");
@@ -2552,7 +2552,7 @@ void sec_poll(void)
         poll_stream(&R, h, peer, "FIFO");
         check(read(peer, buf, sizeof(buf)) == 1, "  and the byte is still there to read");
 
-        /* 3. Cancel an armed poll. Nothing may complete afterwards. */
+        // 3. Cancel an armed poll. Nothing may complete afterwards.
         sqe_poll(&sq[0], (uint32_t)h, KORU_POLL_IN, 0x310);
         check(submit(R.fd, sq, 1, cq, 0, 0, &completed) == 1, "arm a second poll on the FIFO");
         sqe_cancel(&sq[0], 0x310, 0x311);
@@ -2566,15 +2566,15 @@ void sec_poll(void)
         } else {
             check(0, "  both CQEs carry their own user_data");
         }
-        /* Without remove_wait_queue this is a use-after-free; without the
-         * token it is a second completion, which breaks C1. */
+        // Without remove_wait_queue this is a use-after-free; without the
+        // token it is a second completion, which breaks C1.
         check(write(peer, "x", 1) == 1, "  the peer writes again");
         check(poll_quiet(&R, cq, 8) == 0, "  and the cancelled poll produces no CQE at all");
         check(read(peer, buf, sizeof(buf)) == 1, "  the byte is still readable");
         check_res(r_close(&R, (uint32_t)h), 0, "  and the handle closes");
     }
 
-    /* 4. A pipe opened read-write wants two waitqueues, which is refused. */
+    // 4. A pipe opened read-write wants two waitqueues, which is refused.
     h = r_open(&R, PATH_SLOT, POLLFIFO, KORU_O_RDWR | KORU_O_NONBLOCK);
     check(h > 0, "OPEN the FIFO read-write");
     if (h > 0) {
@@ -2587,8 +2587,8 @@ void sec_poll(void)
         close(peer);
     unlink(POLLFIFO);
 
-    /* 5. A stream socket. Its wake is the writer's own process context, like
-     *    the FIFO's, but it reaches us through the socket layer. */
+    // 5. A stream socket. Its wake is the writer's own process context, like
+    // the FIFO's, but it reaches us through the socket layer.
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) {
         check(0, "create a socketpair");
         return;
@@ -2604,13 +2604,13 @@ void sec_poll(void)
     close(sv[0]);
     close(sv[1]);
 
-    /* 6. A UDP socket on loopback, which is the case the wake-callback rule is
-     *    actually about: the datagram arrives in the NET_RX softirq, so the
-     *    callback runs there rather than in any process's context. */
+    // 6. A UDP socket on loopback, which is the case the wake-callback rule is
+    // actually about: the datagram arrives in the NET_RX softirq, so the
+    // callback runs there rather than in any process's context.
     poll_udp();
 }
 
-/* Bind a UDP socket on loopback and report where. */
+// Bind a UDP socket on loopback and report where.
 static int udp_bind(struct sockaddr_in *addr)
 {
     socklen_t len = sizeof(*addr);
@@ -2668,16 +2668,16 @@ static void poll_udp(void)
     close(tx);
 }
 
-/* ---------------------------------------------------------------------------
- * T29: READDIR. The first opcode that moves shared per-file state.
- * ------------------------------------------------------------------------ */
+// ---------------------------------------------------------------------------
+// T29: READDIR. The first opcode that moves shared per-file state.
+// ---------------------------------------------------------------------------
 
 #define DIRPATH  "/tmp/koru-check-dir"
 #define DIRCOUNT 500u
-/* Small enough that 500 entries need several rounds. */
+// Small enough that 500 entries need several rounds.
 #define DIRBUDGET 4096u
 
-/* One decoded entry. The name is bounded by what this test creates. */
+// One decoded entry. The name is bounded by what this test creates.
 struct dent {
     uint64_t ino, cookie;
     uint16_t reclen, namelen;
@@ -2685,7 +2685,7 @@ struct dent {
     char name[64];
 };
 
-/* Decode `bytes` of records in `slot`. -1 means malformed, which is a finding. */
+// Decode `bytes` of records in `slot`. -1 means malformed, which is a finding.
 static int dents_decode(uint32_t slot, int64_t bytes, struct dent *out, int max)
 {
     const uint8_t *p = R.arena + (size_t)slot * R.slot_size;
@@ -2706,7 +2706,7 @@ static int dents_decode(uint32_t slot, int64_t bytes, struct dent *out, int max)
             return -1;
         if (h.namelen >= sizeof(out[n].name))
             return -1;
-        /* The NUL the ABI promises, and the length that is authoritative. */
+        // The NUL the ABI promises, and the length that is authoritative.
         if (p[at + sizeof(h) + h.namelen] != 0)
             return -1;
         out[n].ino     = h.ino;
@@ -2750,7 +2750,7 @@ static int name_cmp(const void *a, const void *b)
     return strcmp(((const struct dent *)a)->name, ((const struct dent *)b)->name);
 }
 
-/* Every name in DIRPATH, through readdir(3), sorted. */
+// Every name in DIRPATH, through readdir(3), sorted.
 static int host_names(struct dent *out, int max)
 {
     DIR *d = opendir(DIRPATH);
@@ -2799,8 +2799,8 @@ static void remove_dir_entries(void)
     rmdir(DIRPATH);
 }
 
-/* Read the whole directory in rounds, following the cookie. Returns the count
- * or -1, and fills `out`. */
+// Read the whole directory in rounds, following the cookie. Returns the count
+// or -1, and fills `out`.
 static int read_all(int64_t h, struct dent *out, int max, unsigned *rounds)
 {
     uint64_t off = 0;
@@ -2816,7 +2816,7 @@ static int read_all(int64_t h, struct dent *out, int max, unsigned *rounds)
         if (res < 0)
             return -1;
         if (res == 0)
-            return n; /* end of directory, as READ reports it */
+            return n; // end of directory, as READ reports it
         k = dents_decode(1, res, batch, 128);
         if (k <= 0)
             return -1;
@@ -2855,7 +2855,7 @@ void sec_readdir(void)
         return;
     }
 
-    /* 1. The whole directory, as a set, against readdir(3). */
+    // 1. The whole directory, as a set, against readdir(3).
     n  = read_all(h, got, (int)(DIRCOUNT + 8), &rounds);
     hn = host_names(want, (int)(DIRCOUNT + 8));
     check(n == hn && n == (int)DIRCOUNT + 2, "READDIR sees every entry, dot and dot-dot too");
@@ -2872,7 +2872,7 @@ void sec_readdir(void)
     if (!ok && n > 0 && n == hn)
         note("first mismatch near %s / %s", got[0].name, want[0].name);
 
-    /* 2. An entry's own cookie must resume after it, not at it. */
+    // 2. An entry's own cookie must resume after it, not at it.
     res = r_readdir((uint32_t)h, 1, 0, DIRBUDGET, &next, NULL);
     n   = res > 0 ? dents_decode(1, res, got, (int)(DIRCOUNT + 8)) : -1;
     check(n > 2, "a first round returns entries");
@@ -2887,7 +2887,7 @@ void sec_readdir(void)
               "  an entry's cookie resumes at the one after it");
     }
 
-    /* 3. A budget too small for one entry is EINVAL, never 0: 0 is the end. */
+    // 3. A budget too small for one entry is EINVAL, never 0: 0 is the end.
     check_res(r_readdir((uint32_t)h, 1, 0, 8, NULL, NULL), -EINVAL,
               "a budget too small for one entry is EINVAL");
     check_res(r_readdir((uint32_t)h, 1, 0, 0, NULL, NULL), -EINVAL, "  a zero budget is EINVAL");
@@ -2897,13 +2897,13 @@ void sec_readdir(void)
               "  a slot past the arena is EINVAL");
     check_res(r_readdir(0, 1, 0, DIRBUDGET, NULL, NULL), -EBADF, "  handle 0 is EBADF");
 
-    /* 4. Reading to the end reports 0, and no flag is set on a sane tmpfs. */
+    // 4. Reading to the end reports 0, and no flag is set on a sane tmpfs.
     n = read_all(h, got, (int)(DIRCOUNT + 8), &rounds);
     check(n == (int)DIRCOUNT + 2, "a second full pass sees the same count");
     check(r_readdir((uint32_t)h, 1, next, DIRBUDGET, NULL, &flags) >= 0 && flags == 0,
           "  and no entry was skipped");
 
-    /* 5. Two concurrent READDIRs on one handle: one wins, one gets EBUSY. */
+    // 5. Two concurrent READDIRs on one handle: one wins, one gets EBUSY.
     memset(&sq[0], 0, sizeof(sq[0]));
     sq[0].opcode    = KORU_OP_READDIR;
     sq[0].handle    = (uint32_t)h;
@@ -2924,11 +2924,11 @@ void sec_readdir(void)
         check((a->res >= 0) + (b->res >= 0) == 1, "  and exactly one reads");
     }
 
-    /* 6. The claims came back: the content check, for a claim never returned. */
+    // 6. The claims came back: the content check, for a claim never returned.
     n = read_all(h, got, (int)(DIRCOUNT + 8), &rounds);
     check(n == (int)DIRCOUNT + 2, "  the handle still iterates the whole directory");
 
-    /* 7. A cancelled READDIR frees both the slot and the handle. */
+    // 7. A cancelled READDIR frees both the slot and the handle.
     memset(&sq[0], 0, sizeof(sq[0]));
     sq[0].opcode    = KORU_OP_READDIR;
     sq[0].handle    = (uint32_t)h;
@@ -2945,7 +2945,7 @@ void sec_readdir(void)
               "  and its handle too");
     }
 
-    /* 8. A non-directory handle is ENOTDIR. */
+    // 8. A non-directory handle is ENOTDIR.
     res = r_open(&R, 0, PATFILE, KORU_O_RDONLY);
     if (res > 0) {
         check_res(r_readdir((uint32_t)res, 1, 0, DIRBUDGET, NULL, NULL), -ENOTDIR,

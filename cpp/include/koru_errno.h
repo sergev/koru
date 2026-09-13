@@ -1,24 +1,23 @@
-/* SPDX-License-Identifier: MIT */
-/*
- * Braam's error vocabulary and the closed set of errnos koru can produce.
- * Hand-written mirror of rust/sys/src/error.rs; scripts/abi.sh diffs the
- * two through the abi_dump binaries.
- *
- * Each row's provenance prose lives in error.rs and is deliberately not
- * mirrored here: it is documentation, not wire format, and diffing it would
- * make a wording change a two-language edit.
- *
- * X-macro rather than an array, so nothing is defined in the header: a
- * static const array in a header is -Wunused-variable in any C translation
- * unit that does not use it.
- */
+// SPDX-License-Identifier: MIT
+//
+// Braam's error vocabulary and the closed set of errnos koru can produce.
+// Hand-written mirror of rust/sys/src/error.rs; scripts/abi.sh diffs the
+// two through the abi_dump binaries.
+//
+// Each row's provenance prose lives in error.rs and is deliberately not
+// mirrored here: it is documentation, not wire format, and diffing it would
+// make a wording change a two-language edit.
+//
+// X-macro rather than an array, so nothing is defined in the header: a
+// static const array in a header is -Wunused-variable in any C translation
+// unit that does not use it.
 
 #ifndef KORU_ERRNO_H
 #define KORU_ERRNO_H
 
-/* The fifteen names, with Braam's wire values. Closed reaches userspace two
- * ways: EPIPE from a write whose reader is gone, and end of file, which is
- * res == 0 and which the read wrapper is what turns into a name. */
+// The fifteen names, with Braam's wire values. Closed reaches userspace two
+// ways: EPIPE from a write whose reader is gone, and end of file, which is
+// res == 0 and which the read wrapper is what turns into a name.
 #define KORU_KIND_TABLE(X) \
     X(Invalid, 1)          \
     X(NoMemory, 2)         \
@@ -40,9 +39,9 @@
 
 enum koru_kind { KORU_KIND_TABLE(KORU_KIND_ENUMERATOR) };
 
-/* Every errno koru can produce, ascending. A value outside this set is a
- * finding. EBUSY, EALREADY, EMFILE, EPROTO and ENOTTY are judgement calls;
- * see doc/Notes.md. asm-generic values: alpha, mips, parisc and sparc differ. */
+// Every errno koru can produce, ascending. A value outside this set is a
+// finding. EBUSY, EALREADY, EMFILE, EPROTO and ENOTTY are judgement calls;
+// see doc/Notes.md. asm-generic values: alpha, mips, parisc and sparc differ.
 #define KORU_ERRNO_TABLE(X)        \
     X(EPERM, 1, Perm)              \
     X(ENOENT, 2, NotFound)         \
@@ -77,4 +76,4 @@ enum koru_kind { KORU_KIND_TABLE(KORU_KIND_ENUMERATOR) };
     X(EALREADY, 114, Again)        \
     X(ECANCELED, 125, Cancelled)
 
-#endif /* KORU_ERRNO_H */
+#endif // KORU_ERRNO_H

@@ -21,12 +21,12 @@
 
 #include "koru_check.h"
 
-/* The only path the fuzzer ever opens for writing, truncates or touches. */
+// The only path the fuzzer ever opens for writing, truncates or touches.
 #define FUZZWRFILE "/tmp/koru-fuzz-write"
-/* Its own symlink, the only one it ever reads. */
+// Its own symlink, the only one it ever reads.
 #define FUZZLINK "/tmp/koru-fuzz-link"
-/* The only directory it ever creates in, emptied by the janitor thread and
- * removed at the end. MKDIR and SYMLINK make objects; nothing else here does. */
+// The only directory it ever creates in, emptied by the janitor thread and
+// removed at the end. MKDIR and SYMLINK make objects; nothing else here does.
 #define FUZZDIR   "/tmp/koru-fuzz-dir"
 #define FUZZNAMES 8u
 
@@ -35,10 +35,10 @@
 #define F_SLOT    4096u
 #define NWORKERS  8
 #define BATCH     8u
-/* The shared data slots, which READ, WRITE and CHECKSUM pick from: eight
- * threads over eight slots collide often, which is what keeps the exclusivity
- * rule exercised. Above them sits one private path slot per thread per batch
- * index, so no two generated SQEs ever share one. */
+// The shared data slots, which READ, WRITE and CHECKSUM pick from: eight
+// threads over eight slots collide often, which is what keeps the exclusivity
+// rule exercised. Above them sits one private path slot per thread per batch
+// index, so no two generated SQEs ever share one.
 #define F_SHARED  8u
 #define F_SLOTS   (F_SHARED + (uint32_t)NWORKERS * BATCH)
 #define F_ARENA   ((uint64_t)F_SLOT * F_SLOTS)
@@ -51,9 +51,9 @@ static atomic_int stop;
 static int fd = -1;
 static uint8_t *arena;
 static uint64_t max_delay_ns;
-static int adoptable = -1; /* read-only, never 0/1/2: see gen_valid */
+static int adoptable = -1; // read-only, never 0/1/2: see gen_valid
 
-/* xorshift64*, per thread so threads never share PRNG state. */
+// xorshift64*, per thread so threads never share PRNG state.
 static uint64_t rnd(uint64_t *s)
 {
     uint64_t x = *s;
@@ -75,16 +75,16 @@ static int one_in(uint64_t *s, uint32_t n)
     return rnd_below(s, n) == 0;
 }
 
-/* Handles harvested from OPEN completions. Shared and racy on purpose. */
+// Handles harvested from OPEN completions. Shared and racy on purpose.
 #define POOL 1024
 static atomic_uint handle_pool[POOL];
 static atomic_uint pool_next;
 
-/* One per opcode, plus a bucket for everything that is not one. */
+// One per opcode, plus a bucket for everything that is not one.
 #define NOPCODES (KORU_OP_READDIR + 2)
 
 static atomic_ullong op_total[NOPCODES], op_ok[NOPCODES];
-/* The last cookie a READDIR returned, fed back in as an off. Racy on purpose. */
+// The last cookie a READDIR returned, fed back in as an off. Racy on purpose.
 static atomic_ullong dir_cookie;
 static atomic_ullong open_einval, open_ebusy, open_emfile, open_other;
 
@@ -93,7 +93,7 @@ static uint32_t pool_pick(uint64_t *s)
     return atomic_load(&handle_pool[rnd_below(s, POOL)]);
 }
 
-/* READ borrows a handle, CLOSE consumes it, so opens and closes stay balanced. */
+// READ borrows a handle, CLOSE consumes it, so opens and closes stay balanced.
 static uint32_t pool_take(uint64_t *s)
 {
     return atomic_exchange(&handle_pool[rnd_below(s, POOL)], 0);
@@ -106,19 +106,19 @@ static void fail(const char *what)
     atomic_store(&stop, 1);
 }
 
-/* `extra` stopped being blanket-zero at T23. Per-opcode from here, or the
- * assertion goes green for the wrong reason. */
+// `extra` stopped being blanket-zero at T23. Per-opcode from here, or the
+// assertion goes green for the wrong reason.
 static int extra_allowed(uint8_t opcode, const struct koru_cqe *c)
 {
     if (opcode == KORU_OP_STAT || opcode == KORU_OP_STATX_AT)
         return c->res >= 0 ? (c->extra & ~(uint64_t)KORU_STAT_ALL) == 0 : c->extra == 0;
-    /* A resume cookie, which is whatever the filesystem's f_pos is. */
+    // A resume cookie, which is whatever the filesystem's f_pos is.
     if (opcode == KORU_OP_READDIR)
         return c->res >= 0 || c->extra == 0;
     return c->extra == 0;
 }
 
-/* And `flags` stopped being blanket-zero at T29, for the same reason. */
+// And `flags` stopped being blanket-zero at T29, for the same reason.
 static int flags_allowed(uint8_t opcode, const struct koru_cqe *c)
 {
     if (opcode == KORU_OP_READDIR)
@@ -126,7 +126,7 @@ static int flags_allowed(uint8_t opcode, const struct koru_cqe *c)
     return c->flags == 0;
 }
 
-/* Every opcode that names a file by path. The fuzzer sandboxes all of them. */
+// Every opcode that names a file by path. The fuzzer sandboxes all of them.
 static int is_path_op(uint8_t op)
 {
     return op == KORU_OP_TRUNCATE || op == KORU_OP_UTIMES || op == KORU_OP_READLINK ||
@@ -134,15 +134,15 @@ static int is_path_op(uint8_t op)
            op == KORU_OP_UNLINK || op == KORU_OP_RMDIR || op == KORU_OP_RENAME;
 }
 
-/* Which per-opcode counter a completion lands in. Never a mask: an unknown
- * opcode aliased into a real bucket would satisfy the reached-once check for an
- * opcode nothing ever submitted. */
+// Which per-opcode counter a completion lands in. Never a mask: an unknown
+// opcode aliased into a real bucket would satisfy the reached-once check for an
+// opcode nothing ever submitted.
 static unsigned op_bucket(uint8_t op)
 {
     return op <= KORU_OP_READDIR ? op : NOPCODES - 1;
 }
 
-/* There is only one Cqe constructor, so any deviation is a real bug. */
+// There is only one Cqe constructor, so any deviation is a real bug.
 static void check_cqe(const struct koru_cqe *c, uint8_t op)
 {
     if (!flags_allowed(op, c) || c->rsvd0 != 0 || !extra_allowed(op, c)) {
@@ -152,7 +152,7 @@ static void check_cqe(const struct koru_cqe *c, uint8_t op)
     }
 }
 
-/* OPEN is open-ended: its errno is whatever filp_open returns. */
+// OPEN is open-ended: its errno is whatever filp_open returns.
 static int res_allowed(uint8_t opcode, int64_t res)
 {
     switch (opcode) {
@@ -181,18 +181,18 @@ static int res_allowed(uint8_t opcode, int64_t res)
         return res >= 0 || res == -EINVAL || res == -EBUSY || res == -ENOMEM || res == -EAGAIN ||
                res == -ECANCELED;
     case KORU_OP_POLL_ADD:
-        /* A regular file is always ready, so res is a mask; anything else is a
-         * rejection. EOPNOTSUPP needs two waitqueues, which none of these have. */
+        // A regular file is always ready, so res is a mask; anything else is a
+        // rejection. EOPNOTSUPP needs two waitqueues, which none of these have.
         return (res >= 0 && res <= KORU_POLL_EVENTS_ALL) || res == -EINVAL || res == -EBADF ||
                res == -ENOMEM || res == -ECANCELED;
     case KORU_OP_STAT:
-        /* Never 0: a zero len is refused, so a success wrote something. */
+        // Never 0: a zero len is refused, so a success wrote something.
         return (res >= 1 && res <= (int64_t)sizeof(struct koru_stat)) || res == -EINVAL ||
                res == -EBADF || res == -EBUSY || res == -ENOMEM || res == -EAGAIN ||
                res == -ECANCELED;
     case KORU_OP_TRUNCATE:
     case KORU_OP_UTIMES:
-        /* Inline, so never cancelled and never deferred. */
+        // Inline, so never cancelled and never deferred.
         return res == 0 || res == -EINVAL || res == -EBUSY || res == -ENOMEM ||
                res == -ENOENT || res == -ENOTDIR || res == -EISDIR || res == -EACCES ||
                res == -EPERM || res == -ELOOP || res == -ENAMETOOLONG;
@@ -201,34 +201,34 @@ static int res_allowed(uint8_t opcode, int64_t res)
                res == -ENOMEM || res == -ENOENT || res == -ENOTDIR || res == -EACCES ||
                res == -ELOOP || res == -ENAMETOOLONG;
     case KORU_OP_STATX_AT:
-        /* The whole struct or nothing: there is no version negotiation here. */
+        // The whole struct or nothing: there is no version negotiation here.
         return res == (int64_t)sizeof(struct koru_stat) || res == -EINVAL || res == -EBUSY ||
                res == -ENOMEM || res == -ENOENT || res == -ENOTDIR || res == -EACCES ||
                res == -ELOOP || res == -ENAMETOOLONG;
     case KORU_OP_MKDIR:
     case KORU_OP_SYMLINK:
-        /* The janitor races these, so EEXIST and ENOENT are both ordinary. */
+        // The janitor races these, so EEXIST and ENOENT are both ordinary.
         return res == 0 || res == -EINVAL || res == -EBUSY || res == -ENOMEM ||
                res == -EEXIST || res == -ENOENT || res == -ENOTDIR || res == -EACCES ||
                res == -EPERM || res == -ELOOP || res == -ENAMETOOLONG || res == -EROFS ||
                res == -ENOSPC || res == -EDQUOT || res == -EMLINK;
     case KORU_OP_UNLINK:
     case KORU_OP_RMDIR:
-        /* The same race the other way: the janitor may have got there first. */
+        // The same race the other way: the janitor may have got there first.
         return res == 0 || res == -EINVAL || res == -EBUSY || res == -ENOMEM ||
                res == -ENOENT || res == -ENOTDIR || res == -EISDIR || res == -ENOTEMPTY ||
                res == -EACCES || res == -EPERM || res == -ELOOP || res == -ENAMETOOLONG ||
                res == -EROFS;
     case KORU_OP_READDIR:
-        /* Its own claim on the handle makes EBUSY ordinary with eight threads;
-         * a budget too small for one entry is EINVAL, never 0. */
+        // Its own claim on the handle makes EBUSY ordinary with eight threads;
+        // a budget too small for one entry is EINVAL, never 0.
         return (res >= 0 && res <= F_SLOT) || res == -EINVAL || res == -EBADF ||
                res == -EBUSY || res == -ENOMEM || res == -ENOTDIR || res == -EACCES ||
                res == -ECANCELED || res == -EIO || res == -EINTR || res == -ESPIPE ||
                res == -ENOENT;
     case KORU_OP_RENAME:
-        /* Both names are inside FUZZDIR, so EXDEV never comes up here; the
-         * deterministic matrix owns that one. */
+        // Both names are inside FUZZDIR, so EXDEV never comes up here; the
+        // deterministic matrix owns that one.
         return res == 0 || res == -EINVAL || res == -EBUSY || res == -ENOMEM ||
                res == -ENOENT || res == -ENOTDIR || res == -EISDIR || res == -ENOTEMPTY ||
                res == -EEXIST || res == -EACCES || res == -EPERM || res == -ELOOP ||
@@ -238,8 +238,8 @@ static int res_allowed(uint8_t opcode, int64_t res)
     }
 }
 
-/* Every ENTER must be accounted, or the C1 sum is wrong. EINTR is the failure
- * that still writes both counts. */
+// Every ENTER must be accounted, or the C1 sum is wrong. EINTR is the failure
+// that still writes both counts.
 static void account(int ret, const struct koru_enter *e)
 {
     if (ret >= 0) {
@@ -252,31 +252,30 @@ static void account(int ret, const struct koru_enter *e)
     }
 }
 
-/* CQEs come back unordered, so the opcode travels in the echoed user_data. */
+// CQEs come back unordered, so the opcode travels in the echoed user_data.
 #define UD(opcode, tag) (((uint64_t)(opcode) << 8) | ((tag) & 0xff))
 #define UD_OPCODE(ud)   ((uint8_t)(((ud) >> 8) & 0xff))
 
-/* Every op that names a file by path, and the whole of the fuzzer's sandbox.
- *
- * It writes the path itself into this thread's private slot and gives the SQE
- * the exact (slot, off, len) for it, so **no path op can ever name anything but
- * the four objects below**. That is structural, not statistical: a borrowed
- * slot or a truncated `len` would hand TRUNCATE or MKDIR some prefix of
- * whatever another thread last wrote, which is how this test once destroyed the
- * check's own pattern file. Rejection coverage for those fields comes from the
- * deterministic matrices, which share the same validation.
- */
+// Every op that names a file by path, and the whole of the fuzzer's sandbox.
+//
+// It writes the path itself into this thread's private slot and gives the SQE
+// the exact (slot, off, len) for it, so **no path op can ever name anything but
+// the four objects below**. That is structural, not statistical: a borrowed
+// slot or a truncated `len` would hand TRUNCATE or MKDIR some prefix of
+// whatever another thread last wrote, which is how this test once destroyed the
+// check's own pattern file. Rejection coverage for those fields comes from the
+// deterministic matrices, which share the same validation.
 static void gen_path(uint64_t *s, struct koru_sqe *q, uint64_t ud, uint32_t path_slot)
 {
-    /* Its own scratch file, its own symlink, a path that resolves nowhere, and
-     * a name inside its own directory. Nothing else. */
+    // Its own scratch file, its own symlink, a path that resolves nowhere, and
+    // a name inside its own directory. Nothing else.
     static const char *const paths[] = { FUZZWRFILE, FUZZLINK, "/tmp/koru-fuzz-no-such" };
     char name[64];
     uint8_t *slot = arena + (size_t)path_slot * F_SLOT;
     uint32_t n;
 
     switch (rnd_below(s, 9)) {
-    case 0: { /* TRUNCATE: only ever its own scratch file. */
+    case 0: { // TRUNCATE: only ever its own scratch file.
         uint64_t size = rnd_below(s, F_SLOT);
 
         n = put_path(arena, F_SLOT, path_slot, paths[rnd_below(s, 3)]);
@@ -284,7 +283,7 @@ static void gen_path(uint64_t *s, struct koru_sqe *q, uint64_t ud, uint32_t path
         sqe_path(q, KORU_OP_TRUNCATE, path_slot, 0, n, ud);
         break;
     }
-    case 1: { /* UTIMES, with nanoseconds in and out of range. */
+    case 1: { // UTIMES, with nanoseconds in and out of range.
         struct koru_times t;
 
         t.atime_sec  = (int64_t)rnd(s);
@@ -304,19 +303,19 @@ static void gen_path(uint64_t *s, struct koru_sqe *q, uint64_t ud, uint32_t path
         n = put_path(arena, F_SLOT, path_slot, paths[rnd_below(s, 3)]);
         sqe_path(q, KORU_OP_STATX_AT, path_slot, 0, n, ud);
         break;
-    case 4: /* MKDIR, inside FUZZDIR, which the janitor keeps emptying. */
+    case 4: // MKDIR, inside FUZZDIR, which the janitor keeps emptying.
         snprintf(name, sizeof(name), FUZZDIR "/c%u", rnd_below(s, FUZZNAMES));
         n = put_path(arena, F_SLOT, path_slot, name);
         sqe_path(q, KORU_OP_MKDIR, path_slot, 0, n, ud);
-        /* The one field a create may have fuzzed: it names no path. */
+        // The one field a create may have fuzzed: it names no path.
         q->handle = one_in(s, 8) ? (uint32_t)rnd(s) : (uint32_t)(rnd(s) & 01777);
         break;
-    case 5: /* SYMLINK, the same name and its own file as the target. */
+    case 5: // SYMLINK, the same name and its own file as the target.
         snprintf(name, sizeof(name), FUZZDIR "/c%u", rnd_below(s, FUZZNAMES));
         n = put_paths(arena, F_SLOT, path_slot, FUZZWRFILE, name);
         sqe_path(q, KORU_OP_SYMLINK, path_slot, 0, n, ud);
         break;
-    case 8: { /* RENAME, both names inside FUZZDIR. */
+    case 8: { // RENAME, both names inside FUZZDIR.
         char to[64];
 
         snprintf(name, sizeof(name), FUZZDIR "/c%u", rnd_below(s, FUZZNAMES));
@@ -325,9 +324,9 @@ static void gen_path(uint64_t *s, struct koru_sqe *q, uint64_t ud, uint32_t path
         sqe_path(q, KORU_OP_RENAME, path_slot, 0, n, ud);
         break;
     }
-    default: /* UNLINK and RMDIR, on the same names and nothing else. Every
-              * non-normal last component too, which only our own check
-              * refuses. */
+    default: // UNLINK and RMDIR, on the same names and nothing else. Every
+             // non-normal last component too, which only our own check
+             // refuses.
         switch (rnd_below(s, 4)) {
         case 0:
             snprintf(name, sizeof(name), FUZZDIR "/.");
@@ -348,12 +347,12 @@ static void gen_path(uint64_t *s, struct koru_sqe *q, uint64_t ud, uint32_t path
     }
 }
 
-/* `path_slot` is private to the calling thread: put_path zeroes the whole slot,
- * so a shared one means every OPEN fails on an embedded NUL. */
+// `path_slot` is private to the calling thread: put_path zeroes the whole slot,
+// so a shared one means every OPEN fails on an embedded NUL.
 static void gen_valid(uint64_t *s, struct koru_sqe *q, uint64_t ud, uint32_t path_slot)
 {
-    /* Never a path slot: a READ landing in one would fill it with file data
-     * that an inline path op is copying out of at that moment. */
+    // Never a path slot: a READ landing in one would fill it with file data
+    // that an inline path op is copying out of at that moment.
     uint32_t slot = rnd_below(s, F_SHARED);
 
     switch (rnd_below(s, 24)) {
@@ -369,12 +368,12 @@ static void gen_valid(uint64_t *s, struct koru_sqe *q, uint64_t ud, uint32_t pat
         const char *path;
         uint32_t flags;
 
-        /* WRFILE is the only path ever opened for writing. A writable handle
-         * plus a random offset would otherwise corrupt whatever it names.
-         * No FIFO here either: the hostile generator can clear O_NONBLOCK,
-         * and filp_open on a peerless FIFO would then hang a worker. */
+        // WRFILE is the only path ever opened for writing. A writable handle
+        // plus a random offset would otherwise corrupt whatever it names.
+        // No FIFO here either: the hostile generator can clear O_NONBLOCK,
+        // and filp_open on a peerless FIFO would then hang a worker.
         if (one_in(s, 4)) {
-            /* A directory, so READDIR has something to iterate. */
+            // A directory, so READDIR has something to iterate.
             sqe_open(q, path_slot, 0, put_path(arena, F_SLOT, path_slot, FUZZDIR),
                      KORU_O_RDONLY | KORU_O_DIRECTORY, ud);
             break;
@@ -387,7 +386,7 @@ static void gen_valid(uint64_t *s, struct koru_sqe *q, uint64_t ud, uint32_t pat
             flags = KORU_O_RDONLY;
         }
         if (one_in(s, 4))
-            flags |= KORU_O_NONBLOCK; /* a no-op on a regular file */
+            flags |= KORU_O_NONBLOCK; // a no-op on a regular file
         sqe_open(q, path_slot, 0, put_path(arena, F_SLOT, path_slot, path), flags, ud);
         break;
     }
@@ -398,7 +397,7 @@ static void gen_valid(uint64_t *s, struct koru_sqe *q, uint64_t ud, uint32_t pat
         break;
     case 7:
     case 8:
-        /* A read-only handle here is a fine outcome: EBADF. */
+        // A read-only handle here is a fine outcome: EBADF.
         sqe_write(q, one_in(s, 4) ? (uint32_t)rnd(s) : pool_pick(s), slot, rnd_below(s, PATSIZE),
                   1 + rnd_below(s, F_SLOT), ud);
         break;
@@ -411,9 +410,9 @@ static void gen_valid(uint64_t *s, struct koru_sqe *q, uint64_t ud, uint32_t pat
         sqe_cancel(q, UD(KORU_OP_DELAY_NS, rnd(s)), ud);
         break;
     case 13:
-        /* Only a read-only scratch fd, the ring itself (ELOOP) and a number
-         * that is no fd at all. Never 0, 1 or 2: an adopted stdout plus a
-         * random WRITE would shred the check's own output. */
+        // Only a read-only scratch fd, the ring itself (ELOOP) and a number
+        // that is no fd at all. Never 0, 1 or 2: an adopted stdout plus a
+        // random WRITE would shred the check's own output.
         switch (rnd_below(s, 3)) {
         case 0:
             sqe_adopt(q, adoptable, ud);
@@ -427,15 +426,15 @@ static void gen_valid(uint64_t *s, struct koru_sqe *q, uint64_t ud, uint32_t pat
         }
         break;
     case 14:
-        /* Only ever a regular file or a bad handle, so a poll here is always
-         * ready or refused and none is left armed holding a reservation. The
-         * FIFO stays out for the reason the OPEN arm does. */
+        // Only ever a regular file or a bad handle, so a poll here is always
+        // ready or refused and none is left armed holding a reservation. The
+        // FIFO stays out for the reason the OPEN arm does.
         sqe_poll(q, one_in(s, 4) ? (uint32_t)rnd(s) : pool_pick(s),
                  one_in(s, 8) ? (uint32_t)rnd(s) : (1u + rnd_below(s, KORU_POLL_EVENTS_ALL)), ud);
         break;
     case 21: {
-        /* Mostly a regular file's handle, which is ENOTDIR; sometimes a real
-         * directory. The cookie is whatever the last one returned, or junk. */
+        // Mostly a regular file's handle, which is ENOTDIR; sometimes a real
+        // directory. The cookie is whatever the last one returned, or junk.
         struct koru_sqe *d = q;
 
         memset(d, 0, sizeof(*d));
@@ -448,8 +447,8 @@ static void gen_valid(uint64_t *s, struct koru_sqe *q, uint64_t ud, uint32_t pat
         break;
     }
     case 15:
-        /* Aligned by construction; the hostile generator's random off is what
-         * probes the rejection. */
+        // Aligned by construction; the hostile generator's random off is what
+        // probes the rejection.
         sqe_stat(q, one_in(s, 4) ? (uint32_t)rnd(s) : pool_pick(s), slot, 8 * rnd_below(s, 8),
                  1 + rnd_below(s, 512), ud);
         break;
@@ -466,8 +465,8 @@ static void gen_valid(uint64_t *s, struct koru_sqe *q, uint64_t ud, uint32_t pat
     }
 }
 
-/* Every field the opcode does not read, every boundary, and opcodes that do not
- * exist. */
+// Every field the opcode does not read, every boundary, and opcodes that do not
+// exist.
 static void gen_hostile(uint64_t *s, struct koru_sqe *q, uint64_t ud, uint32_t path_slot)
 {
     gen_valid(s, q, ud, path_slot);
@@ -489,12 +488,12 @@ static void gen_hostile(uint64_t *s, struct koru_sqe *q, uint64_t ud, uint32_t p
         q->len = F_SLOT + rnd_below(s, 8);
         break;
     case 5:
-        q->len = 4095 + rnd_below(s, 3); /* the PATH_MAX boundary */
+        q->len = 4095 + rnd_below(s, 3); // the PATH_MAX boundary
         break;
     case 6:
-        /* Past the count, past it but inside the bitmap's last word, and
-         * absurd. Never a slot that exists: that would point an op at another
-         * thread's path while the kernel is copying it. */
+        // Past the count, past it but inside the bitmap's last word, and
+        // absurd. Never a slot that exists: that would point an op at another
+        // thread's path while the kernel is copying it.
         switch (rnd_below(s, 3)) {
         case 0:
             q->slot = F_SLOTS + rnd_below(s, 4);
@@ -512,10 +511,10 @@ static void gen_hostile(uint64_t *s, struct koru_sqe *q, uint64_t ud, uint32_t p
         break;
     case 8:
         q->opcode = KORU_OP_OPEN;
-        q->handle = 3 | (rnd(s) & 0xf0); /* accmode 3, unknown flag bits */
+        q->handle = 3 | (rnd(s) & 0xf0); // accmode 3, unknown flag bits
         break;
     case 9:
-        /* Strictly over the cap: an accepted long delay bricks the ring. */
+        // Strictly over the cap: an accepted long delay bricks the ring.
         q->opcode = KORU_OP_DELAY_NS;
         q->off    = max_delay_ns + 1 + rnd_below(s, 4);
         break;
@@ -527,18 +526,17 @@ static void gen_hostile(uint64_t *s, struct koru_sqe *q, uint64_t ud, uint32_t p
         break;
     }
 
-    /* The sandbox is not negotiable: a mutated `slot`, `off` or `len` would
-     * point a path op at whatever another thread last wrote, and a random
-     * opcode byte can land on one of them too. Regenerate rather than submit
-     * it. See `gen_path`.
-     */
+    // The sandbox is not negotiable: a mutated `slot`, `off` or `len` would
+    // point a path op at whatever another thread last wrote, and a random
+    // opcode byte can land on one of them too. Regenerate rather than submit
+    // it. See `gen_path`.
     if (is_path_op(q->opcode))
         gen_path(s, q, ud, path_slot);
 }
 
 struct wctx {
     uint64_t seed;
-    uint32_t slot0; /* this thread's first private path slot */
+    uint32_t slot0; // this thread's first private path slot
 };
 
 static void *worker(void *arg)
@@ -557,17 +555,17 @@ static void *worker(void *arg)
 
         for (i = 0; i < n; i++) {
             uint64_t tag = rnd(&seed);
-            /* Its own slot per batch index: a generator writes the path as a
-             * side effect, so two SQEs sharing one would leave the first
-             * naming the second's path cut to its own `len`. That is how a
-             * MKDIR once created a truncated prefix of the pattern file. */
+            // Its own slot per batch index: a generator writes the path as a
+            // side effect, so two SQEs sharing one would leave the first
+            // naming the second's path cut to its own `len`. That is how a
+            // MKDIR once created a truncated prefix of the pattern file.
             uint32_t path_slot = w->slot0 + i;
 
             if (one_in(&seed, 3))
                 gen_hostile(&seed, &sq[i], tag, path_slot);
             else
                 gen_valid(&seed, &sq[i], tag, path_slot);
-            /* Stamped last: the hostile generator may have changed the opcode. */
+            // Stamped last: the hostile generator may have changed the opcode.
             sq[i].user_data = UD(sq[i].opcode, tag);
         }
 
@@ -577,7 +575,7 @@ static void *worker(void *arg)
         e.to_submit    = n;
         e.cq_space     = space;
         e.min_complete = rnd_below(&seed, space + 1);
-        /* Always bounded: an unsatisfied unbounded wait stalls this thread. */
+        // Always bounded: an unsatisfied unbounded wait stalls this thread.
         e.timeout_ns = (rnd_below(&seed, 5) + 1) * MS;
         if (one_in(&seed, 64))
             e.flags = (uint32_t)rnd(&seed);
@@ -641,7 +639,7 @@ static void *worker(void *arg)
     return NULL;
 }
 
-/* A buffer whose second page is unmapped, so a copy off the end faults. */
+// A buffer whose second page is unmapped, so a copy off the end faults.
 static uint8_t *guard_buf(size_t *usable)
 {
     long pg = sysconf(_SC_PAGESIZE);
@@ -658,7 +656,7 @@ static uint8_t *guard_buf(size_t *usable)
     return p;
 }
 
-/* Faulting SQ/CQ buffers, malformed ioctls and rival SETUPs. */
+// Faulting SQ/CQ buffers, malformed ioctls and rival SETUPs.
 static void *chaos(void *arg)
 {
     uint64_t seed  = *(uint64_t *)arg;
@@ -671,8 +669,8 @@ static void *chaos(void *arg)
         if (guard) {
             size_t off = usable - rnd_below(&seed, 96);
 
-            /* cq_space 0: a CQE this thread swallows is one the workers never
-             * see, and a swallowed OPEN handle fills the table. */
+            // cq_space 0: a CQE this thread swallows is one the workers never
+            // see, and a swallowed OPEN handle fills the table.
             memset(&e, 0, sizeof(e));
             e.sq_addr   = (uint64_t)(uintptr_t)(guard + off);
             e.to_submit = 1 + rnd_below(&seed, 8);
@@ -680,7 +678,7 @@ static void *chaos(void *arg)
             memset(guard + off, 0, usable - off);
             account(ioctl(fd, KORU_IOC_ENTER, &e), &e);
 
-            /* A CQ array that faults partway must leave the rest queued. */
+            // A CQ array that faults partway must leave the rest queued.
             memset(&e, 0, sizeof(e));
             e.cq_addr  = (uint64_t)(uintptr_t)(guard + usable - 16);
             e.cq_space = 1 + rnd_below(&seed, 4);
@@ -732,8 +730,8 @@ static void *chaos(void *arg)
     return NULL;
 }
 
-/* Its own ring, unmapped under in-flight work, then a clean exit or a SIGKILL.
- * This is what drives release() under load. */
+// Its own ring, unmapped under in-flight work, then a clean exit or a SIGKILL.
+// This is what drives release() under load.
 static void child_body(uint64_t seed)
 {
     struct koru_sqe sq[BATCH];
@@ -756,14 +754,14 @@ static void child_body(uint64_t seed)
     p.slot_count   = F_SLOTS;
     p.handle_count = one_in(&seed, 8) ? rnd_below(&seed, 9000) : F_HANDLES;
     if (ioctl(cfd, KORU_IOC_SETUP, &p) != 0)
-        _exit(0); /* a rejected SETUP is a fine outcome */
+        _exit(0); // a rejected SETUP is a fine outcome
 
     a = mmap(NULL, F_ARENA, PROT_READ | PROT_WRITE, MAP_SHARED, cfd, 0);
     if (a == MAP_FAILED)
         _exit(0);
     put_path(a, F_SLOT, 0, PATFILE);
 
-    /* One private path slot per SQE, as the workers have. */
+    // One private path slot per SQE, as the workers have.
     for (i = 0; i < BATCH; i++)
         gen_valid(&seed, &sq[i], i, F_SHARED + i);
     sqe_delay(&sq[0], 0x100, (rnd_below(&seed, 500) + 100) * MS);
@@ -786,10 +784,10 @@ static void child_body(uint64_t seed)
         pause();
 }
 
-/* Empties FUZZDIR, so a name is sometimes free and sometimes taken and both
- * outcomes of a create are reached. Racing the kernel ops on purpose. Slow
- * enough since T27 that koru's own UNLINK and RMDIR get some of the removals:
- * a janitor that swept every millisecond left them nothing to find. */
+// Empties FUZZDIR, so a name is sometimes free and sometimes taken and both
+// outcomes of a create are reached. Racing the kernel ops on purpose. Slow
+// enough since T27 that koru's own UNLINK and RMDIR get some of the removals:
+// a janitor that swept every millisecond left them nothing to find.
 static void *janitor(void *arg)
 {
     uint64_t seed = *(uint64_t *)arg;
@@ -827,7 +825,7 @@ static void *spawner(void *arg)
     return NULL;
 }
 
-/* No SA_RESTART, so a blocked ENTER returns EINTR. */
+// No SA_RESTART, so a blocked ENTER returns EINTR.
 static void usr1(int sig)
 {
     (void)sig;
@@ -920,7 +918,7 @@ int fuzz_main(unsigned secs, uint64_t seed)
 
     for (i = 0; i < NWORKERS; i++) {
         wc[i].seed  = seed + (uint64_t)i * 0x9e3779b97f4a7c15ull;
-        wc[i].slot0 = F_SHARED + (uint32_t)i * BATCH; /* BATCH private slots */
+        wc[i].slot0 = F_SHARED + (uint32_t)i * BATCH; // BATCH private slots
         pthread_create(&th[nth], NULL, worker, &wc[i]);
         nth++;
     }
@@ -964,7 +962,7 @@ int fuzz_main(unsigned secs, uint64_t seed)
              (unsigned long long)atomic_load(&open_other));
 
         check(sub > SUB_FLOOR, "the fuzzer actually exercised the ring");
-        /* Completion, not success: the tail sections carry that claim. */
+        // Completion, not success: the tail sections carry that claim.
         reached = 1;
         for (op = 0; op <= KORU_OP_READDIR; op++)
             if (atomic_load(&op_total[op]) == 0) {

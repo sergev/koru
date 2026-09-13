@@ -23,7 +23,7 @@
 #define OPEN_ITERS   500
 #define READ_ITERS   400
 #define CANCEL_ITERS 300
-/* Longer: this is the only loop that reaches the -EALREADY window. */
+// Longer: this is the only loop that reaches the -EALREADY window.
 #define ALREADY_ITERS   1000
 #define POLL_RACE_ITERS 1000
 #define LEAK_ITERS    200
@@ -44,7 +44,7 @@ void sec_devchurn(void)
     check(!bad, "2000 open/close cycles on /dev/koru");
 }
 
-/* A third abandoned with work still queued. The largest churn in the run. */
+// A third abandoned with work still queued. The largest churn in the run.
 void sec_ringchurn(void)
 {
     struct koru_ring m;
@@ -54,7 +54,7 @@ void sec_ringchurn(void)
     int i, bad = 0, in_flight = 0;
 
     for (i = 0; i < RING_ITERS && !bad; i++) {
-        uint32_t slots = 4 + (unsigned)i % 5; /* rotate the geometry */
+        uint32_t slots = 4 + (unsigned)i % 5; // rotate the geometry
 
         if (ring_open(&m, 32, 64, 4096, slots, 8) != 0 || ring_map(&m) != 0) {
             bad = 1;
@@ -69,7 +69,7 @@ void sec_ringchurn(void)
                 bad = 1;
             break;
         case 1: {
-            /* A queued READ: release() must drain the handle table too. */
+            // A queued READ: release() must drain the handle table too.
             int64_t h = r_open(&m, 0, PATFILE, KORU_O_RDONLY);
 
             if (h > 0) {
@@ -82,7 +82,7 @@ void sec_ringchurn(void)
             break;
         }
         default:
-            /* Long enough that close() must cancel, not wait it out. */
+            // Long enough that close() must cancel, not wait it out.
             sqe_delay(&sq[0], 0x13, 500 * MS);
             if (submit(m.fd, sq, 1, cq, 0, 0, &completed) != 1)
                 bad = 1;
@@ -95,8 +95,8 @@ void sec_ringchurn(void)
     check_ge(in_flight, 150, "  most torn down with work still queued");
 }
 
-/* The 2 s delay keeps the ring's Arc alive across the close, so release() has
- * to drain the handle table explicitly. */
+// The 2 s delay keeps the ring's Arc alive across the close, so release() has
+// to drain the handle table explicitly.
 static void drain_test(void)
 {
     struct koru_ring m;
@@ -129,7 +129,7 @@ static void drain_test(void)
         note("file-nr %ld -> %ld -> %ld", before, during, after);
 }
 
-/* kmemleak cannot see a leaked handle: our own table still references it. */
+// kmemleak cannot see a leaked handle: our own table still references it.
 void sec_handles(void)
 {
     long before, after;
@@ -158,10 +158,10 @@ void sec_handles(void)
     drain_test();
 }
 
-/* ------------------------------------------------------------------------- */
+// ---------------------------------------------------------------------------
 
-/* CLOSE runs inline while the READ is still queued, which is why the work item
- * owns an ARef resolved at submit time. */
+// CLOSE runs inline while the READ is still queued, which is why the work item
+// owns an ARef resolved at submit time.
 static void read_race(void)
 {
     struct koru_sqe sq[2];
@@ -205,8 +205,8 @@ static void read_race(void)
     note("CLOSE completed before the READ in %d of %d", close_first, READ_ITERS);
 }
 
-/* An armed timer leaves the op queued and the cancel wins; delay_ns 0 lets a
- * worker beat it. Arms are reported, not gated: doc/Notes.md. */
+// An armed timer leaves the op queued and the cancel wins; delay_ns 0 lets a
+// worker beat it. Arms are reported, not gated: doc/Notes.md.
 static void cancel_race(uint64_t delay_ns, int want_ok, int want_enoent, const char *what)
 {
     struct koru_sqe sq[1];
@@ -254,8 +254,8 @@ static void cancel_race(uint64_t delay_ns, int want_ok, int want_enoent, const c
     check(!bad_cancel, "  the canceller is only ever 0, EALREADY or ENOENT");
     check(!bad_target, "  the target is only ever 0 or ECANCELED");
     check(n_ok + n_already + n_enoent == CANCEL_ITERS, "  every round is accounted for");
-    /* Gate only the arms this shape actually reaches, so a loop that stops
-     * reaching them fails instead of passing silently. */
+    // Gate only the arms this shape actually reaches, so a loop that stops
+    // reaching them fails instead of passing silently.
     if (want_ok)
         check_ge(n_ok, want_ok, "  the cancel won often enough");
     if (want_enoent)
@@ -263,7 +263,7 @@ static void cancel_race(uint64_t delay_ns, int want_ok, int want_enoent, const c
     note("cancelled %d, already running %d, already done %d", n_ok, n_already, n_enoent);
 }
 
-/* A whole-slot CHECKSUM is the longest-running op: the best shot at -EALREADY. */
+// A whole-slot CHECKSUM is the longest-running op: the best shot at -EALREADY.
 static void already_race(void)
 {
     struct koru_sqe sq[1];
@@ -304,8 +304,8 @@ static void already_race(void)
     note("cancelled %d, already running %d, already done %d", n_ok, n_already, n_enoent);
 }
 
-/* Drop the cancel reference on a false return and it is a use-after-free; skip
- * it on a true return and the op, its file and a module reference all leak. */
+// Drop the cancel reference on a false return and it is a use-after-free; skip
+// it on a true return and the op, its file and a module reference all leak.
 static void cancel_leak(void)
 {
     struct koru_sqe sq[1];
@@ -352,8 +352,8 @@ static void cancel_leak(void)
         note("file-nr %ld -> %ld", before, after);
 }
 
-/* A free-running poker, so each round's datagram lands wherever it lands
- * rather than always before the cancel. */
+// A free-running poker, so each round's datagram lands wherever it lands
+// rather than always before the cancel.
 struct poke {
     int fd;
     struct sockaddr_in addr;
@@ -371,10 +371,10 @@ static void *poke_thread(void *arg)
     return NULL;
 }
 
-/* T22: the wake and the cancel race for the same one-shot token. Exactly one
- * wins, the poll completes exactly once either way, and the loser's answer
- * says which. A UDP datagram is the sharpest shot: it arrives in a softirq
- * rather than inside the sender's own write. */
+// T22: the wake and the cancel race for the same one-shot token. Exactly one
+// wins, the poll completes exactly once either way, and the loser's answer
+// says which. A UDP datagram is the sharpest shot: it arrives in a softirq
+// rather than inside the sender's own write.
 static void poll_race(void)
 {
     struct sockaddr_in addr;
@@ -431,15 +431,15 @@ static void poll_race(void)
         }
         if (t->res == -ECANCELED && c->res == 0)
             n_cancel++;
-        /* ENOENT rather than EALREADY when the wake completed before the
-         * cancel was even submitted: the registry entry is already gone. */
+        // ENOENT rather than EALREADY when the wake completed before the
+        // cancel was even submitted: the registry entry is already gone.
         else if (t->res == KORU_POLL_IN && (c->res == -EALREADY || c->res == -ENOENT))
             n_woke++;
         else {
             bad = 1;
             break;
         }
-        /* Drain, or the next arm is ready before it is armed. */
+        // Drain, or the next arm is ready before it is armed.
         while (recv(rx, buf, sizeof(buf), 0) > 0)
             ;
     }
@@ -447,7 +447,7 @@ static void poll_race(void)
     pthread_join(th, NULL);
     check(!bad, "1000 cancel races against a poll wake hold C1");
     check(n_cancel + n_woke == POLL_RACE_ITERS, "  every round answered one way or the other");
-    /* Both arms, or the loop proves only one of them. Measured with margin. */
+    // Both arms, or the loop proves only one of them. Measured with margin.
     check_ge(n_cancel, 20, "  the cancel won often enough");
     check_ge(n_woke, 20, "  and the wake won often enough");
     note("cancelled %d, woken %d", n_cancel, n_woke);
@@ -463,8 +463,8 @@ out:
 void sec_races(void)
 {
     read_race();
-    /* An armed timer: the cancel always wins. delay_ns 0: the worker usually
-     * does. The thresholds are measured values with a wide margin. */
+    // An armed timer: the cancel always wins. delay_ns 0: the worker usually
+    // does. The thresholds are measured values with a wide margin.
     cancel_race(2 * MS, 250, 0, "cancel races against an armed timer:");
     cancel_race(0, 0, 50, "cancel races against the worker:");
     already_race();

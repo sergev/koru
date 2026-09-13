@@ -25,7 +25,7 @@ static void alarm_die(int sig)
 
 void test_begin(unsigned alarm_secs)
 {
-    /* _exit from the handler would drop a full buffer. */
+    // _exit from the handler would drop a full buffer.
     setvbuf(stdout, NULL, _IOLBF, 0);
     if (alarm_secs) {
         signal(SIGALRM, alarm_die);
@@ -90,7 +90,7 @@ void note(const char *fmt, ...)
     va_end(ap);
 }
 
-/* ------------------------------------------------------------------------- */
+// ---------------------------------------------------------------------------
 
 int open_dev(void)
 {
@@ -183,9 +183,9 @@ int ring_quiesce(struct koru_ring *r)
     unsigned space = r->cq_entries < 128 ? r->cq_entries : 128;
     int total = 0, spin, idle = 0;
 
-    /* min_complete 1 returns at once on an idle ring, so the idle rounds are
-     * free; on a busy one each costs the timeout, which is what lets a
-     * still-running op land. */
+    // min_complete 1 returns at once on an idle ring, so the idle rounds are
+    // free; on a busy one each costs the timeout, which is what lets a
+    // still-running op land.
     for (spin = 0; spin < 64 && idle < 3; spin++) {
         memset(&e, 0, sizeof(e));
         e.cq_addr      = (uint64_t)(uintptr_t)cq;
@@ -204,7 +204,7 @@ int ring_quiesce(struct koru_ring *r)
     return total;
 }
 
-/* ------------------------------------------------------------------------- */
+// ---------------------------------------------------------------------------
 
 void enter_init(struct koru_enter *e, struct koru_sqe *sq, unsigned n, struct koru_cqe *cq,
                 unsigned cq_space)
@@ -369,7 +369,7 @@ int64_t r_stat(struct koru_ring *r, uint32_t handle, uint32_t slot, uint64_t off
     return c.res;
 }
 
-/* ------------------------------------------------------------------------- */
+// ---------------------------------------------------------------------------
 
 void sqe_nop(struct koru_sqe *s, uint64_t user_data)
 {
@@ -493,7 +493,7 @@ void sqe_cancel(struct koru_sqe *s, uint64_t target, uint64_t user_data)
     s->user_data = user_data;
 }
 
-/* ------------------------------------------------------------------------- */
+// ---------------------------------------------------------------------------
 
 uint8_t pattern_byte(size_t i)
 {

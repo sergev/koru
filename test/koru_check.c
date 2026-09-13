@@ -28,20 +28,20 @@
 
 struct koru_ring R = { .fd = -1 };
 
-/* ---------------------------------------------------------------------------
- * Sections.
- * ------------------------------------------------------------------------ */
+// ---------------------------------------------------------------------------
+// Sections.
+// ---------------------------------------------------------------------------
 
 struct sec {
     const char *name;
     void (*fn)(void);
-    int heavy; /* allocates in bulk: must run early enough for kmemleak */
+    int heavy; // allocates in bulk: must run early enough for kmemleak
 };
 
 static const struct sec sections[] = {
     { "smoke", sec_smoke, 0 },
 
-    /* Heavy: everything that allocates in bulk. */
+    // Heavy: everything that allocates in bulk.
     { "devchurn", sec_devchurn, 1 },
     { "ringchurn", sec_ringchurn, 1 },
     { "handles", sec_handles, 1 },
@@ -52,7 +52,7 @@ static const struct sec sections[] = {
     { "path", sec_path, 1 },
     { "readdir", sec_readdir, 1 },
 
-    /* Tail: deterministic matrices and the timing checks. */
+    // Tail: deterministic matrices and the timing checks.
     { "setup", sec_setup, 0 },
     { "ioctl", sec_ioctl, 0 },
     { "mmap", sec_mmap, 0 },
@@ -72,7 +72,7 @@ static const struct sec sections[] = {
 
 #define NSECTIONS (sizeof(sections) / sizeof(sections[0]))
 
-/* ------------------------------------------------------------------------- */
+// ---------------------------------------------------------------------------
 
 void sec_smoke(void)
 {
@@ -83,7 +83,7 @@ void sec_smoke(void)
     sqe_nop(&s, 0x01);
     check_res(run_one(R.fd, &s), 0, "a NOP completes");
 
-    /* Zeroed at SETUP, not at mmap. Nothing has written here yet. */
+    // Zeroed at SETUP, not at mmap. Nothing has written here yet.
     for (i = 0; i < R.slot_size; i++)
         if (R.arena[R.slot_size + i] != 0)
             zero = 0;
@@ -94,9 +94,9 @@ void sec_smoke(void)
     check_res(run_one(R.fd, &s), fnv1a(R.arena, 4096), "a CHECKSUM reads the arena");
 }
 
-/* ---------------------------------------------------------------------------
- * SETUP and GET_PARAMS.
- * ------------------------------------------------------------------------ */
+// ---------------------------------------------------------------------------
+// SETUP and GET_PARAMS.
+// ---------------------------------------------------------------------------
 
 static void good_request(struct koru_params *p)
 {
@@ -109,8 +109,8 @@ static void good_request(struct koru_params *p)
     p->slot_count  = 32;
 }
 
-/* Every rejection runs on one fd; the SETUP at the end proves none consumed
- * the one-shot. */
+// Every rejection runs on one fd; the SETUP at the end proves none consumed
+// the one-shot.
 static int fd_reject;
 
 static void reject(void (*mutate)(struct koru_params *), int want, const char *what)
@@ -155,7 +155,7 @@ void sec_setup(void)
     if (fd < 0)
         return;
 
-    /* 1. GET_PARAMS is legal before SETUP and reports the caps. */
+    // 1. GET_PARAMS is legal before SETUP and reports the caps.
     memset(&caps, 0, sizeof(caps));
     check(ioctl(fd, KORU_IOC_GET_PARAMS, &caps) == 0, "GET_PARAMS before SETUP succeeds");
     check(caps.magic == KORU_MAGIC && caps.abi_version == KORU_ABI_VERSION,
@@ -166,7 +166,7 @@ void sec_setup(void)
               caps.max_delay_ns > 0,
           "  every cap is non-zero");
 
-    /* 2. Every rejection, on one fd. */
+    // 2. Every rejection, on one fd.
     fd_reject = fd;
     reject(bad_magic, EPROTO, "bad magic is EPROTO, not EINVAL");
     reject(bad_version, EPROTO, "bad abi_version is EPROTO");
@@ -185,7 +185,7 @@ void sec_setup(void)
     reject(big_arena, EINVAL, "an arena past the cap is rejected, not clamped");
     reject(big_handles, EINVAL, "handle_count past the cap is EINVAL");
 
-    /* 3. Which leaves the fd still virgin. */
+    // 3. Which leaves the fd still virgin.
     good_request(&p);
     check(ioctl(fd, KORU_IOC_SETUP, &p) == 0, "SETUP still works after every rejection");
     check(p.sq_entries == 64 && p.cq_entries == 128, "  sq and cq entries round-trip");
@@ -195,17 +195,17 @@ void sec_setup(void)
     check(p.handle_count > 0 && p.handle_count <= caps.max_handles,
           "  handle_count 0 became the kernel default");
 
-    /* 4. GET_PARAMS afterwards agrees, field for field. */
+    // 4. GET_PARAMS afterwards agrees, field for field.
     memset(&q, 0, sizeof(q));
     check(ioctl(fd, KORU_IOC_GET_PARAMS, &q) == 0, "GET_PARAMS after SETUP succeeds");
     check(memcmp(&p, &q, sizeof(p)) == 0, "  and returns what SETUP returned");
 
-    /* 5. The one-shot is now spent. */
+    // 5. The one-shot is now spent.
     good_request(&p);
     check_errno(ioctl(fd, KORU_IOC_SETUP, &p), EBUSY, "a second SETUP is EBUSY");
     close(fd);
 
-    /* 6. Defaults and echoes that need their own fds. */
+    // 6. Defaults and echoes that need their own fds.
     fd = open_dev();
     if (fd >= 0) {
         good_request(&p);
@@ -224,9 +224,9 @@ void sec_setup(void)
     }
 }
 
-/* ---------------------------------------------------------------------------
- * ioctl dispatch: ENOTTY for "not ours", EPROTO for "ours, malformed".
- * ------------------------------------------------------------------------ */
+// ---------------------------------------------------------------------------
+// ioctl dispatch: ENOTTY for "not ours", EPROTO for "ours, malformed".
+// ---------------------------------------------------------------------------
 
 #define IOC(dir, type, nr, size)                                                                   \
     (((unsigned)(dir) << _IOC_DIRSHIFT) | ((unsigned)(type) << _IOC_TYPESHIFT) |                   \
@@ -240,7 +240,7 @@ void sec_ioctl(void)
 
     memset(&p, 0, sizeof(p));
 
-    /* Dispatch is on the type byte first, then the number. */
+    // Dispatch is on the type byte first, then the number.
     check_errno(ioctl(R.fd, _IO('x', 0x7f)), ENOTTY, "an unknown ioctl is ENOTTY");
     for (dir = 0; dir < 4; dir++)
         for (nr = 0; nr < 5; nr++)
@@ -254,7 +254,7 @@ void sec_ioctl(void)
             bad_nr = 1;
     check(!bad_nr, "our type byte with an unknown number is ENOTTY");
 
-    /* Right number, wrong size or direction: an ABI mismatch, so EPROTO. */
+    // Right number, wrong size or direction: an ABI mismatch, so EPROTO.
     check_errno(ioctl(R.fd, IOC(_IOC_READ | _IOC_WRITE, 'k', 0x00, sizeof(p) + 8), &p), EPROTO,
                 "SETUP with the wrong size is EPROTO");
     check_errno(ioctl(R.fd, IOC(_IOC_READ, 'k', 0x00, sizeof(p)), &p), EPROTO,
@@ -274,9 +274,9 @@ void sec_ioctl(void)
                 "SETUP with a bad pointer is EFAULT");
 }
 
-/* ---------------------------------------------------------------------------
- * The arena mapping.
- * ------------------------------------------------------------------------ */
+// ---------------------------------------------------------------------------
+// The arena mapping.
+// ---------------------------------------------------------------------------
 
 #define M_SLOT  4096u
 #define M_COUNT 8u
@@ -311,7 +311,7 @@ void sec_mmap(void)
     for (i = 0; i < M_SLOT; i++)
         pattern[i] = (uint8_t)(i * 31 + 7);
 
-    /* 1. Before SETUP there is no arena to map. */
+    // 1. Before SETUP there is no arena to map.
     fd = open_dev();
     if (fd < 0)
         return;
@@ -324,7 +324,7 @@ void sec_mmap(void)
         return;
     }
 
-    /* 2. Length is exact, not a minimum. */
+    // 2. Length is exact, not a minimum.
     a = mmap(NULL, M_ARENA, PROT_READ | PROT_WRITE, MAP_PRIVATE, m.fd, 0);
     check(a == MAP_FAILED && errno == EINVAL, "MAP_PRIVATE is EINVAL, never a silent COW");
     a = mmap(NULL, M_ARENA - 4096, PROT_READ | PROT_WRITE, MAP_SHARED, m.fd, 0);
@@ -343,7 +343,7 @@ void sec_mmap(void)
     second = mmap(NULL, M_ARENA, PROT_READ | PROT_WRITE, MAP_SHARED, m.fd, 0);
     check(second == MAP_FAILED && errno == EBUSY, "a second mmap is EBUSY");
 
-    /* 3. VM_DONTCOPY, and userspace cannot undo it. */
+    // 3. VM_DONTCOPY, and userspace cannot undo it.
     check(region_in_maps() == 1, "the region shows in /proc/self/maps");
     check(madvise(m.arena, M_ARENA, MADV_DOFORK) != 0, "madvise(MADV_DOFORK) is refused");
     pid = fork();
@@ -352,7 +352,7 @@ void sec_mmap(void)
     waitpid(pid, &status, 0);
     check(WIFEXITED(status) && WEXITSTATUS(status) == 0, "a forked child does not inherit it");
 
-    /* 4. The kernel owns the pages. */
+    // 4. The kernel owns the pages.
     sqe_delay(&s, 0xd1, 100 * MS);
     enter_init(&e, &s, 1, NULL, 0);
     check(ioctl(m.fd, KORU_IOC_ENTER, &e) == 1, "a delay is in flight");
@@ -361,7 +361,7 @@ void sec_mmap(void)
     check(ring_quiesce(&m) == 1, "  and the op still lands afterwards");
     ring_close(&m);
 
-    /* 5. The mapping holds its own reference. */
+    // 5. The mapping holds its own reference.
     if (ring_open(&m, 32, 64, M_SLOT, M_COUNT, 8) != 0) {
         failures++;
         return;
@@ -381,18 +381,18 @@ void sec_mmap(void)
     ring_close(&m);
 }
 
-/* ---------------------------------------------------------------------------
- * The ENTER protocol: C1, E1, admission control.
- * ------------------------------------------------------------------------ */
+// ---------------------------------------------------------------------------
+// The ENTER protocol: C1, E1, admission control.
+// ---------------------------------------------------------------------------
 
-/* Every opcode, plus two that do not exist. */
+// Every opcode, plus two that do not exist.
 static const uint8_t all_opcodes[] = { KORU_OP_NOP,      KORU_OP_DELAY_NS, KORU_OP_OPEN,
                                        KORU_OP_READ,     KORU_OP_CLOSE,    KORU_OP_CANCEL,
                                        KORU_OP_CHECKSUM, KORU_OP_WRITE,    KORU_OP_ADOPT_FD,
                                        KORU_OP_POLL_ADD, KORU_OP_STAT,     11,
                                        200 };
 
-/* Submit and never reap. Admission control must stop this at cq_entries. */
+// Submit and never reap. Admission control must stop this at cq_entries.
 static unsigned fill_cq(struct koru_ring *r, uint64_t delay_ns)
 {
     struct koru_sqe sq[8];
@@ -416,7 +416,7 @@ static unsigned fill_cq(struct koru_ring *r, uint64_t delay_ns)
         }
         total += (unsigned)ret;
         if (ret < 8)
-            break; /* short submit: the queue is full */
+            break; // short submit: the queue is full
     }
     return total;
 }
@@ -430,7 +430,7 @@ void sec_enter(void)
     unsigned i;
     int fd, ret, ok, res_ok;
 
-    /* 1. Eight NOPs in, eight CQEs out, in order. */
+    // 1. Eight NOPs in, eight CQEs out, in order.
     for (i = 0; i < 8; i++)
         sqe_nop(&sq[i], 0x1000 + i);
     enter_init(&e, sq, 8, cq, 16);
@@ -447,7 +447,7 @@ void sec_enter(void)
     check(ok, "  user_data matches one for one, in order");
     check(res_ok, "  res 0, and flags, rsvd0 and extra all zero");
 
-    /* 2. E1: a bad SQE is a completion, never an ioctl failure. */
+    // 2. E1: a bad SQE is a completion, never an ioctl failure.
     sqe_nop(&sq[0], 0x2000);
     sq[0].opcode = 200;
     enter_init(&e, sq, 1, cq, 16);
@@ -462,7 +462,7 @@ void sec_enter(void)
     check(ret == 1 && e.completed == 1 && cq[0].res == -EINVAL,
           "a field the opcode does not read must be zero");
 
-    /* 3. The two rules that let the ABI grow, for every opcode. */
+    // 3. The two rules that let the ABI grow, for every opcode.
     {
         int bad_rsvd = 0, bad_flags = 0;
 
@@ -483,7 +483,7 @@ void sec_enter(void)
         check(!bad_flags, "an unknown SQE flag bit is EINVAL for every opcode");
     }
 
-    /* 4. C1: a mixed batch completes every entry it consumed. */
+    // 4. C1: a mixed batch completes every entry it consumed.
     for (i = 0; i < 8; i++) {
         sqe_nop(&sq[i], 0x3000 + i);
         if (i % 2)
@@ -501,7 +501,7 @@ void sec_enter(void)
     }
     check(ok, "  each completion matches its own SQE");
 
-    /* 5. A short cq_space queues the rest rather than dropping it. */
+    // 5. A short cq_space queues the rest rather than dropping it.
     for (i = 0; i < 8; i++)
         sqe_nop(&sq[i], 0x4000 + i);
     enter_init(&e, sq, 8, cq, 3);
@@ -517,7 +517,7 @@ void sec_enter(void)
             ok = 0;
     check(ok, "  in order, and they are the ones left behind");
 
-    /* 6. Protocol failures that do fail the ioctl. */
+    // 6. Protocol failures that do fail the ioctl.
     enter_init(&e, sq, 1, cq, 16);
     e.flags = 1;
     check_errno(ioctl(R.fd, KORU_IOC_ENTER, &e), EINVAL, "an unknown ENTER flag is EINVAL");
@@ -542,7 +542,7 @@ void sec_enter(void)
         close(fd);
     }
 
-    /* 7. Admission control: queued completions, then reservations. */
+    // 7. Admission control: queued completions, then reservations.
     if (ring_open(&a, 64, 128, 4096, 8, 8) == 0) {
         check(fill_cq(&a, 0) == a.cq_entries, "submitting past cq_entries stops at a short count");
         ring_close(&a);
@@ -553,18 +553,17 @@ void sec_enter(void)
     }
 }
 
-/* Its own ring: 80 slots, so the busy bitmap spans two 64-bit words. */
+// Its own ring: 80 slots, so the busy bitmap spans two 64-bit words.
 
 #define S_SLOT  4096u
 #define S_COUNT 80u
 
-/* Two deferred CHECKSUMs on one slot, retried until they actually collide.
- *
- * The collision is racy: the winner's kworker can finish before the submit loop
- * dispatches the loser, and then both succeed. Exclusivity is still what is
- * being tested — if it were broken, no attempt would ever collide and this
- * returns 0. `*winner` is the successful checksum from the colliding round.
- */
+// Two deferred CHECKSUMs on one slot, retried until they actually collide.
+//
+// The collision is racy: the winner's kworker can finish before the submit loop
+// dispatches the loser, and then both succeed. Exclusivity is still what is
+// being tested — if it were broken, no attempt would ever collide and this
+// returns 0. `*winner` is the successful checksum from the colliding round.
 static int collide(struct koru_ring *m, uint32_t slot, unsigned n, int64_t *winner)
 {
     struct koru_sqe sq[3];
@@ -615,7 +614,7 @@ void sec_slots(void)
     }
     memcpy(m.arena + 3 * S_SLOT, pattern, S_SLOT);
 
-    /* 1. Two ops naming one slot. CHECKSUM is deferred so this is reachable. */
+    // 1. Two ops naming one slot. CHECKSUM is deferred so this is reachable.
     sqe_checksum(&sq[0], 3, 0, S_SLOT, 0xaa);
     sqe_checksum(&sq[1], 3, 0, S_SLOT, 0xbb);
     ret = submit(m.fd, sq, 2, cq, 2, 2, &completed);
@@ -631,11 +630,11 @@ void sec_slots(void)
     if (n > 1)
         note("the collision took %d attempts", n);
 
-    /* 2. Released in the same critical section that posts the CQE. */
+    // 2. Released in the same critical section that posts the CQE.
     sqe_checksum(&sq[0], 3, 0, S_SLOT, 0xcc);
     check_res(run_one(m.fd, &sq[0]), want, "the slot is free again once its CQE posted");
 
-    /* 3. Distinct slots do not collide. */
+    // 3. Distinct slots do not collide.
     memcpy(m.arena + 4 * S_SLOT, pattern, S_SLOT);
     sqe_checksum(&sq[0], 3, 0, S_SLOT, 0x10);
     sqe_checksum(&sq[1], 4, 0, S_SLOT, 0x11);
@@ -645,10 +644,10 @@ void sec_slots(void)
     check(ret == 2 && completed == 2 && a && b && a->res >= 0 && b->res >= 0,
           "two ops on different slots both succeed");
 
-    /* 4. A refused op must not release the slot the winner holds. */
+    // 4. A refused op must not release the slot the winner holds.
     check(collide(&m, 3, 3, NULL) > 0, "three on one slot: one succeeds, two get -EBUSY");
 
-    /* 5. Past the first bitmap word, and no aliasing with the word below. */
+    // 5. Past the first bitmap word, and no aliasing with the word below.
     memcpy(m.arena + 70 * S_SLOT, pattern, S_SLOT);
     check(collide(&m, 70, 2, NULL) > 0,
           "slot 70, in the second bitmap word, is tracked separately");
@@ -660,8 +659,8 @@ void sec_slots(void)
     check(ret == 2 && completed == 2 && a && b && a->res >= 0 && b->res >= 0,
           "  and slots 6 and 70 do not alias each other");
 
-    /* 6. slot_try_acquire does not bounds-check itself; every caller must.
-     * The bitmap is whole words, so probe past the count and past word 0. */
+    // 6. slot_try_acquire does not bounds-check itself; every caller must.
+    // The bitmap is whole words, so probe past the count and past word 0.
     sqe_checksum(&sq[0], S_COUNT, 0, 16, 0x40);
     check_res(run_one(m.fd, &sq[0]), -EINVAL, "slot == slot_count is EINVAL");
     sqe_checksum(&sq[0], S_COUNT + 1, 0, 16, 0x41);
@@ -669,14 +668,14 @@ void sec_slots(void)
     sqe_checksum(&sq[0], UINT32_MAX, 0, 16, 0x42);
     check_res(run_one(m.fd, &sq[0]), -EINVAL, "  and an absurd slot index");
 
-    /* 7. A rejected op leaves no slot stuck busy. */
+    // 7. A rejected op leaves no slot stuck busy.
     sqe_checksum(&sq[0], 5, 0, S_SLOT, 0x50);
     sq[0].off = S_SLOT;
     check_res(run_one(m.fd, &sq[0]), -EINVAL, "an out-of-range op is rejected before it claims");
     sqe_checksum(&sq[0], 5, 0, S_SLOT, 0x51);
     check(run_one(m.fd, &sq[0]) >= 0, "  and slot 5 is still usable");
 
-    /* 8. Every slot at once. */
+    // 8. Every slot at once.
     for (i = 0; i < 8; i++)
         sqe_checksum(&sq[i], i, 0, S_SLOT, 0x60 + i);
     ret = submit(m.fd, sq, 8, cq, 8, 8, &completed);
@@ -689,9 +688,9 @@ void sec_slots(void)
     ring_close(&m);
 }
 
-/* ------------------------------------------------------------------------- */
+// ---------------------------------------------------------------------------
 
-/* rmmod must be refused while this runs. */
+// rmmod must be refused while this runs.
 static int mode_hold(void)
 {
     struct koru_ring m;
@@ -704,9 +703,9 @@ static int mode_hold(void)
         pause();
 }
 
-/* release() must cancel these, so the script's rmmod beats the delay. It must
- * also disarm the poll: the child pokes the pipe once the ring is gone, and
- * an entry left on that waitqueue is a use-after-free from the wake. */
+// release() must cancel these, so the script's rmmod beats the delay. It must
+// also disarm the poll: the child pokes the pipe once the ring is gone, and
+// an entry left on that waitqueue is a use-after-free from the wake.
 static int mode_pending(void)
 {
     struct koru_ring m;
@@ -726,7 +725,7 @@ static int mode_pending(void)
             if (ioctl(m.fd, KORU_IOC_ENTER, &e) != 1)
                 return 1;
             if (fork() == 0) {
-                close(m.fd); /* the child must not hold the ring open */
+                close(m.fd); // the child must not hold the ring open
                 close(pipefd[0]);
                 usleep(200000);
                 if (write(pipefd[1], "x", 1) != 1)
@@ -742,12 +741,12 @@ static int mode_pending(void)
         return 1;
     printf("READY\n");
     fflush(stdout);
-    _exit(0); /* the fd closes with the process, the delays stay queued */
+    _exit(0); // the fd closes with the process, the delays stay queued
 }
 
-/* ---------------------------------------------------------------------------
- * Driver.
- * ------------------------------------------------------------------------ */
+// ---------------------------------------------------------------------------
+// Driver.
+// ---------------------------------------------------------------------------
 
 static int selected(const char *name, int argc, char **argv)
 {
@@ -796,7 +795,7 @@ int main(int argc, char **argv)
         printf("\n== SECTION %s ==\n", sections[i].name);
         sections[i].fn();
 
-        /* A section that walked away from queued work fails here, not later. */
+        // A section that walked away from queued work fails here, not later.
         left = ring_quiesce(&R);
         if (left != 0) {
             snprintf(what, sizeof(what), "  %s left nothing in flight", sections[i].name);
@@ -815,7 +814,7 @@ int main(int argc, char **argv)
     ring_close(&R);
     unlink(PATFILE);
 
-    /* The script tops the kmemleak window up from here. */
+    // The script tops the kmemleak window up from here.
     printf("\nKORU-HEAVY-END-MS %llu\n", (unsigned long long)(heavy_end ? heavy_end : wall_ms()));
     return test_end();
 }
