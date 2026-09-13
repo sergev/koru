@@ -233,6 +233,15 @@ KORU_STATIC_ASSERT(KORU_IOC_ENTER == 0xc0406b02u, "ioctl ENTER");
  * STAT: a later field comes out of koru_stat.reserved, which fixes the struct's
  * size for every binary at this ABI version. */
 #define KORU_OP_STATX_AT 14
+/* Create the directory the path names. No argument: handle carries the mode,
+ * free on this opcode exactly as OPEN's flags are, and res is 0. The VFS
+ * applies the umask, as mkdir(2) does. */
+#define KORU_OP_MKDIR 15
+/* Create a symlink. TWO NUL-terminated paths back to back in the slot, with len
+ * covering both and their separator: the target first, then the link to create,
+ * in symlink(2)'s own argument order. Exactly one NUL may fall inside those len
+ * bytes and neither half may be empty. handle must be zero and res is 0. */
+#define KORU_OP_SYMLINK 16
 
 KORU_STATIC_ASSERT(KORU_OP_NOP == 0, "op NOP");
 KORU_STATIC_ASSERT(KORU_OP_DELAY_NS == 1, "op DELAY_NS");
@@ -249,6 +258,8 @@ KORU_STATIC_ASSERT(KORU_OP_TRUNCATE == 11, "op TRUNCATE");
 KORU_STATIC_ASSERT(KORU_OP_UTIMES == 12, "op UTIMES");
 KORU_STATIC_ASSERT(KORU_OP_READLINK == 13, "op READLINK");
 KORU_STATIC_ASSERT(KORU_OP_STATX_AT == 14, "op STATX_AT");
+KORU_STATIC_ASSERT(KORU_OP_MKDIR == 15, "op MKDIR");
+KORU_STATIC_ASSERT(KORU_OP_SYMLINK == 16, "op SYMLINK");
 
 /* Any bit set in an SQE's flags is rejected. */
 #define KORU_SQE_FLAGS_ALL 0u
@@ -285,6 +296,11 @@ KORU_STATIC_ASSERT(KORU_OP_STATX_AT == 14, "op STATX_AT");
  * creation mode. */
 #define KORU_OPEN_FLAGS_ALL                                                                        \
     (KORU_O_ACCMODE | KORU_O_NOFOLLOW | KORU_O_DIRECTORY | KORU_O_NONBLOCK)
+
+/* What a MKDIR SQE's handle may carry: the permission bits and the sticky bit,
+ * which is all vfs_mkdir keeps of a requested mode. Any other bit is EINVAL
+ * rather than silently dropped, as an unknown open flag is. */
+#define KORU_MKDIR_MODE_ALL 01777u
 
 /* Multishot bit, reserved and never set. */
 #define KORU_CQE_F_MORE (1u << 0)

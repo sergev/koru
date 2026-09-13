@@ -316,6 +316,25 @@ int64_t r_path_extra(struct koru_ring *r, uint8_t opcode, uint32_t slot, const c
     return c.res;
 }
 
+int64_t r_mkdir(struct koru_ring *r, uint32_t slot, const char *path, uint32_t mode)
+{
+    struct koru_sqe s;
+    uint32_t n = put_path(r->arena, r->slot_size, slot, path);
+
+    sqe_path(&s, KORU_OP_MKDIR, slot, 0, n, 0x107);
+    s.handle = mode;
+    return run_one(r->fd, &s);
+}
+
+int64_t r_symlink(struct koru_ring *r, uint32_t slot, const char *target, const char *link)
+{
+    struct koru_sqe s;
+    uint32_t n = put_paths(r->arena, r->slot_size, slot, target, link);
+
+    sqe_path(&s, KORU_OP_SYMLINK, slot, 0, n, 0x108);
+    return run_one(r->fd, &s);
+}
+
 int64_t r_stat(struct koru_ring *r, uint32_t handle, uint32_t slot, uint64_t off, uint32_t len,
                uint64_t *extra)
 {
@@ -495,6 +514,17 @@ uint32_t put_path(uint8_t *arena, uint32_t slot_size, uint32_t slot, const char 
     memset(arena + (size_t)slot * slot_size, 0, slot_size);
     memcpy(arena + (size_t)slot * slot_size, path, n);
     return (uint32_t)n;
+}
+
+uint32_t put_paths(uint8_t *arena, uint32_t slot_size, uint32_t slot, const char *a, const char *b)
+{
+    uint8_t *p = arena + (size_t)slot * slot_size;
+    size_t na = strlen(a), nb = strlen(b);
+
+    memset(p, 0, slot_size);
+    memcpy(p, a, na);
+    memcpy(p + na + 1, b, nb);
+    return (uint32_t)(na + 1 + nb);
 }
 
 long mem_free_kb(void)

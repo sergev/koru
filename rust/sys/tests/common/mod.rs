@@ -79,6 +79,16 @@ impl Mapped {
         path.len() as u32
     }
 
+    /// Two paths back to back with one NUL between them, as `SYMLINK` wants.
+    /// Returns the byte count covering both and the separator.
+    pub fn put_paths(&self, slot: u32, a: &str, b: &str) -> u32 {
+        let s = self.slot(slot);
+        s.fill(0);
+        s[..a.len()].copy_from_slice(a.as_bytes());
+        s[a.len() + 1..a.len() + 1 + b.len()].copy_from_slice(b.as_bytes());
+        (a.len() + 1 + b.len()) as u32
+    }
+
     /// One SQE to completion, keeping the CQE's `extra`.
     pub fn run_one_extra(&self, sqe: &Sqe) -> (i64, u64) {
         let mut cq = [Cqe::default(); 1];

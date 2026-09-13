@@ -5,12 +5,12 @@ code in this repository.
 
 ## State of the repository
 
-**T0–T25 are done: Braam's hello world runs through koru, and the ring can
+**T0–T26 are done: Braam's hello world runs through koru, and the ring can
 wait for a descriptor.** The module registers `/dev/koru`, configures a ring
 with `SETUP`, and submits `NOP`, `DELAY_NS`, `CHECKSUM`, `OPEN`, `READ`,
 `WRITE`, `CLOSE`, `CANCEL`, `ADOPT_FD`, `POLL_ADD`, `STAT`, `TRUNCATE`,
-`UTIMES`, `READLINK` and `STATX_AT` through `ENTER`, which blocks for
-completions. The arena
+`UTIMES`, `READLINK`, `STATX_AT`, `MKDIR` and `SYMLINK` through `ENTER`, which
+blocks for completions. The arena
 is mmap'd, with slot exclusivity enforced by the kernel. Open files live in a
 generational handle table. A queued op can be genuinely dequeued, and
 `close(fd)` cancels whatever is still queued. The whole validation surface has
@@ -112,6 +112,20 @@ carried cred. The struct **replaces the path it was given** at `off`, as
 because `len` is the path's length. `dispatch` now returns `(res, extra)`: this
 is the first inline op with anything to put in `extra`. doc/Notes.md has the
 seven perturbations.
+
+T26 added `KORU_OP_MKDIR` and `KORU_OP_SYMLINK`, the first ops that create
+something. Both are `start_creating_path`, a `vfs_*` call and
+`end_creating_path`, wrapped in `koru_path.rs`'s `Creating` guard — which holds
+the parent's lock, the mount's write count and the path all at once, so the
+`mnt_want_write` guard the plan asked for is **still** not needed. `vfs_mkdir`
+may hand back a different dentry and it is that one the unlock belongs to.
+`MKDIR`'s mode rides in `handle`, masked to `0o1777`; `SYMLINK` takes two
+NUL-separated paths in one slot, target first. The heavy phase mounts its own
+tmpfs and remounts it read-only, which is the only instrument that sees an
+unbalanced write count. T26 also found that **the fuzzer's path sandbox was
+never real** — one shared path slot per thread meant a batched `MKDIR` could
+name a truncated prefix of anything another SQE had written. doc/Notes.md has
+the six perturbations and the sandbox rebuild.
 
 T14 made the two userspace ABI mirrors a diff rather than a promise.
 `cpp/include/koru_abi.h` and `cpp/include/koru_errno.h` are the C mirrors,
@@ -216,7 +230,7 @@ survived**.
 
 ## Commands
 
-These work today (T0 through T25):
+These work today (T0 through T26):
 
 ```sh
 KDIR=../kernel-dev/linux-source-7.1

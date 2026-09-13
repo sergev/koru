@@ -3196,6 +3196,8 @@ fn creds_an_unprivileged_path_op_is_refused() {
     // permission on the way in, so nothing else here would refuse it.
     let dir = "/tmp/koru-check-rs-credsdir";
     let inner = format!("{dir}/inside");
+    let sub = format!("{dir}/sub");
+    let newlink = format!("{dir}/new");
     let _ = std::fs::remove_dir_all(dir);
     std::fs::create_dir(dir).expect("mkdir");
     std::fs::write(&inner, b"x").expect("fill");
@@ -3242,6 +3244,12 @@ fn creds_an_unprivileged_path_op_is_refused() {
                             7
                         } else if statx_at(&m, &inner).0 != -(EACCES.0 as i64) {
                             8
+                        // Creating in it needs write and search, and the
+                        // child has neither.
+                        } else if mkdir(&m, &sub, 0o700) != -(EACCES.0 as i64) {
+                            9
+                        } else if symlink(&m, "/any/target", &newlink) != -(EACCES.0 as i64) {
+                            10
                         } else {
                             0
                         }
@@ -3256,7 +3264,7 @@ fn creds_an_unprivileged_path_op_is_refused() {
     unsafe { sys::waitpid(pid, &mut status, 0) };
     assert!(sys::wifexited(status), "the child died");
     let _ = std::fs::remove_dir_all(dir);
-    // 5 truncate, 6 named utimes, 7 touch, 8 statx.
+    // 5 truncate, 6 named utimes, 7 touch, 8 statx, 9 mkdir, 10 symlink.
     assert_eq!(sys::wexitstatus(status), 0, "child verdict");
 }
 
@@ -3433,5 +3441,208 @@ fn statx_at_is_refused_a_slot_another_op_holds() {
     let refused = find_cqe(&cq, 0x761);
     assert_eq!(refused.res, -(EBUSY.0 as i64), "the STATX_AT behind it");
     assert_eq!(refused.extra, 0, "a refused STATX_AT reports no mask");
+    m.assert_quiesced();
+}
+
+// ---------------------------------------------------------------------------
+// T26 - MKDIR and SYMLINK
+// ---------------------------------------------------------------------------
+
+/// `handle` carries the mode, as `OPEN`'s carries its flags.
+fn mkdir(m: &Mapped, path: &str, mode: u32) -> i64 {
+    let n = m.put_path(1, path);
+    let mut s = Sqe::path(KORU_OP_MKDIR, 0x780, 1, 0, n);
+    s.handle = mode;
+    m.run_one(&s)
+}
+
+/// The target first, then the link, in `symlink(2)`'s own argument order.
+fn symlink(m: &Mapped, target: &str, link: &str) -> i64 {
+    let n = m.put_paths(1, target, link);
+    m.run_one(&Sqe::path(KORU_OP_SYMLINK, 0x781, 1, 0, n))
+}
+
+/// A directory removed when the guard drops.
+struct Dir(String);
+
+impl Dir {
+    fn new(tag: &str) -> Dir {
+        let path = format!("/tmp/koru-check-rs-dir-{tag}");
+        let _ = std::fs::remove_dir_all(&path);
+        Dir(path)
+    }
+
+    fn path(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Drop for Dir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// The mode a `stat(2)` reports, permission bits only.
+fn mode_of(path: &str) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::symlink_metadata(path)
+        .expect("metadata")
+        .permissions()
+        .mode()
+        & 0o7777
+}
+
+#[test]
+fn mkdir_creates_a_directory_stat_2_agrees_with() {
+    let d = Dir::new("mkdir");
+    let m = Mapped::shared();
+    // The VFS applies the submitter's umask, so clear it for an exact mode.
+    let old = unsafe { sys::umask(0) };
+
+    assert_eq!(mkdir(&m, d.path(), 0o750), 0, "MKDIR");
+    assert!(
+        std::fs::symlink_metadata(d.path()).expect("stat").is_dir(),
+        "stat(2) calls it a directory"
+    );
+    assert_eq!(mode_of(d.path()), 0o750, "the mode it asked for");
+    assert_eq!(
+        mkdir(&m, d.path(), 0o755),
+        -(EEXIST.0 as i64),
+        "a second one"
+    );
+
+    // The sticky bit is the one non-permission bit `vfs_mkdir` keeps.
+    let sticky = Dir::new("sticky");
+    assert_eq!(mkdir(&m, sticky.path(), 0o1777), 0, "the sticky bit");
+    assert_eq!(mode_of(sticky.path()), 0o1777, "and it is set");
+
+    unsafe { sys::umask(old) };
+    m.assert_quiesced();
+}
+
+/// The umask is the submitting task's, which is what `mkdir(2)` promises.
+#[test]
+fn mkdir_has_the_umask_applied() {
+    let d = Dir::new("umask");
+    let m = Mapped::shared();
+    let old = unsafe { sys::umask(0o022) };
+
+    assert_eq!(mkdir(&m, d.path(), 0o777), 0, "MKDIR under umask 022");
+    assert_eq!(mode_of(d.path()), 0o755, "the umask was applied");
+
+    unsafe { sys::umask(old) };
+    m.assert_quiesced();
+}
+
+#[test]
+fn mkdir_rejection_matrix() {
+    let d = Dir::new("mkdirbad");
+    let m = Mapped::shared();
+    let bad = -(EINVAL.0 as i64);
+
+    assert_eq!(
+        mkdir(&m, "/no/such/parent/x", 0o700),
+        -(ENOENT.0 as i64),
+        "a missing parent"
+    );
+    assert_eq!(
+        mkdir(&m, "/tmp/.", 0o700),
+        -(EEXIST.0 as i64),
+        "a path ending in ."
+    );
+    assert_eq!(mkdir(&m, d.path(), 0o4755), bad, "a mode outside the mask");
+    assert_eq!(mkdir(&m, d.path(), 0o100000), bad, "a file-type bit");
+    assert_eq!(
+        m.run_one(&Sqe::path(KORU_OP_MKDIR, 0x790, 1, 0, 0)),
+        bad,
+        "a zero-length path"
+    );
+    assert_eq!(
+        m.run_one(&Sqe::path(KORU_OP_MKDIR, 0x791, m.slot_count(), 0, 8)),
+        bad,
+        "a slot past the arena"
+    );
+    assert!(
+        std::fs::symlink_metadata(d.path()).is_err(),
+        "no rejected MKDIR left a directory behind"
+    );
+    m.assert_quiesced();
+}
+
+#[test]
+fn symlink_creates_the_link_readlink_2_reads_back() {
+    let f = Scratch::new("symlink");
+    let _ = std::fs::remove_file(f.path());
+    let m = Mapped::shared();
+    // Longer than tmpfs's inline limit, so the target is page-backed too.
+    let target: String = std::iter::repeat_n("/abcdefgh", 24).collect();
+
+    assert_eq!(symlink(&m, &target, f.path()), 0, "SYMLINK");
+    let got = std::fs::read_link(f.path()).expect("readlink(2)");
+    assert_eq!(got.to_str().expect("utf8"), target, "the target comes back");
+    assert!(
+        std::fs::symlink_metadata(f.path())
+            .expect("lstat")
+            .file_type()
+            .is_symlink(),
+        "lstat(2) calls it a symlink"
+    );
+    assert_eq!(
+        symlink(&m, &target, f.path()),
+        -(EEXIST.0 as i64),
+        "a second one"
+    );
+    m.assert_quiesced();
+}
+
+/// The two-path parse, which is a different parse from `copy_path`'s rather
+/// than a relaxation of it. Each case is one deleted check from splitting
+/// somewhere the caller did not ask for.
+#[test]
+fn symlink_two_path_parse_matrix() {
+    let f = Scratch::new("symparse");
+    let _ = std::fs::remove_file(f.path());
+    let m = Mapped::shared();
+    let bad = -(EINVAL.0 as i64);
+    let link = f.path().to_string();
+
+    assert_eq!(
+        symlink(&m, "/any/target", "/no/such/parent/x"),
+        -(ENOENT.0 as i64),
+        "a missing parent"
+    );
+
+    let n = m.put_paths(1, "/any/target", &link);
+    let mut s = Sqe::path(KORU_OP_SYMLINK, 0x7a0, 1, 0, n);
+    s.handle = 1;
+    assert_eq!(m.run_one(&s), bad, "a non-zero handle");
+
+    let n = m.put_path(1, &link);
+    assert_eq!(
+        m.run_one(&Sqe::path(KORU_OP_SYMLINK, 0x7a1, 1, 0, n)),
+        bad,
+        "no interior NUL"
+    );
+
+    let n = m.put_paths(1, "/any/target", &link);
+    m.slot(1)[3] = 0;
+    assert_eq!(
+        m.run_one(&Sqe::path(KORU_OP_SYMLINK, 0x7a2, 1, 0, n)),
+        bad,
+        "two interior NULs"
+    );
+
+    assert_eq!(symlink(&m, "", &link), bad, "one at the first byte");
+    assert_eq!(symlink(&m, "/any/target", ""), bad, "one at the last byte");
+    assert_eq!(
+        m.run_one(&Sqe::path(KORU_OP_SYMLINK, 0x7a3, 1, 0, 0)),
+        bad,
+        "a zero-length pair"
+    );
+    assert!(
+        std::fs::symlink_metadata(&link).is_err(),
+        "no rejected SYMLINK left a link behind"
+    );
     m.assert_quiesced();
 }

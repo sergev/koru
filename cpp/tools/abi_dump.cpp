@@ -116,6 +116,7 @@ int main()
     konst("KORU_O_DIRECTORY", "u32", KORU_O_DIRECTORY);
     konst("KORU_O_NONBLOCK", "u32", KORU_O_NONBLOCK);
     konst("KORU_OPEN_FLAGS_ALL", "u32", KORU_OPEN_FLAGS_ALL);
+    konst("KORU_MKDIR_MODE_ALL", "u32", KORU_MKDIR_MODE_ALL);
     konst("KORU_CQE_F_MORE", "u32", KORU_CQE_F_MORE);
     konst("KORU_POLL_IN", "u32", KORU_POLL_IN);
     konst("KORU_POLL_OUT", "u32", KORU_POLL_OUT);
@@ -181,6 +182,8 @@ int main()
     OPCODE(KORU_OP_UTIMES);
     OPCODE(KORU_OP_READLINK);
     OPCODE(KORU_OP_STATX_AT);
+    OPCODE(KORU_OP_MKDIR);
+    OPCODE(KORU_OP_SYMLINK);
 #undef OPCODE
 
     {

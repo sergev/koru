@@ -93,44 +93,6 @@ existing "unimplemented completes `-EINVAL`" rule. A new bit in an existing
 Per-opcode meanings for `Cqe::extra` are within its documented contract. New
 data-plane structs change no existing size or offset.
 
-### T26 [M] — `KORU_OP_MKDIR` and `KORU_OP_SYMLINK`
-
-The `start_creating_path` and `end_creating_path` happy path. `vfs_mkdir`
-returns a possibly different dentry, and it is that one, not the one
-`start_creating_path` handed over, that must go to `end_creating_path`;
-confusing them unlocks the wrong inode. `mnt_idmap` is a static inline doing one
-`READ_ONCE` and is reimplemented in Rust.
-
-`MKDIR` carries its mode in `handle`, free on this opcode exactly as `OPEN`'s
-flags are, masked to the permission bits with everything else rejected; the VFS
-applies the umask. Consequence worth noting: Notes.md records that there is no
-`O_CREAT` because no field can carry a creation mode, and this retires that
-reason.
-
-`SYMLINK` needs two paths in one slot: two NUL-terminated strings back to back
-with `len` covering both. Read exactly `len` bytes, require **exactly one**
-interior NUL, split there, append our own NUL to the second, reject either side
-empty. A different parse, not a relaxation of the embedded-NUL rule. Factor it
-into one helper, since T28 needs it. Do not use `off` as a second length — it
-collides with `off`'s within-slot meaning.
-
-**The `mnt_want_write`/`mnt_drop_write` guard lands here**, not at T24 as the
-plan once said: `vfs_truncate` and `vfs_utimes` take the write count themselves,
-`vfs_mkdir` and `vfs_symlink` do not. Notes has the reasoning; `koru_path.rs` is
-where the guard goes, beside `Lookup` and `Link`.
-
-Pass NULL for `delegated_inode` throughout T26 to T28. `try_break_deleg` with
-NULL returns `-EWOULDBLOCK` without taking a reference, so there is no `iput`
-bookkeeping; the cost is that NFS delegations surface as `-EWOULDBLOCK` rather
-than being broken. Right trade for a first cut, and documented.
-
-Done test: both verified with `stat(2)` and `readlink(2)`; the creds case
-against T24's harness; the two-path parse rejection matrix — zero interior NULs,
-two, one at position zero, one at the last byte — each shown to fail when its
-check is deleted. Then 2,000 mkdir-and-rmdir pairs in the heavy phase followed
-by an assertion that the filesystem can still be remounted read-only, which is
-the only instrument that sees a leaked write count.
-
 ### T27 [R] — `KORU_OP_UNLINK` and `KORU_OP_RMDIR`
 
 `start_removing_path` is not exported, and the only exported variant takes a
@@ -149,7 +111,9 @@ Done test: both verified with `access(2)`; `rmdir` on a non-empty directory
 giving `-ENOTEMPTY`, `unlink` on a directory giving `-EISDIR`, `rmdir` on a
 regular file giving `-ENOTDIR`; a path ending in `..` giving `-EINVAL` from our
 own check, which when deleted must fail *differently* rather than not at all;
-the creds case; and T26's write-count balance assertion.
+the creds case; and the write-count balance assertion T26 built — its own tmpfs,
+a loop, then a read-only remount, which is the only instrument that sees an
+unbalanced `mnt_want_write`.
 
 ### T28 [R] — `KORU_OP_RENAME`
 

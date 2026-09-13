@@ -28,7 +28,7 @@ use core::mem::offset_of;
 use core::ptr::NonNull;
 
 use crate::koru_abi::*;
-use crate::koru_path::{Link, Lookup, LOOKUP_FOLLOW};
+use crate::koru_path::{Creating, Link, Lookup, LOOKUP_DIRECTORY, LOOKUP_FOLLOW};
 use crate::{module_get_live, module_put, RingCtx};
 
 /// Nanoseconds to jiffies, rounded up so a sub-millisecond delay still waits.
@@ -355,9 +355,12 @@ impl RingCtx {
             KORU_OP_POLL_ADD => RingCtx::poll_op(me, sqe).map(|res| (res, 0)),
             KORU_OP_STAT => RingCtx::stat_op(me, sqe).map(|res| (res, 0)),
             // Inline for `OPEN`'s reason, and permanently. See `path_op`.
-            KORU_OP_TRUNCATE | KORU_OP_UTIMES | KORU_OP_READLINK | KORU_OP_STATX_AT => {
-                Some(me.path_op(sqe))
-            }
+            KORU_OP_TRUNCATE
+            | KORU_OP_UTIMES
+            | KORU_OP_READLINK
+            | KORU_OP_STATX_AT
+            | KORU_OP_MKDIR
+            | KORU_OP_SYMLINK => Some(me.path_op(sqe)),
             KORU_OP_CANCEL => plain(me.cancel_op(sqe)),
             KORU_OP_CHECKSUM => {
                 if sqe.handle != 0 {
@@ -495,6 +498,69 @@ impl RingCtx {
         Ok(path)
     }
 
+    /// `do_open`'s recipe: validate, claim, copy, release. The claim lasts only
+    /// the snapshot, because the VFS call after it can block on disk.
+    fn take_path(&self, sqe: &Sqe) -> Result<KVec<u8>> {
+        let pos = self.path_validate(sqe)?;
+
+        if !self.state.lock().slot_try_acquire(sqe.slot) {
+            return Err(EBUSY);
+        }
+        let path = self.copy_path(pos, sqe.len as usize);
+        self.state.lock().slot_release(sqe.slot);
+        path
+    }
+
+    /// The same for a two-path op: `len` covers both strings and the NUL
+    /// between them. An over-long half is the VFS's to refuse.
+    fn take_path_pair(&self, sqe: &Sqe) -> Result<(KVec<u8>, KVec<u8>)> {
+        if sqe.handle != 0 {
+            return Err(EINVAL);
+        }
+        self.check_range(sqe)?;
+        if sqe.len == 0 || sqe.len >= 2 * bindings::PATH_MAX {
+            return Err(EINVAL);
+        }
+        let pos = self.slot_offset(sqe)?;
+
+        if !self.state.lock().slot_try_acquire(sqe.slot) {
+            return Err(EBUSY);
+        }
+        let pair = self.copy_pair(pos, sqe.len as usize);
+        self.state.lock().slot_release(sqe.slot);
+        pair
+    }
+
+    /// Split `len` bytes at their one interior NUL, terminating our own copy of
+    /// each half. **Exactly one** NUL, at neither end: a different parse from
+    /// [`copy_path`](Self::copy_path)'s, not a relaxation of it.
+    fn copy_pair(&self, pos: usize, len: usize) -> Result<(KVec<u8>, KVec<u8>)> {
+        let mut raw = KVec::with_capacity(len, GFP_KERNEL)?;
+        self.read_slot(pos, len, &mut raw)?;
+
+        let mut at = None;
+        for (i, &b) in raw.iter().enumerate() {
+            if b == 0 {
+                if at.is_some() {
+                    return Err(EINVAL); // A second NUL: which one splits?
+                }
+                at = Some(i);
+            }
+        }
+        let at = at.ok_or(EINVAL)?;
+        // At either end one half would be empty, which is no path at all.
+        if at == 0 || at + 1 == len {
+            return Err(EINVAL);
+        }
+
+        let mut first = KVec::with_capacity(at + 1, GFP_KERNEL)?;
+        first.extend_from_slice(&raw[..=at], GFP_KERNEL)?; // its NUL is the split
+        let mut second = KVec::with_capacity(len - at, GFP_KERNEL)?;
+        second.extend_from_slice(&raw[at + 1..], GFP_KERNEL)?;
+        second.push(0u8, GFP_KERNEL)?; // ours, as `copy_path` appends one
+        Ok((first, second))
+    }
+
     /// Where a path op's argument block starts: the first 8-aligned slot offset
     /// at or after the end of the path. `EINVAL` if `size` bytes do not fit.
     fn arg_offset(&self, sqe: &Sqe, size: usize) -> Result<u64> {
@@ -541,16 +607,7 @@ impl RingCtx {
 
     fn do_open(&self, sqe: &Sqe) -> Result<u32> {
         let flags = open_flags(sqe.handle)?;
-        let pos = self.path_validate(sqe)?;
-
-        // Claim the slot so nothing writes the page mid-copy, and release it as
-        // soon as the snapshot is taken: filp_open can block on disk.
-        if !self.state.lock().slot_try_acquire(sqe.slot) {
-            return Err(EBUSY);
-        }
-        let path = self.copy_path(pos, sqe.len as usize);
-        self.state.lock().slot_release(sqe.slot);
-        let path = path?;
+        let path = self.take_path(sqe)?;
         let cpath = CStr::from_bytes_with_nul(&path).map_err(|_| EINVAL)?;
 
         // SAFETY: `cpath` is NUL-terminated and lives across the call. Runs in
@@ -839,8 +896,8 @@ impl RingCtx {
         Ok((n as i64, statx_to_koru(mask)))
     }
 
-    /// The four path ops. `res` is 0, or a length for `READLINK` and
-    /// `STATX_AT`; only `STATX_AT` sets `extra`.
+    /// The path ops. `res` is 0, or a length for `READLINK` and `STATX_AT`;
+    /// only `STATX_AT` sets `extra`.
     ///
     /// **Inline, permanently**: in a kworker `current_cred()` is `init_cred`
     /// and `current->fs` is the init root, and `override_creds` is not
@@ -851,8 +908,65 @@ impl RingCtx {
             KORU_OP_TRUNCATE => self.do_truncate(sqe).map_or_else(failed, |()| (0, 0)),
             KORU_OP_UTIMES => self.do_utimes(sqe).map_or_else(failed, |()| (0, 0)),
             KORU_OP_STATX_AT => self.do_statx_at(sqe).unwrap_or_else(failed),
+            KORU_OP_MKDIR => self.do_mkdir(sqe).map_or_else(failed, |()| (0, 0)),
+            KORU_OP_SYMLINK => self.do_symlink(sqe).map_or_else(failed, |()| (0, 0)),
             _ => self.do_readlink(sqe).map_or_else(failed, |res| (res, 0)),
         }
+    }
+
+    /// `MKDIR`: `handle` carries the mode, as `OPEN`'s carries its flags.
+    fn do_mkdir(&self, sqe: &Sqe) -> Result<()> {
+        if sqe.handle & !KORU_MKDIR_MODE_ALL != 0 {
+            return Err(EINVAL);
+        }
+        let mode = u16::try_from(sqe.handle).map_err(|_| EINVAL)?;
+        let path = self.take_path(sqe)?;
+        let cpath = CStr::from_bytes_with_nul(&path).map_err(|_| EINVAL)?;
+
+        // `mkdir(2)`'s own flag: it is what lets a trailing slash through.
+        let mut c = Creating::new(cpath, LOOKUP_DIRECTORY)?;
+        // SAFETY: the section holds the parent locked and its mount pinned,
+        // and the dentry is the negative one it made. NULL `delegated_inode`:
+        // `try_break_deleg` then takes no reference. See doc/Notes.md.
+        let de = unsafe {
+            bindings::vfs_mkdir(
+                c.idmap(),
+                c.parent(),
+                c.dentry(),
+                mode,
+                core::ptr::null_mut(),
+            )
+        };
+        // Always: on error it already unlocked the one it was given, on
+        // success it may have replaced it.
+        c.replace(de);
+        from_err_ptr(de)?;
+        Ok(())
+    }
+
+    /// `SYMLINK`: the target, then the link to create. The second path is the
+    /// one that gets looked up, and the first is stored verbatim.
+    fn do_symlink(&self, sqe: &Sqe) -> Result<()> {
+        let (target, link) = self.take_path_pair(sqe)?;
+        let ctarget = CStr::from_bytes_with_nul(&target).map_err(|_| EINVAL)?;
+        let clink = CStr::from_bytes_with_nul(&link).map_err(|_| EINVAL)?;
+
+        let c = Creating::new(clink, 0)?;
+        // SAFETY: as `do_mkdir`, and `ctarget` outlives the call. Unlike
+        // `vfs_mkdir`, this never replaces or unlocks the dentry.
+        let ret = unsafe {
+            bindings::vfs_symlink(
+                c.idmap(),
+                c.parent(),
+                c.dentry(),
+                ctarget.as_char_ptr(),
+                core::ptr::null_mut(),
+            )
+        };
+        if ret < 0 {
+            return Err(Error::from_errno(ret));
+        }
+        Ok(())
     }
 
     /// `STATX_AT`: `STAT`'s answer for a path rather than a handle. The struct

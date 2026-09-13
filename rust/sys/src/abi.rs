@@ -164,6 +164,21 @@ pub const KORU_OP_READLINK: u8 = 13;
 /// `STAT`: a later field comes out of `KoruStat::reserved`, which fixes the
 /// struct's size for every binary at this ABI version.
 pub const KORU_OP_STATX_AT: u8 = 14;
+/// Create the directory the path names. No argument: `handle` carries the mode,
+/// free on this opcode exactly as `OPEN`'s flags are, and `res` is 0. The VFS
+/// applies the umask, as `mkdir(2)` does.
+pub const KORU_OP_MKDIR: u8 = 15;
+/// Create a symlink. **Two** NUL-terminated paths back to back in the slot, with
+/// `len` covering both and their separator: the target first, then the link to
+/// create, in `symlink(2)`'s own argument order. Exactly one NUL may fall inside
+/// those `len` bytes and neither half may be empty. `handle` must be zero and
+/// `res` is 0.
+pub const KORU_OP_SYMLINK: u8 = 16;
+
+/// What a `MKDIR` SQE's `handle` may carry: the permission bits and the sticky
+/// bit, which is all `vfs_mkdir` keeps of a requested mode. Any other bit is
+/// `EINVAL` rather than silently dropped, as an unknown open flag is.
+pub const KORU_MKDIR_MODE_ALL: u32 = 0o1777;
 
 /// Any bit set is rejected.
 pub const KORU_SQE_FLAGS_ALL: u8 = 0;

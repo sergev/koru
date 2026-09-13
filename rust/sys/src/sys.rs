@@ -80,6 +80,9 @@ unsafe extern "C" {
 
     /// `int mkfifo(const char *pathname, mode_t mode);`
     pub fn mkfifo(pathname: *const std::ffi::c_char, mode: ModeT) -> c_int;
+
+    /// `mode_t umask(mode_t mask);` — `MKDIR`'s mode passes through it.
+    pub fn umask(mask: ModeT) -> ModeT;
 }
 
 pub const PROT_READ: c_int = 0x1;

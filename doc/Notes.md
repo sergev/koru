@@ -376,7 +376,9 @@ bump, no size change, no change to any existing test.
 `OPEN` carries its flags in the SQE's `handle` field, which it has no other use
 for. They are koru's own bit values, not the host `O_*` constants, which differ
 between architectures; the kernel whitelists and translates. There is no
-`O_CREAT`, because no field can carry a creation mode.
+`O_CREAT`, because on this opcode `handle` is already spent on the flags and no
+other field can carry a creation mode. T26's `MKDIR`, which has `handle` free,
+is what shows that is a fact about `OPEN` rather than about the SQE.
 
 `OPEN` claims the slot it reads its path from, then releases it the moment the
 copy is done — before `filp_open`, which can block on disk. So the claim window
@@ -1202,6 +1204,131 @@ T24 arm does. Its `extra` oracle is the `STAT` one, now shared by the two
 opcodes, and the per-opcode counters stopped being indexed by `op & 15`: with
 fifteen opcodes an unknown one aliased into a real bucket, which could have
 satisfied the reached-once check for an opcode nothing ever submitted.
+
+### Creating things, and the guard the plan kept asking for
+
+T26 added `MKDIR` and `SYMLINK`, the first ops that make something rather than
+read or change it. Both are `start_creating_path`, then `vfs_mkdir` or
+`vfs_symlink`, then `end_creating_path` — the sequence `filename_mkdirat` and
+`filename_symlinkat` are, with our own path copy in front of it.
+
+**The `mnt_want_write` guard is not needed here either.** The plan moved it from
+T24 to T26 on the grounds that `vfs_mkdir` and `vfs_symlink` do not take the
+write count themselves. They do not — but `start_creating_path` does, inside
+`filename_create`, and `end_creating_path` drops it along with the parent's lock
+and the path reference. So the count is balanced by the same two calls that
+balance everything else, and a separate guard would be a second, unbalanced one.
+It belongs at T27, where `start_removing_path` is unusable and the sequence is
+hand-assembled. This is the second time the plan has asked for that guard one
+task too early; the instrument for it, though, is real and is described below.
+
+**`Creating` is the guard that is needed**, and it holds three things at once:
+the parent inode's lock, the mount's write count and the path reference. A `?`
+between `start_creating_path` and `end_creating_path` would leave a directory
+locked for ever, which is not a leak but a hang.
+
+**`vfs_mkdir` may return a different dentry**, and it is that one, not the one
+it was given, that `end_creating_path` must unlock — hence `Creating::replace`,
+called on every path out of `vfs_mkdir`. Two halves of that rule behave very
+differently here. The *success* half is unreachable in this VM: tmpfs and
+overlayfs both return `NULL`, so the dentry never actually changes, and
+perturbing the code to pass the original one changes nothing. Only a filesystem
+whose `->mkdir` splices an alias would tell the difference. The *error* half is
+reachable and sharp: on failure `vfs_mkdir` has already unlocked and dropped the
+dentry, so passing that one on unlocks an inode nobody holds — and the check
+does reach it, because `vfs_mkdir` is where an unprivileged create in a
+searchable-but-unwritable directory is refused.
+
+**`SYMLINK` carries two paths in one slot**, `len` covering both and the NUL
+between them, target first as in `symlink(2)`. That is a different parse from
+`copy_path`'s, not a relaxation of it: exactly one NUL may fall inside those
+bytes, at neither end, and the second half gets a NUL of our own. The plan's
+alternative — `off` as a second length — would have collided with `off`'s
+within-slot meaning, which is the same argument T24 settled for `TRUNCATE`.
+
+`MKDIR` carries its mode in `handle`, free on that opcode exactly as `OPEN`'s
+flags are. The mask is `0o1777`, which is all `vfs_prepare_mode` keeps of a
+requested directory mode; `S_ISUID` and `S_ISGID` are rejected rather than
+silently dropped, as an unknown open flag is. The VFS applies the umask — the
+*submitting* task's, which is another thing that would be wrong in a kworker.
+**This retires the reason Notes gives for having no `O_CREAT`**: `handle` can
+carry a creation mode after all. `OPEN` still has none, because on that opcode
+`handle` is spent on the flags.
+
+`delegated_inode` is NULL throughout. `try_break_deleg` with NULL takes no
+reference and returns `-EWOULDBLOCK`, so there is no `iput` bookkeeping and no
+retry loop; the cost is that an NFS delegation surfaces as `-EWOULDBLOCK`
+instead of being broken.
+
+#### What was verified, and how
+
+Six perturbations, each applied and reverted. Five fail; the sixth is the
+finding below.
+
+- **Defer `MKDIR` to the workqueue.** The unprivileged child creates a directory
+  inside a root-only one, and the sticky-bit mode comes back wrong because the
+  kworker's umask is not the submitter's. Creating something as root for a
+  caller who may not is the worst failure mode in this plan, and it is one line
+  away at every one of these opcodes.
+- **Pass `vfs_mkdir` the dentry it was given rather than the one it returned.**
+  The guest hangs with no output, on the creds child's refused create: the
+  parent inode is unlocked twice. A hang rather than an assertion, like two of
+  T18's.
+- **Leak one `mnt_want_write` per `MKDIR`.** Exactly one assertion fails, and
+  only the last one: the tmpfs the heavy loop mounts refuses to go read-only
+  with `EBUSY`. Nothing else anywhere in the check notices — no splat, no leak
+  report — which is what makes that assertion the only instrument there is.
+- **Delete the mode mask.** Three assertions fail; `S_ISUID` is accepted and
+  silently dropped by the VFS, which is exactly the outcome koru refuses.
+- **Accept an empty half of the pair.** A symlink to the empty string is
+  created and reported as success.
+- **Swap the two paths.** Six assertions fail, the creds child included.
+- **Accept a second interior NUL, splitting at the first.** *Nothing fails.*
+  Whatever the split leaves behind still reaches
+  `CStr::from_bytes_with_nul`, which refuses an interior NUL with the same
+  `EINVAL` — so the rule is subsumed by the conversion and cannot be falsified
+  by errno. It stays because a parse should state its own rule rather than
+  inherit it from a later step, but it is not a tested guard. The two-NUL case
+  in the check passes for the conversion's reason, not for the rule's.
+
+The heavy phase mounts a tmpfs of its own and runs 2,000 `MKDIR`-and-`rmdir`
+plus 2,000 `SYMLINK`-and-`unlink` pairs on it before the remount. Its own mount,
+because the write count a shared filesystem carries is everybody's.
+
+#### The fuzzer's sandbox was never what it claimed
+
+T24 recorded that the fuzzer "names only its own scratch file, its own symlink
+and a path that resolves nowhere", and called that the most important line in
+it. It was not true, and T26 is where that showed: `MKDIR` started creating
+directories called `/tmp/koru-check-patte` — a 21-byte prefix of the check's own
+pattern file, which is what `/tmp/koru-fuzz-dir/c3` truncates to.
+
+Two holes, both older than T26 and both invisible while no opcode created
+anything:
+
+- **A generator writes the path into the slot as a side effect**, and a batch of
+  eight SQEs shared one path slot per thread. The last generator to run decided
+  what every path op in that batch would read, cut to each one's own `len`. The
+  same hole let `TRUNCATE` name the pattern file, which is destructive, not
+  merely untidy.
+- **The hostile generator mutates `slot`, `off` and `len`**, and a random opcode
+  byte can land on a path op. Either one points it at whatever another thread
+  last wrote.
+
+The fix is structural rather than statistical, which is what the plan demanded.
+Every path op is now generated by one function, `gen_path`, which writes the
+path itself and sets the exact `(slot, off, len)` for it; the hostile generator
+regenerates any SQE that ends up being a path op, so a mutated field can never
+survive on one. Each SQE in a batch gets its own private path slot — the arena
+grew to `8 + NWORKERS * BATCH` slots for that — and `READ`, `WRITE` and
+`CHECKSUM` pick only from the eight shared ones, so nothing can overwrite a path
+while the kernel is copying it. The hostile slot values are all past
+`slot_count` for the same reason.
+
+What that costs is hostile coverage of the path ops' own fields, which the
+deterministic rejection matrices carry instead — they cover every field of every
+path op, and the validation is shared code. What it buys is that no fuzz run can
+touch anything outside four names, provable by reading one function.
 
 ### Cancellation
 

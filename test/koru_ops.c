@@ -13,6 +13,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/mount.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
@@ -1106,6 +1107,9 @@ void sec_stat(void)
  * leaves no room for the argument after it. */
 #define SHORTPATH "/run/abc"
 #define CREDSDIR  "/tmp/koru-check-credsdir"
+/* Searchable but not writable: the lookup succeeds and `vfs_mkdir` itself is
+ * what refuses, which is the only way to reach its error path. */
+#define CREDSRO   "/tmp/koru-check-credsro"
 #define CREDSLINK CREDSDIR "/link"
 /* Longer than tmpfs's SHORT_SYMLINK_LEN, so the target is page-backed and
  * vfs_get_link arms a delayed call. A short one arms none and leaks nothing. */
@@ -1487,6 +1491,173 @@ static void path_statx(void)
     }
 }
 
+/* T26: MKDIR and SYMLINK, the start_creating_path pair. */
+
+#define NEWDIR   "/tmp/koru-check-newdir"
+#define NEWLINK  "/tmp/koru-check-newlink"
+/* Its own mount, so the write count the remount sees is only ours. */
+#define BALDIR   "/run/koru-check-mnt"
+
+/* mode & 07777 of `path`, or -1. */
+static int path_mode(const char *path)
+{
+    struct stat sb;
+
+    return lstat(path, &sb) == 0 ? (int)(sb.st_mode & 07777) : -1;
+}
+
+static int is_dir(const char *path)
+{
+    struct stat sb;
+
+    return lstat(path, &sb) == 0 && S_ISDIR(sb.st_mode);
+}
+
+static void path_mkdir(void)
+{
+    struct koru_sqe s;
+    mode_t old = umask(0);
+
+    rmdir(NEWDIR);
+    check_res(r_mkdir(&R, 1, NEWDIR, 0750), 0, "MKDIR creates a directory");
+    check(is_dir(NEWDIR), "  and stat(2) calls it one");
+    check(path_mode(NEWDIR) == 0750, "  with the mode it asked for");
+    check_res(r_mkdir(&R, 1, NEWDIR, 0755), -EEXIST, "  a second one is EEXIST");
+    rmdir(NEWDIR);
+
+    /* The VFS applies the submitter's umask, as mkdir(2) does. */
+    umask(022);
+    check_res(r_mkdir(&R, 1, NEWDIR, 0777), 0, "MKDIR under umask 022");
+    check(path_mode(NEWDIR) == 0755, "  has the umask applied by the VFS");
+    rmdir(NEWDIR);
+    umask(0);
+
+    /* The sticky bit is the one non-permission bit vfs_mkdir keeps. */
+    check_res(r_mkdir(&R, 1, NEWDIR, 01777), 0, "MKDIR accepts the sticky bit");
+    check(path_mode(NEWDIR) == 01777, "  and sets it");
+    rmdir(NEWDIR);
+
+    /* LOOKUP_DIRECTORY is what lets a trailing slash through. */
+    check_res(r_mkdir(&R, 1, NEWDIR "/", 0700), 0, "MKDIR accepts a trailing slash");
+    check(is_dir(NEWDIR), "  and creates the directory named");
+    rmdir(NEWDIR);
+
+    check_res(r_mkdir(&R, 1, "/no/such/parent/x", 0700), -ENOENT,
+              "MKDIR under a missing parent is ENOENT");
+    check_res(r_mkdir(&R, 1, "/tmp/.", 0700), -EEXIST, "  of a path ending in . is EEXIST");
+    check_res(r_mkdir(&R, 1, NEWDIR, 04755), -EINVAL, "  a mode bit outside the mask is EINVAL");
+    check_res(r_mkdir(&R, 1, NEWDIR, 0100000), -EINVAL, "  and a file-type bit too");
+
+    sqe_path(&s, KORU_OP_MKDIR, 1, 0, 0, 0x760);
+    check_res(run_one(R.fd, &s), -EINVAL, "  a zero-length path is EINVAL");
+    sqe_path(&s, KORU_OP_MKDIR, R.slot_count, 0, 8, 0x761);
+    check_res(run_one(R.fd, &s), -EINVAL, "  a slot past the arena is EINVAL");
+    check(!is_dir(NEWDIR), "and no rejected MKDIR left a directory behind");
+
+    umask(old);
+}
+
+/* The slot's two paths, as SYMLINK reads them. Returns the SQE's len. */
+static uint32_t put_pair(uint32_t slot, const char *a, const char *b)
+{
+    return put_paths(R.arena, R.slot_size, slot, a, b);
+}
+
+static void path_symlink(void)
+{
+    struct koru_sqe s;
+    char got[512];
+    uint32_t n;
+    ssize_t k;
+
+    unlink(NEWLINK);
+    check_res(r_symlink(&R, 1, LONGTARGET, NEWLINK), 0, "SYMLINK creates a link");
+    k = readlink(NEWLINK, got, sizeof(got) - 1);
+    if (k > 0)
+        got[k] = 0;
+    check(k > 0 && strcmp(got, LONGTARGET) == 0, "  and readlink(2) gives the target back");
+    check(path_mode(NEWLINK) == 0777, "  with a symlink's own mode");
+    check_res(r_symlink(&R, 1, LONGTARGET, NEWLINK), -EEXIST, "  a second one is EEXIST");
+    unlink(NEWLINK);
+
+    check_res(r_symlink(&R, 1, "/any/target", "/no/such/parent/x"), -ENOENT,
+              "SYMLINK under a missing parent is ENOENT");
+
+    /* The two-path parse. Each of these is one deleted check away from
+     * splitting somewhere the caller did not ask for. */
+    n = put_pair(1, "/any/target", NEWLINK);
+    sqe_path(&s, KORU_OP_SYMLINK, 1, 0, n, 0x770);
+    s.handle = 1;
+    check_res(run_one(R.fd, &s), -EINVAL, "SYMLINK with a non-zero handle is EINVAL");
+
+    put_path(R.arena, R.slot_size, 1, NEWLINK);
+    sqe_path(&s, KORU_OP_SYMLINK, 1, 0, (uint32_t)strlen(NEWLINK), 0x771);
+    check_res(run_one(R.fd, &s), -EINVAL, "  no interior NUL is EINVAL");
+
+    n            = put_pair(1, "/any/target", NEWLINK);
+    R.arena[R.slot_size + 3] = 0;
+    sqe_path(&s, KORU_OP_SYMLINK, 1, 0, n, 0x772);
+    check_res(run_one(R.fd, &s), -EINVAL, "  two of them is EINVAL");
+
+    n = put_pair(1, "", NEWLINK);
+    sqe_path(&s, KORU_OP_SYMLINK, 1, 0, n, 0x773);
+    check_res(run_one(R.fd, &s), -EINVAL, "  one at the first byte is EINVAL");
+
+    n = put_pair(1, "/any/target", "");
+    sqe_path(&s, KORU_OP_SYMLINK, 1, 0, n, 0x774);
+    check_res(run_one(R.fd, &s), -EINVAL, "  and one at the last byte is EINVAL");
+
+    sqe_path(&s, KORU_OP_SYMLINK, 1, 0, 0, 0x775);
+    check_res(run_one(R.fd, &s), -EINVAL, "  a zero-length pair is EINVAL");
+    check(readlink(NEWLINK, got, sizeof(got)) < 0, "and no rejected SYMLINK left a link behind");
+}
+
+/* Heavy: start_creating_path takes the mount's write count and end_creating_path
+ * drops it. Nothing else sees an unbalanced one — no splat, no leak report —
+ * until the filesystem refuses to go read-only. Its own tmpfs, so the count the
+ * remount weighs is ours alone. */
+#define BALANCE 2000u
+
+static void path_create_balance(void)
+{
+    char dir[64], link[64];
+    unsigned i, made = 0;
+    int ok = 1;
+
+    rmdir(BALDIR);
+    if (mkdir(BALDIR, 0700) != 0 || mount("none", BALDIR, "tmpfs", 0, NULL) != 0) {
+        printf("%-58s SKIP (cannot mount a tmpfs)\n", "2,000 MKDIR and SYMLINK pairs");
+        rmdir(BALDIR);
+        return;
+    }
+
+    for (i = 0; i < BALANCE; i++) {
+        snprintf(dir, sizeof(dir), BALDIR "/d%u", i);
+        snprintf(link, sizeof(link), BALDIR "/l%u", i);
+        if (r_mkdir(&R, 1, dir, 0700) != 0 || r_symlink(&R, 1, LONGTARGET, link) != 0)
+            break;
+        if (rmdir(dir) != 0 || unlink(link) != 0) {
+            ok = 0;
+            break;
+        }
+        made++;
+    }
+    check(made == BALANCE && ok, "2,000 MKDIR and SYMLINK pairs");
+
+    /* A leaked mnt_want_write is EBUSY here and nothing anywhere else. */
+    if (mount(NULL, BALDIR, NULL, MS_REMOUNT | MS_RDONLY, NULL) == 0) {
+        check(1, "  and the filesystem still goes read-only");
+    } else {
+        check(0, "  and the filesystem still goes read-only");
+        note("remount read-only: %s", strerror(errno));
+    }
+    if (mount(NULL, BALDIR, NULL, MS_REMOUNT, NULL) != 0)
+        note("could not remount %s read-write", BALDIR);
+    if (umount(BALDIR) != 0)
+        note("could not unmount %s", BALDIR);
+    rmdir(BALDIR);
+}
+
 /* The whole inline-because-of-creds rule, for something other than OPEN.
  * Deferred to a kworker every one of these would run as root in the initial
  * namespaces, and each EACCES below would become a success. */
@@ -1524,6 +1695,18 @@ static int path_creds_child(struct koru_ring *m)
     /* Same directory, and the op that would report its target's every field. */
     if (r_statx(m, 0, CREDSLINK, NULL) != -EACCES)
         return 9;
+    /* Creating in it needs write and search, and the child has neither. */
+    if (r_mkdir(m, 0, CREDSDIR "/sub", 0700) != -EACCES)
+        return 10;
+    if (r_symlink(m, 0, "/any/target", CREDSDIR "/new") != -EACCES)
+        return 11;
+    /* Here the lookup succeeds and vfs_mkdir refuses, so its error path runs:
+     * it has already unlocked and dropped the dentry it was given, and passing
+     * that one to end_creating_path unlocks an inode nobody holds. */
+    if (r_mkdir(m, 0, CREDSRO "/sub", 0700) != -EACCES)
+        return 12;
+    if (r_symlink(m, 0, "/any/target", CREDSRO "/new") != -EACCES)
+        return 13;
     return 0;
 }
 
@@ -1543,7 +1726,9 @@ static void path_creds(void)
     }
     unlink(CREDSLINK);
     rmdir(CREDSDIR);
-    if (mkdir(CREDSDIR, 0700) != 0 || symlink("/etc/hostname", CREDSLINK) != 0) {
+    rmdir(CREDSRO);
+    if (mkdir(CREDSDIR, 0700) != 0 || symlink("/etc/hostname", CREDSLINK) != 0 ||
+        mkdir(CREDSRO, 0755) != 0) {
         check(0, "create the root-only directory");
         unlink(TRFILE);
         return;
@@ -1559,9 +1744,10 @@ static void path_creds(void)
         if (pid < 0 || waitpid(pid, &st, 0) != pid) {
             check(0, "fork the path creds child");
         } else {
-            /* 5 truncate, 6 utimes, 7 touch, 8 readlink, 9 statx. */
+            /* 5 truncate, 6 utimes, 7 touch, 8 readlink, 9 statx, 10 mkdir,
+             * 11 symlink, 12 and 13 the same two where the lookup succeeds. */
             check(WIFEXITED(st) && WEXITSTATUS(st) == 0,
-                  "an unprivileged TRUNCATE, UTIMES, READLINK and STATX_AT are refused");
+                  "every unprivileged path op is refused");
             if (WIFEXITED(st) && WEXITSTATUS(st) != 0)
                 note("child verdict %d", WEXITSTATUS(st));
         }
@@ -1569,6 +1755,7 @@ static void path_creds(void)
     }
     unlink(CREDSLINK);
     rmdir(CREDSDIR);
+    rmdir(CREDSRO);
     unlink(TRFILE);
 }
 
@@ -1611,8 +1798,11 @@ void sec_path(void)
     path_utimes();
     path_readlink();
     path_statx();
+    path_mkdir();
+    path_symlink();
     path_creds();
     path_readlink_leak();
+    path_create_balance();
 }
 
 void sec_delay(void)

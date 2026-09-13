@@ -65,6 +65,10 @@ int64_t r_close(struct koru_ring *r, uint32_t handle);
 int64_t r_adopt(struct koru_ring *r, int fd);
 int64_t r_read(struct koru_ring *r, uint32_t handle, uint32_t slot, uint64_t off, uint32_t len);
 int64_t r_write(struct koru_ring *r, uint32_t handle, uint32_t slot, uint64_t off, uint32_t len);
+/* MKDIR carries its mode in handle, as OPEN carries its flags. */
+int64_t r_mkdir(struct koru_ring *r, uint32_t slot, const char *path, uint32_t mode);
+/* SYMLINK takes both paths in the slot, target first. */
+int64_t r_symlink(struct koru_ring *r, uint32_t slot, const char *target, const char *link);
 /* `extra` may be NULL; on success it gets the CQE's KORU_STAT_* mask. */
 int64_t r_stat(struct koru_ring *r, uint32_t handle, uint32_t slot, uint64_t off, uint32_t len,
                uint64_t *extra);
@@ -85,7 +89,8 @@ void sqe_write(struct koru_sqe *s, uint32_t handle, uint32_t slot, uint64_t off,
 void sqe_stat(struct koru_sqe *s, uint32_t handle, uint32_t slot, uint64_t off, uint32_t len,
               uint64_t user_data);
 /* A path op: path at (off, len), argument after it. `opcode` is one of
- * KORU_OP_TRUNCATE, KORU_OP_UTIMES, KORU_OP_READLINK, KORU_OP_STATX_AT. */
+ * KORU_OP_TRUNCATE, KORU_OP_UTIMES, KORU_OP_READLINK, KORU_OP_STATX_AT,
+ * KORU_OP_MKDIR, KORU_OP_SYMLINK. */
 void sqe_path(struct koru_sqe *s, uint8_t opcode, uint32_t slot, uint64_t off, uint32_t len,
               uint64_t user_data);
 /* Where a path op's argument goes: the first 8-aligned offset at or after the
@@ -101,6 +106,10 @@ uint8_t pattern_byte(size_t i);
 
 /* Copy a path into a slot, without its NUL. Returns its length. */
 uint32_t put_path(uint8_t *arena, uint32_t slot_size, uint32_t slot, const char *path);
+/* Two paths back to back with one NUL between them, as SYMLINK wants. Returns
+ * the byte count covering both and the separator. */
+uint32_t put_paths(uint8_t *arena, uint32_t slot_size, uint32_t slot, const char *a,
+                   const char *b);
 
 /* Run one path op on a mapped ring: put `path` at slot offset 0, copy `arg`
  * after it, submit, return its res. `arg` may be NULL. */

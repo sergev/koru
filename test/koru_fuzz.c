@@ -15,6 +15,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -24,15 +25,24 @@
 #define FUZZWRFILE "/tmp/koru-fuzz-write"
 /* Its own symlink, the only one it ever reads. */
 #define FUZZLINK "/tmp/koru-fuzz-link"
+/* The only directory it ever creates in, emptied by the janitor thread and
+ * removed at the end. MKDIR and SYMLINK make objects; nothing else here does. */
+#define FUZZDIR   "/tmp/koru-fuzz-dir"
+#define FUZZNAMES 8u
 
 #define F_SQ      64u
 #define F_CQ      128u
 #define F_SLOT    4096u
-#define F_SLOTS   24u
-#define F_ARENA   ((uint64_t)F_SLOT * F_SLOTS)
-#define F_HANDLES 128u
 #define NWORKERS  8
 #define BATCH     8u
+/* The shared data slots, which READ, WRITE and CHECKSUM pick from: eight
+ * threads over eight slots collide often, which is what keeps the exclusivity
+ * rule exercised. Above them sits one private path slot per thread per batch
+ * index, so no two generated SQEs ever share one. */
+#define F_SHARED  8u
+#define F_SLOTS   (F_SHARED + (uint32_t)NWORKERS * BATCH)
+#define F_ARENA   ((uint64_t)F_SLOT * F_SLOTS)
+#define F_HANDLES 128u
 #define SECONDS   3u
 #define SUB_FLOOR 5000ull
 
@@ -71,7 +81,7 @@ static atomic_uint handle_pool[POOL];
 static atomic_uint pool_next;
 
 /* One per opcode, plus a bucket for everything that is not one. */
-#define NOPCODES (KORU_OP_STATX_AT + 2)
+#define NOPCODES (KORU_OP_SYMLINK + 2)
 
 static atomic_ullong op_total[NOPCODES], op_ok[NOPCODES];
 static atomic_ullong open_einval, open_ebusy, open_emfile, open_other;
@@ -103,12 +113,19 @@ static int extra_allowed(uint8_t opcode, const struct koru_cqe *c)
     return c->extra == 0;
 }
 
+/* Every opcode that names a file by path. The fuzzer sandboxes all of them. */
+static int is_path_op(uint8_t op)
+{
+    return op == KORU_OP_TRUNCATE || op == KORU_OP_UTIMES || op == KORU_OP_READLINK ||
+           op == KORU_OP_STATX_AT || op == KORU_OP_MKDIR || op == KORU_OP_SYMLINK;
+}
+
 /* Which per-opcode counter a completion lands in. Never a mask: an unknown
  * opcode aliased into a real bucket would satisfy the reached-once check for an
  * opcode nothing ever submitted. */
 static unsigned op_bucket(uint8_t op)
 {
-    return op <= KORU_OP_STATX_AT ? op : NOPCODES - 1;
+    return op <= KORU_OP_SYMLINK ? op : NOPCODES - 1;
 }
 
 /* There is only one Cqe constructor, so any deviation is a real bug. */
@@ -174,6 +191,13 @@ static int res_allowed(uint8_t opcode, int64_t res)
         return res == (int64_t)sizeof(struct koru_stat) || res == -EINVAL || res == -EBUSY ||
                res == -ENOMEM || res == -ENOENT || res == -ENOTDIR || res == -EACCES ||
                res == -ELOOP || res == -ENAMETOOLONG;
+    case KORU_OP_MKDIR:
+    case KORU_OP_SYMLINK:
+        /* The janitor races these, so EEXIST and ENOENT are both ordinary. */
+        return res == 0 || res == -EINVAL || res == -EBUSY || res == -ENOMEM ||
+               res == -EEXIST || res == -ENOENT || res == -ENOTDIR || res == -EACCES ||
+               res == -EPERM || res == -ELOOP || res == -ENAMETOOLONG || res == -EROFS ||
+               res == -ENOSPC || res == -EDQUOT || res == -EMLINK;
     default:
         return res == -EINVAL;
     }
@@ -197,13 +221,78 @@ static void account(int ret, const struct koru_enter *e)
 #define UD(opcode, tag) (((uint64_t)(opcode) << 8) | ((tag) & 0xff))
 #define UD_OPCODE(ud)   ((uint8_t)(((ud) >> 8) & 0xff))
 
+/* Every op that names a file by path, and the whole of the fuzzer's sandbox.
+ *
+ * It writes the path itself into this thread's private slot and gives the SQE
+ * the exact (slot, off, len) for it, so **no path op can ever name anything but
+ * the four objects below**. That is structural, not statistical: a borrowed
+ * slot or a truncated `len` would hand TRUNCATE or MKDIR some prefix of
+ * whatever another thread last wrote, which is how this test once destroyed the
+ * check's own pattern file. Rejection coverage for those fields comes from the
+ * deterministic matrices, which share the same validation.
+ */
+static void gen_path(uint64_t *s, struct koru_sqe *q, uint64_t ud, uint32_t path_slot)
+{
+    /* Its own scratch file, its own symlink, a path that resolves nowhere, and
+     * a name inside its own directory. Nothing else. */
+    static const char *const paths[] = { FUZZWRFILE, FUZZLINK, "/tmp/koru-fuzz-no-such" };
+    char name[64];
+    uint8_t *slot = arena + (size_t)path_slot * F_SLOT;
+    uint32_t n;
+
+    switch (rnd_below(s, 6)) {
+    case 0: { /* TRUNCATE: only ever its own scratch file. */
+        uint64_t size = rnd_below(s, F_SLOT);
+
+        n = put_path(arena, F_SLOT, path_slot, paths[rnd_below(s, 3)]);
+        memcpy(slot + arg_offset(0, n), &size, sizeof(size));
+        sqe_path(q, KORU_OP_TRUNCATE, path_slot, 0, n, ud);
+        break;
+    }
+    case 1: { /* UTIMES, with nanoseconds in and out of range. */
+        struct koru_times t;
+
+        t.atime_sec  = (int64_t)rnd(s);
+        t.atime_nsec = one_in(s, 4) ? (int64_t)rnd(s) : (int64_t)rnd_below(s, 1000000000);
+        t.mtime_sec  = (int64_t)rnd(s);
+        t.mtime_nsec = one_in(s, 4) ? KORU_UTIME_NOW : KORU_UTIME_OMIT;
+        n            = put_path(arena, F_SLOT, path_slot, paths[rnd_below(s, 3)]);
+        memcpy(slot + arg_offset(0, n), &t, sizeof(t));
+        sqe_path(q, KORU_OP_UTIMES, path_slot, 0, n, ud);
+        break;
+    }
+    case 2:
+        n = put_path(arena, F_SLOT, path_slot, paths[rnd_below(s, 3)]);
+        sqe_path(q, KORU_OP_READLINK, path_slot, 0, n, ud);
+        break;
+    case 3:
+        n = put_path(arena, F_SLOT, path_slot, paths[rnd_below(s, 3)]);
+        sqe_path(q, KORU_OP_STATX_AT, path_slot, 0, n, ud);
+        break;
+    case 4: /* MKDIR, inside FUZZDIR, which the janitor keeps emptying. */
+        snprintf(name, sizeof(name), FUZZDIR "/c%u", rnd_below(s, FUZZNAMES));
+        n = put_path(arena, F_SLOT, path_slot, name);
+        sqe_path(q, KORU_OP_MKDIR, path_slot, 0, n, ud);
+        /* The one field a create may have fuzzed: it names no path. */
+        q->handle = one_in(s, 8) ? (uint32_t)rnd(s) : (uint32_t)(rnd(s) & 01777);
+        break;
+    default: /* SYMLINK, the same name and its own file as the target. */
+        snprintf(name, sizeof(name), FUZZDIR "/c%u", rnd_below(s, FUZZNAMES));
+        n = put_paths(arena, F_SLOT, path_slot, FUZZWRFILE, name);
+        sqe_path(q, KORU_OP_SYMLINK, path_slot, 0, n, ud);
+        break;
+    }
+}
+
 /* `path_slot` is private to the calling thread: put_path zeroes the whole slot,
  * so a shared one means every OPEN fails on an embedded NUL. */
 static void gen_valid(uint64_t *s, struct koru_sqe *q, uint64_t ud, uint32_t path_slot)
 {
-    uint32_t slot = rnd_below(s, F_SLOTS);
+    /* Never a path slot: a READ landing in one would fill it with file data
+     * that an inline path op is copying out of at that moment. */
+    uint32_t slot = rnd_below(s, F_SHARED);
 
-    switch (rnd_below(s, 21)) {
+    switch (rnd_below(s, 23)) {
     case 0:
         sqe_nop(q, ud);
         break;
@@ -281,42 +370,12 @@ static void gen_valid(uint64_t *s, struct koru_sqe *q, uint64_t ud, uint32_t pat
                  1 + rnd_below(s, 512), ud);
         break;
     case 16:
-    case 17: {
-        /* Only ever the fuzzer's own scratch file, its own symlink, or a path
-         * that resolves nowhere. A random path here would truncate or touch
-         * whatever it named; that sandboxing is a property of this test. */
-        static const char *const paths[] = { FUZZWRFILE, FUZZLINK, "/tmp/koru-fuzz-no-such" };
-        const char *path = paths[rnd_below(s, 3)];
-        uint32_t n       = put_path(arena, F_SLOT, path_slot, path);
-        uint8_t op = one_in(s, 3) ? KORU_OP_READLINK
-                                  : (one_in(s, 2) ? KORU_OP_TRUNCATE : KORU_OP_UTIMES);
-        uint64_t at = arg_offset(0, n);
-
-        if (op == KORU_OP_TRUNCATE) {
-            uint64_t size = rnd_below(s, F_SLOT);
-
-            memcpy(arena + (size_t)path_slot * F_SLOT + at, &size, sizeof(size));
-        } else if (op == KORU_OP_UTIMES) {
-            struct koru_times t;
-
-            t.atime_sec  = (int64_t)rnd(s);
-            t.atime_nsec = one_in(s, 4) ? (int64_t)rnd(s) : (int64_t)rnd_below(s, 1000000000);
-            t.mtime_sec  = (int64_t)rnd(s);
-            t.mtime_nsec = one_in(s, 4) ? KORU_UTIME_NOW : KORU_UTIME_OMIT;
-            memcpy(arena + (size_t)path_slot * F_SLOT + at, &t, sizeof(t));
-        }
-        sqe_path(q, op, path_slot, 0, n, ud);
+    case 17:
+    case 18:
+    case 19:
+    case 20:
+        gen_path(s, q, ud, path_slot);
         break;
-    }
-    case 18: {
-        /* The same three sandboxed paths. It writes nothing on disk, but its
-         * answer overwrites the slot the path came out of. */
-        static const char *const paths[] = { FUZZWRFILE, FUZZLINK, "/tmp/koru-fuzz-no-such" };
-        uint32_t n = put_path(arena, F_SLOT, path_slot, paths[rnd_below(s, 3)]);
-
-        sqe_path(q, KORU_OP_STATX_AT, path_slot, 0, n, ud);
-        break;
-    }
     default:
         sqe_checksum(q, slot, 0, rnd_below(s, F_SLOT + 1), ud);
         break;
@@ -349,13 +408,15 @@ static void gen_hostile(uint64_t *s, struct koru_sqe *q, uint64_t ud, uint32_t p
         q->len = 4095 + rnd_below(s, 3); /* the PATH_MAX boundary */
         break;
     case 6:
-        /* Past the count, past the bitmap's first word, and absurd. */
+        /* Past the count, past it but inside the bitmap's last word, and
+         * absurd. Never a slot that exists: that would point an op at another
+         * thread's path while the kernel is copying it. */
         switch (rnd_below(s, 3)) {
         case 0:
             q->slot = F_SLOTS + rnd_below(s, 4);
             break;
         case 1:
-            q->slot = 64 + rnd_below(s, 4096);
+            q->slot = F_SLOTS + rnd_below(s, 64);
             break;
         default:
             q->slot = UINT32_MAX - rnd_below(s, 4);
@@ -381,11 +442,19 @@ static void gen_hostile(uint64_t *s, struct koru_sqe *q, uint64_t ud, uint32_t p
         q->off = rnd(s);
         break;
     }
+
+    /* The sandbox is not negotiable: a mutated `slot`, `off` or `len` would
+     * point a path op at whatever another thread last wrote, and a random
+     * opcode byte can land on one of them too. Regenerate rather than submit
+     * it. See `gen_path`.
+     */
+    if (is_path_op(q->opcode))
+        gen_path(s, q, ud, path_slot);
 }
 
 struct wctx {
     uint64_t seed;
-    uint32_t path_slot;
+    uint32_t slot0; /* this thread's first private path slot */
 };
 
 static void *worker(void *arg)
@@ -404,11 +473,16 @@ static void *worker(void *arg)
 
         for (i = 0; i < n; i++) {
             uint64_t tag = rnd(&seed);
+            /* Its own slot per batch index: a generator writes the path as a
+             * side effect, so two SQEs sharing one would leave the first
+             * naming the second's path cut to its own `len`. That is how a
+             * MKDIR once created a truncated prefix of the pattern file. */
+            uint32_t path_slot = w->slot0 + i;
 
             if (one_in(&seed, 3))
-                gen_hostile(&seed, &sq[i], tag, w->path_slot);
+                gen_hostile(&seed, &sq[i], tag, path_slot);
             else
-                gen_valid(&seed, &sq[i], tag, w->path_slot);
+                gen_valid(&seed, &sq[i], tag, path_slot);
             /* Stamped last: the hostile generator may have changed the opcode. */
             sq[i].user_data = UD(sq[i].opcode, tag);
         }
@@ -603,8 +677,9 @@ static void child_body(uint64_t seed)
         _exit(0);
     put_path(a, F_SLOT, 0, PATFILE);
 
+    /* One private path slot per SQE, as the workers have. */
     for (i = 0; i < BATCH; i++)
-        gen_valid(&seed, &sq[i], i, 0);
+        gen_valid(&seed, &sq[i], i, F_SHARED + i);
     sqe_delay(&sq[0], 0x100, (rnd_below(&seed, 500) + 100) * MS);
     sqe_checksum(&sq[1], 0, 0, F_SLOT, 0x101);
 
@@ -623,6 +698,25 @@ static void child_body(uint64_t seed)
         _exit(0);
     for (;;)
         pause();
+}
+
+/* Empties FUZZDIR, so a name is sometimes free and sometimes taken and both
+ * outcomes of a create are reached. Racing the kernel ops on purpose. */
+static void *janitor(void *arg)
+{
+    uint64_t seed = *(uint64_t *)arg;
+    char name[64];
+    unsigned i;
+
+    while (!atomic_load(&stop)) {
+        for (i = 0; i < FUZZNAMES; i++) {
+            snprintf(name, sizeof(name), FUZZDIR "/c%u", i);
+            if (unlink(name) != 0)
+                rmdir(name);
+        }
+        usleep(500 + rnd_below(&seed, 2000));
+    }
+    return NULL;
 }
 
 static void *spawner(void *arg)
@@ -680,13 +774,14 @@ static unsigned long long drain(void)
 
 int fuzz_main(unsigned secs, uint64_t seed)
 {
-    static const char *names[NOPCODES] = { "NOP",    "DELAY",  "OPEN",   "READ",
-                                           "CLOSE",  "CANCEL", "CKSUM",  "WRITE",
-                                           "ADOPT",  "POLL",   "STAT",   "TRUNC",
-                                           "UTIMES", "RDLINK", "STATXAT", "other" };
+    static const char *names[NOPCODES] = { "NOP",     "DELAY",  "OPEN",    "READ",
+                                           "CLOSE",   "CANCEL", "CKSUM",   "WRITE",
+                                           "ADOPT",   "POLL",   "STAT",    "TRUNC",
+                                           "UTIMES",  "RDLINK", "STATXAT", "MKDIR",
+                                           "SYMLINK", "other" };
     struct koru_ring m;
-    pthread_t th[NWORKERS + 2];
-    uint64_t seeds[NWORKERS + 2];
+    pthread_t th[NWORKERS + 3];
+    uint64_t seeds[NWORKERS + 3];
     struct wctx wc[NWORKERS];
     struct koru_params p;
     struct sigaction sa;
@@ -706,6 +801,10 @@ int fuzz_main(unsigned secs, uint64_t seed)
     unlink(FUZZLINK);
     if (symlink(FUZZWRFILE, FUZZLINK) != 0) {
         fail("create the fuzzer's symlink");
+        return failures;
+    }
+    if (mkdir(FUZZDIR, 0700) != 0 && errno != EEXIST) {
+        fail("create the fuzzer's scratch directory");
         return failures;
     }
     adoptable = open(PATFILE, O_RDONLY);
@@ -731,8 +830,8 @@ int fuzz_main(unsigned secs, uint64_t seed)
     max_delay_ns = p.max_delay_ns;
 
     for (i = 0; i < NWORKERS; i++) {
-        wc[i].seed      = seed + (uint64_t)i * 0x9e3779b97f4a7c15ull;
-        wc[i].path_slot = F_SLOTS - 1 - (uint32_t)i; /* one private slot each */
+        wc[i].seed  = seed + (uint64_t)i * 0x9e3779b97f4a7c15ull;
+        wc[i].slot0 = F_SHARED + (uint32_t)i * BATCH; /* BATCH private slots */
         pthread_create(&th[nth], NULL, worker, &wc[i]);
         nth++;
     }
@@ -741,6 +840,9 @@ int fuzz_main(unsigned secs, uint64_t seed)
     nth++;
     seeds[nth] = seed ^ 0xdeadbeefull;
     pthread_create(&th[nth], NULL, spawner, &seeds[nth]);
+    nth++;
+    seeds[nth] = seed ^ 0x5eed1eafull;
+    pthread_create(&th[nth], NULL, janitor, &seeds[nth]);
     nth++;
 
     deadline = now_ms() + (uint64_t)secs * 1000;
@@ -775,7 +877,7 @@ int fuzz_main(unsigned secs, uint64_t seed)
         check(sub > SUB_FLOOR, "the fuzzer actually exercised the ring");
         /* Completion, not success: the tail sections carry that claim. */
         reached = 1;
-        for (op = 0; op <= KORU_OP_STATX_AT; op++)
+        for (op = 0; op <= KORU_OP_SYMLINK; op++)
             if (atomic_load(&op_total[op]) == 0) {
                 note("opcode %d never completed once", op);
                 reached = 0;
@@ -788,6 +890,14 @@ int fuzz_main(unsigned secs, uint64_t seed)
 
     ring_close(&m);
     close(adoptable);
+    for (i = 0; i < (int)FUZZNAMES; i++) {
+        char name[64];
+
+        snprintf(name, sizeof(name), FUZZDIR "/c%d", i);
+        if (unlink(name) != 0)
+            rmdir(name);
+    }
+    rmdir(FUZZDIR);
     unlink(FUZZLINK);
     unlink(FUZZWRFILE);
     return failures;

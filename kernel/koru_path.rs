@@ -17,16 +17,30 @@ use kernel::{
 
 // From include/linux/namei.h:
 //   extern int kern_path(const char *, unsigned, struct path *);
+//   extern struct dentry *start_creating_path(int, const char *, struct path *,
+//                                             unsigned int);
+//   extern void end_creating_path(const struct path *, struct dentry *);
 // `struct path` reaches an empty bindgen struct in this config; the `bindings`
 // crate allows the same lint crate-wide.
 #[allow(improper_ctypes)]
 unsafe extern "C" {
     fn kern_path(name: *const c_char, flags: u32, path: *mut bindings::path) -> c_int;
+
+    fn start_creating_path(
+        dfd: c_int,
+        name: *const c_char,
+        path: *mut bindings::path,
+        flags: u32,
+    ) -> *mut bindings::dentry;
+
+    fn end_creating_path(path: *const bindings::path, dentry: *mut bindings::dentry);
 }
 
 // From include/linux/namei.h:
 //   #define LOOKUP_FOLLOW BIT(0)  /* follow links at the end */
+//   #define LOOKUP_DIRECTORY BIT(1)  /* require a directory */
 pub(crate) const LOOKUP_FOLLOW: u32 = 1 << 0;
+pub(crate) const LOOKUP_DIRECTORY: u32 = 1 << 1;
 
 /// A resolved `struct path`, `path_put` on drop. A `?` that skipped it would
 /// leak a dentry and a vfsmount, and only a refused unmount would say so.
@@ -59,6 +73,71 @@ impl Drop for Lookup {
     fn drop(&mut self) {
         // SAFETY: `kern_path` filled this path and took its references.
         unsafe { bindings::path_put(&self.0) };
+    }
+}
+
+/// A `start_creating_path` section: parent inode locked, mount write count
+/// taken, a negative dentry to fill. `end_creating_path` on drop puts all three
+/// back, so a `?` cannot leave a directory locked for ever.
+///
+/// **No `mnt_want_write` guard here**: `start_creating_path` takes the write
+/// count itself. See doc/Notes.md.
+pub(crate) struct Creating {
+    path: bindings::path,
+    dentry: *mut bindings::dentry,
+}
+
+impl Creating {
+    /// `start_creating_path` against `current->fs`, in the submitting task.
+    pub(crate) fn new(name: &CStr, flags: u32) -> Result<Creating> {
+        let mut path = bindings::path::default();
+        // SAFETY: `name` is NUL-terminated and outlives the call, and `path` is
+        // our own storage, filled only when this returns a real dentry.
+        let d = unsafe {
+            start_creating_path(
+                bindings::AT_FDCWD,
+                name.as_char_ptr(),
+                &mut path,
+                flags,
+            )
+        };
+        Ok(Creating {
+            dentry: from_err_ptr(d)?,
+            path,
+        })
+    }
+
+    pub(crate) fn dentry(&self) -> *mut bindings::dentry {
+        self.dentry
+    }
+
+    /// The parent directory's inode, which the section holds locked.
+    pub(crate) fn parent(&self) -> *mut bindings::inode {
+        // SAFETY: the section holds a reference to the parent path.
+        unsafe { (*self.path.dentry).d_inode }
+    }
+
+    /// `mnt_idmap`, a static inline. From include/linux/mount.h:
+    ///   /* Pairs with smp_store_release() in do_idmap_mount(). */
+    ///   return READ_ONCE(mnt->mnt_idmap);
+    pub(crate) fn idmap(&self) -> *mut bindings::mnt_idmap {
+        // SAFETY: as above, and the mount outlives this section.
+        unsafe { core::ptr::read_volatile(&raw const (*self.path.mnt).mnt_idmap) }
+    }
+
+    /// What `vfs_mkdir` returned: it may have replaced the dentry and `dput`
+    /// the original, and confusing the two unlocks the wrong inode. An
+    /// `ERR_PTR` is fine; `end_dirop` ignores it, as the VFS's own caller does.
+    pub(crate) fn replace(&mut self, dentry: *mut bindings::dentry) {
+        self.dentry = dentry;
+    }
+}
+
+impl Drop for Creating {
+    fn drop(&mut self) {
+        // SAFETY: `start_creating_path` filled the path and returned this
+        // dentry, or `vfs_mkdir` replaced it. Called once, here.
+        unsafe { end_creating_path(&self.path, self.dentry) };
     }
 }
 
