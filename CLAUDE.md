@@ -5,12 +5,12 @@ code in this repository.
 
 ## State of the repository
 
-**T0–T27 are done: Braam's hello world runs through koru, and the ring can
+**T0–T28 are done: Braam's hello world runs through koru, and the ring can
 wait for a descriptor.** The module registers `/dev/koru`, configures a ring
 with `SETUP`, and submits `NOP`, `DELAY_NS`, `CHECKSUM`, `OPEN`, `READ`,
 `WRITE`, `CLOSE`, `CANCEL`, `ADOPT_FD`, `POLL_ADD`, `STAT`, `TRUNCATE`,
-`UTIMES`, `READLINK`, `STATX_AT`, `MKDIR`, `SYMLINK`, `UNLINK` and `RMDIR`
-through `ENTER`, which blocks for completions. The arena
+`UTIMES`, `READLINK`, `STATX_AT`, `MKDIR`, `SYMLINK`, `UNLINK`, `RMDIR` and
+`RENAME` through `ENTER`, which blocks for completions. The arena
 is mmap'd, with slot exclusivity enforced by the kernel. Open files live in a
 generational handle table. A queued op can be genuinely dequeued, and
 `close(fd)` cancels whatever is still queued. The whole validation surface has
@@ -139,6 +139,15 @@ count: with the superblock read-only, `inode_permission` refuses on its own and
 the guard can be missing with nothing saying so. doc/Notes.md has the six
 perturbations.
 
+T28 added `KORU_OP_RENAME`, the last path op and the only one that locks two
+directories: `start_renaming`, `vfs_rename`, `end_renaming`, with T26's two-path
+parse and T27's split on each half. **One** `mnt_want_write`, not the two the
+plan asked for — after the cross-mount rejection there is only one mount.
+`EXDEV` joined the errno table as `Kind::Unsupported`. A mount-level rule can
+only be tested with **two mounts of one filesystem**: across two filesystems
+`lock_rename` answers `EXDEV` on its own, so the first version of that test
+passed with the check deleted. doc/Notes.md has the four perturbations.
+
 T14 made the two userspace ABI mirrors a diff rather than a promise.
 `cpp/include/koru_abi.h` and `cpp/include/koru_errno.h` are the C mirrors,
 shared with `test/`, and an `abi_dump` on each side emits a canonical record
@@ -242,7 +251,7 @@ survived**.
 
 ## Commands
 
-These work today (T0 through T27):
+These work today (T0 through T28):
 
 ```sh
 KDIR=../kernel-dev/linux-source-7.1

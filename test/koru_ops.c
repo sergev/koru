@@ -1692,6 +1692,149 @@ static void path_unlink(void)
     rmdir(NEWDIR);
 }
 
+/* T28: RENAME, the only op that locks two directories. */
+
+#define RENSRC  "/tmp/koru-check-ren-a"
+#define RENDST  "/tmp/koru-check-ren-b"
+#define RENDIR  "/tmp/koru-check-rendir"
+#define RENMNT  "/run/koru-check-renmnt"
+#define RENBIND "/run/koru-check-renbind"
+
+/* The file's first byte, or -1. Identity across a rename. */
+static int first_byte(const char *path)
+{
+    unsigned char c;
+    int fd = open(path, O_RDONLY), n;
+
+    if (fd < 0)
+        return -1;
+    n = (int)read(fd, &c, 1);
+    close(fd);
+    return n == 1 ? (int)c : -1;
+}
+
+static int make_byte(const char *path, unsigned char b)
+{
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+
+    if (fd < 0)
+        return -1;
+    if (write(fd, &b, 1) != 1) {
+        close(fd);
+        return -1;
+    }
+    return close(fd);
+}
+
+static void path_rename(void)
+{
+    struct koru_sqe s;
+    uint32_t n;
+
+    unlink(RENSRC);
+    unlink(RENDST);
+    rmdir(RENDIR "/sub");
+    unlink(RENDIR "/f");
+    rmdir(RENDIR);
+
+    /* 1. Within one directory. */
+    if (make_byte(RENSRC, 0x41) != 0) {
+        check(0, "create the RENAME source");
+        return;
+    }
+    check_res(r_rename(&R, 1, RENSRC, RENDST), 0, "RENAME within a directory");
+    check(GONE(RENSRC) && first_byte(RENDST) == 0x41, "  and the bytes moved with the name");
+
+    /* 2. Across directories, and onto an existing file. */
+    if (mkdir(RENDIR, 0700) != 0 || make_byte(RENDIR "/f", 0x42) != 0) {
+        check(0, "create the RENAME destination directory");
+        unlink(RENDST);
+        return;
+    }
+    check_res(r_rename(&R, 1, RENDST, RENDIR "/moved"), 0, "RENAME across directories");
+    check(GONE(RENDST) && first_byte(RENDIR "/moved") == 0x41, "  and the bytes came too");
+    check_res(r_rename(&R, 1, RENDIR "/moved", RENDIR "/f"), 0, "RENAME onto an existing file");
+    check(first_byte(RENDIR "/f") == 0x41, "  which is replaced, not merged");
+    check(GONE(RENDIR "/moved"), "  and the source is gone");
+
+    /* 3. A directory moves too, and onto a non-empty one it does not. */
+    if (mkdir(RENDIR "/sub", 0700) == 0 && make_byte(RENDIR "/sub/x", 0x43) == 0) {
+        check_res(r_rename(&R, 1, RENDIR "/sub", RENDIR "/sub2"), 0, "RENAME moves a directory");
+        check(first_byte(RENDIR "/sub2/x") == 0x43, "  with what was in it");
+        check_res(r_rename(&R, 1, RENDIR "/f", RENDIR "/sub2"), -EISDIR,
+                  "  a file onto a directory is EISDIR");
+        check_res(r_rename(&R, 1, RENDIR "/sub2", RENDIR "/f"), -ENOTDIR,
+                  "  and a directory onto a file is ENOTDIR");
+        unlink(RENDIR "/sub2/x");
+        rmdir(RENDIR "/sub2");
+    } else {
+        check(0, "RENAME moves a directory");
+    }
+
+    /* 4. Rejections. */
+    check_res(r_rename(&R, 1, "/no/such/path", RENDST), -ENOENT,
+              "RENAME of a missing source is ENOENT");
+    check_res(r_rename(&R, 1, RENDIR "/f", "/no/such/dir/x"), -ENOENT,
+              "  into a missing directory is ENOENT");
+    check_res(r_rename(&R, 1, RENDIR "/f", RENDIR "/.."), -EINVAL,
+              "  onto a path ending in .. is EINVAL");
+    check_res(r_rename(&R, 1, RENDIR "/..", RENDIR "/f"), -EINVAL,
+              "  and from one too");
+    check_res(r_rename(&R, 1, RENDIR, RENDIR "/f"), -EINVAL,
+              "  a directory into itself is EINVAL");
+
+    n = put_paths(R.arena, R.slot_size, 1, RENDIR "/f", RENDST);
+    sqe_path(&s, KORU_OP_RENAME, 1, 0, n, 0x7c0);
+    s.handle = 1;
+    check_res(run_one(R.fd, &s), -EINVAL, "  a non-zero handle is EINVAL");
+    put_path(R.arena, R.slot_size, 1, RENDIR "/f");
+    sqe_path(&s, KORU_OP_RENAME, 1, 0, (uint32_t)strlen(RENDIR "/f"), 0x7c1);
+    check_res(run_one(R.fd, &s), -EINVAL, "  one path with no NUL between is EINVAL");
+    check(access(RENDIR "/f", F_OK) == 0, "and no rejected RENAME moved anything");
+
+    /* 5. Across mounts: EXDEV, before anything is locked.
+     *
+     * Two mounts of **one** filesystem, not two filesystems: for two
+     * superblocks `lock_rename` answers EXDEV on its own, so only a bind mount
+     * puts our own check on trial. Renaming across it would also write through
+     * a mount whose write count we never took, which is T27's read-only bypass
+     * reached from here. */
+    rmdir(RENMNT);
+    rmdir(RENBIND);
+    if (mkdir(RENMNT, 0700) == 0 && mount("none", RENMNT, "tmpfs", 0, NULL) == 0) {
+        if (make_byte(RENMNT "/f", 0x44) != 0 || mkdir(RENBIND, 0700) != 0 ||
+            mount(RENMNT, RENBIND, NULL, MS_BIND, NULL) != 0) {
+            check(0, "RENAME across two mounts of one filesystem is EXDEV");
+        } else {
+            check_res(r_rename(&R, 1, RENMNT "/f", RENBIND "/g"), -EXDEV,
+                      "RENAME across two mounts of one filesystem is EXDEV");
+            check(access(RENMNT "/f", F_OK) == 0 && GONE(RENMNT "/g"),
+                  "  and nothing moved");
+            /* The same two names through one mount, so the mount is
+             * demonstrably the only thing that refused. */
+            check_res(r_rename(&R, 1, RENMNT "/f", RENMNT "/g"), 0,
+                      "  while one mount renames them happily");
+            if (umount(RENBIND) != 0)
+                note("could not unmount %s", RENBIND);
+        }
+        rmdir(RENBIND);
+        /* Two filesystems: the VFS's own EXDEV, from lock_rename. */
+        check_res(r_rename(&R, 1, RENDIR "/f", RENMNT "/f"), -EXDEV,
+                  "  and across two filesystems too");
+        unlink(RENMNT "/f");
+        unlink(RENMNT "/g");
+        if (umount(RENMNT) != 0)
+            note("could not unmount %s", RENMNT);
+    } else {
+        printf("%-58s SKIP (cannot mount a tmpfs)\n",
+               "RENAME across two mounts of one filesystem is EXDEV");
+    }
+    rmdir(RENMNT);
+
+    unlink(RENDIR "/f");
+    rmdir(RENDIR);
+}
+
 /* A **read-only bind mount** of a writable filesystem, which is the only shape
  * that isolates our own `mnt_want_write`: with the superblock read-only,
  * `inode_permission` answers EROFS on its own and the guard could be missing
@@ -1717,6 +1860,7 @@ static void path_readonly(void)
     } else {
         check_res(r_unlink(&R, 1, ROBIND "/f"), -EROFS, what);
         check_res(r_rmdir(&R, 1, ROBIND "/d"), -EROFS, "  and so is RMDIR");
+        check_res(r_rename(&R, 1, ROBIND "/f", ROBIND "/g"), -EROFS, "  and RENAME");
         check(access(BALDIR "/f", F_OK) == 0, "  and the file is still there");
         /* The same two through the writable view of the same inodes, so the
          * mount is demonstrably the only thing that refused. */
@@ -1792,7 +1936,7 @@ static void path_rmdir(void)
 
 static void path_create_balance(void)
 {
-    char dir[64], link[64];
+    char dir[64], link[64], moved[64];
     unsigned i, made = 0;
     int ok = 1;
 
@@ -1806,15 +1950,19 @@ static void path_create_balance(void)
     for (i = 0; i < BALANCE; i++) {
         snprintf(dir, sizeof(dir), BALDIR "/d%u", i);
         snprintf(link, sizeof(link), BALDIR "/l%u", i);
+        snprintf(moved, sizeof(moved), BALDIR "/m%u", i);
         if (r_mkdir(&R, 1, dir, 0700) != 0 || r_symlink(&R, 1, LONGTARGET, link) != 0)
             break;
-        if (r_rmdir(&R, 1, dir) != 0 || r_unlink(&R, 1, link) != 0) {
+        /* Renamed in place first, so the rename's own write count is on trial
+         * with the rest. */
+        if (r_rename(&R, 1, link, moved) != 0 || r_rmdir(&R, 1, dir) != 0 ||
+            r_unlink(&R, 1, moved) != 0) {
             ok = 0;
             break;
         }
         made++;
     }
-    check(made == BALANCE && ok, "2,000 create-and-remove rounds, all four opcodes");
+    check(made == BALANCE && ok, "2,000 create-rename-remove rounds, all five opcodes");
 
     /* A leaked mnt_want_write is EBUSY here and nothing anywhere else. */
     if (mount(NULL, BALDIR, NULL, MS_REMOUNT | MS_RDONLY, NULL) == 0) {
@@ -1888,6 +2036,8 @@ static int path_creds_child(struct koru_ring *m)
     /* And the unreachable directory refuses before that. */
     if (r_unlink(m, 0, CREDSLINK) != -EACCES)
         return 16;
+    if (r_rename(m, 0, CREDSRO "/victim", CREDSRO "/moved") != -EACCES)
+        return 17;
     return 0;
 }
 
@@ -1928,7 +2078,8 @@ static void path_creds(void)
         } else {
             /* 5 truncate, 6 utimes, 7 touch, 8 readlink, 9 statx, 10 mkdir,
              * 11 symlink, 12 and 13 the same two where the lookup succeeds,
-             * 14 unlink, 15 rmdir, 16 unlink behind the unreachable one. */
+             * 14 unlink, 15 rmdir, 16 unlink behind the unreachable one,
+             * 17 rename. */
             check(WIFEXITED(st) && WEXITSTATUS(st) == 0,
                   "every unprivileged path op is refused");
             if (WIFEXITED(st) && WEXITSTATUS(st) != 0)
@@ -1987,6 +2138,7 @@ void sec_path(void)
     path_symlink();
     path_unlink();
     path_rmdir();
+    path_rename();
     path_readonly();
     path_creds();
     path_readlink_leak();

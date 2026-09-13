@@ -69,6 +69,8 @@ int64_t r_write(struct koru_ring *r, uint32_t handle, uint32_t slot, uint64_t of
 int64_t r_mkdir(struct koru_ring *r, uint32_t slot, const char *path, uint32_t mode);
 /* SYMLINK takes both paths in the slot, target first. */
 int64_t r_symlink(struct koru_ring *r, uint32_t slot, const char *target, const char *link);
+/* RENAME takes both paths in the slot, the old one first. */
+int64_t r_rename(struct koru_ring *r, uint32_t slot, const char *from, const char *to);
 int64_t r_unlink(struct koru_ring *r, uint32_t slot, const char *path);
 int64_t r_rmdir(struct koru_ring *r, uint32_t slot, const char *path);
 /* `extra` may be NULL; on success it gets the CQE's KORU_STAT_* mask. */
@@ -92,7 +94,8 @@ void sqe_stat(struct koru_sqe *s, uint32_t handle, uint32_t slot, uint64_t off, 
               uint64_t user_data);
 /* A path op: path at (off, len), argument after it. `opcode` is one of
  * KORU_OP_TRUNCATE, KORU_OP_UTIMES, KORU_OP_READLINK, KORU_OP_STATX_AT,
- * KORU_OP_MKDIR, KORU_OP_SYMLINK, KORU_OP_UNLINK, KORU_OP_RMDIR. */
+ * KORU_OP_MKDIR, KORU_OP_SYMLINK, KORU_OP_UNLINK, KORU_OP_RMDIR,
+ * KORU_OP_RENAME. */
 void sqe_path(struct koru_sqe *s, uint8_t opcode, uint32_t slot, uint64_t off, uint32_t len,
               uint64_t user_data);
 /* Where a path op's argument goes: the first 8-aligned offset at or after the

@@ -1425,6 +1425,75 @@ a trailing separator there, which only our own check refuses. The janitor slowed
 from a sweep every millisecond to every five to twenty, because at the old rate
 it removed everything before `UNLINK` or `RMDIR` could find it.
 
+### Rename, and two mounts of one filesystem
+
+T28's `RENAME` is the last path op and the only one that locks two directories
+at once. `start_renaming` hashes and permission-checks both names, then
+`lock_rename` takes both parents — and the superblock's `s_vfs_rename_mutex`
+when they differ, which is what makes the ordering somebody else's problem. The
+`Renaming` guard's drop is `end_renaming`, which unlocks both and drops three
+references.
+
+It reuses T26's two-path parse, old first then new, as `rename(2)` takes them,
+and T27's `split_path` on each half — so a last component that is empty, `.`,
+`..` or followed by a separator is `EINVAL` on both sides.
+
+**One `mnt_want_write`, not two**, which is where the plan was wrong. It asks
+for the write count on both mounts; after the cross-mount rejection there is
+only one mount, and `filename_renameat2` takes only `old_path.mnt` for exactly
+that reason.
+
+#### The cross-mount check, and the test that nearly did not test it
+
+The plan calls for "a cross-mount rejection of `-EXDEV` before anything
+starts", and the first version of the check renamed between two *filesystems* —
+a tmpfs and the root — and asserted `EXDEV`. **It passed with the check
+deleted.** `lock_rename` answers `-EXDEV` itself when the two parents have no
+common ancestor, which two superblocks never do.
+
+What our check alone catches is **two mounts of one filesystem**: a bind mount,
+where `lock_rename` is perfectly happy because there is one superblock, and only
+`old_path.mnt != new_path.mnt` says no. That is not a formality. Without it the
+write count would be taken on one mount while the rename wrote through the
+other, which is T27's read-only-bind-mount bypass reached from a second
+direction. The check now makes the bind mount, asserts `EXDEV` across it, and
+then renames the same two names through a single mount to show which half
+refused.
+
+This is the second time in three tasks that a test of a mount-level rule passed
+for a superblock-level reason. The rule generalises: **a mount-level guard can
+only be tested with two mounts of one filesystem**, because everything else the
+VFS refuses on its own.
+
+`EXDEV` joins the errno table as `Kind::Unsupported`, beside `ENOTTY`, `ENOSYS`,
+`EPROTO` and `EOPNOTSUPP`. Braam's fifteen kinds are fixed, so the question was
+only which one: the two paths are each perfectly valid, and what is unsupported
+is moving between filesystems — a program reading "unsupported" falls back to
+copy-and-delete, which is the right thing. `Invalid` would have suggested fixing
+an argument that is not wrong.
+
+#### What was verified, and how
+
+Four perturbations, each applied and reverted, all four fail.
+
+- **Delete the cross-mount check.** The rename across two mounts of one
+  filesystem succeeds, as described above.
+- **Swap the two paths.** Fifteen assertions fail, the creds child included.
+- **Never call `end_renaming`.** The guest hangs with no output: both parent
+  directories stay locked for ever, so the next path op in either of them
+  blocks in D state. A hang rather than an assertion, as in T26.
+- **Drop `mnt_want_write` from the rename.** The read-only bind mount is
+  bypassed and the rename succeeds through it. T27's guard, T28's use of it,
+  and the same instrument.
+
+The creds child renames inside the searchable-but-unwritable directory, and the
+heavy loop renames each object before removing it, so the rename's own write
+count is on trial with the other four opcodes' in the read-only remount.
+
+The fuzzer's arm renames between the same `FUZZDIR` names its creates and
+removals use, so all three race each other; `EXDEV` never comes up there, and
+the deterministic matrix owns that case.
+
 ### Cancellation
 
 `CANCEL` names its target by `user_data` in `off`. A duplicate `user_data`

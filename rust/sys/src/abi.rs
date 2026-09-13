@@ -182,8 +182,15 @@ pub const KORU_OP_UNLINK: u8 = 17;
 /// `ENOTDIR` for anything else, `ENOTEMPTY` for a directory with entries.
 pub const KORU_OP_RMDIR: u8 = 18;
 
-// A `UNLINK` or `RMDIR` whose last component is empty, `.`, `..` or followed by
-// a separator completes `EINVAL`, where the syscalls spread `EISDIR`,
+/// Rename. **Two** NUL-terminated paths back to back in the slot, as on
+/// `SYMLINK`: the old path first, then the new one, in `rename(2)`'s own
+/// argument order. `handle` must be zero and `res` is 0. Both halves must be on
+/// one mount, else `EXDEV`; an existing destination is replaced, as `rename(2)`
+/// replaces it.
+pub const KORU_OP_RENAME: u8 = 19;
+
+// A `UNLINK`, `RMDIR` or `RENAME` whose last component is empty, `.`, `..` or
+// followed by a separator completes `EINVAL`, where the syscalls spread `EISDIR`,
 // `ENOTEMPTY`, `EINVAL` and `EBUSY` over those same four cases. Naming the thing
 // above you is a caller bug here, not an outcome.
 

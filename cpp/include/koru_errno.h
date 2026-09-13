@@ -56,6 +56,7 @@ enum koru_kind { KORU_KIND_TABLE(KORU_KIND_ENUMERATOR) };
     X(EFAULT, 14, Invalid)         \
     X(EBUSY, 16, Again)            \
     X(EEXIST, 17, Exists)          \
+    X(EXDEV, 18, Unsupported)      \
     X(ENOTDIR, 20, NotDir)         \
     X(EISDIR, 21, IsDir)           \
     X(EINVAL, 22, Invalid)         \

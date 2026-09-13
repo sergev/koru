@@ -248,11 +248,16 @@ KORU_STATIC_ASSERT(KORU_IOC_ENTER == 0xc0406b02u, "ioctl ENTER");
 /* Remove the directory the path names. handle must be zero and res is 0.
  * ENOTDIR for anything else, ENOTEMPTY for a directory with entries.
  *
- * A UNLINK or RMDIR whose last component is empty, ., .. or followed by a
- * separator completes EINVAL, where the syscalls spread EISDIR, ENOTEMPTY,
+ * A UNLINK, RMDIR or RENAME whose last component is empty, ., .. or followed by
+ * a separator completes EINVAL, where the syscalls spread EISDIR, ENOTEMPTY,
  * EINVAL and EBUSY over those same four cases. Naming the thing above you is a
  * caller bug here, not an outcome. */
 #define KORU_OP_RMDIR 18
+/* Rename. TWO NUL-terminated paths back to back in the slot, as on SYMLINK: the
+ * old path first, then the new one, in rename(2)'s own argument order. handle
+ * must be zero and res is 0. Both halves must be on one mount, else EXDEV; an
+ * existing destination is replaced, as rename(2) replaces it. */
+#define KORU_OP_RENAME 19
 
 KORU_STATIC_ASSERT(KORU_OP_NOP == 0, "op NOP");
 KORU_STATIC_ASSERT(KORU_OP_DELAY_NS == 1, "op DELAY_NS");
@@ -273,6 +278,7 @@ KORU_STATIC_ASSERT(KORU_OP_MKDIR == 15, "op MKDIR");
 KORU_STATIC_ASSERT(KORU_OP_SYMLINK == 16, "op SYMLINK");
 KORU_STATIC_ASSERT(KORU_OP_UNLINK == 17, "op UNLINK");
 KORU_STATIC_ASSERT(KORU_OP_RMDIR == 18, "op RMDIR");
+KORU_STATIC_ASSERT(KORU_OP_RENAME == 19, "op RENAME");
 
 /* Any bit set in an SQE's flags is rejected. */
 #define KORU_SQE_FLAGS_ALL 0u

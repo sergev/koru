@@ -345,6 +345,15 @@ int64_t r_rmdir(struct koru_ring *r, uint32_t slot, const char *path)
     return r_path(r, KORU_OP_RMDIR, slot, path, NULL, 0);
 }
 
+int64_t r_rename(struct koru_ring *r, uint32_t slot, const char *from, const char *to)
+{
+    struct koru_sqe s;
+    uint32_t n = put_paths(r->arena, r->slot_size, slot, from, to);
+
+    sqe_path(&s, KORU_OP_RENAME, slot, 0, n, 0x109);
+    return run_one(r->fd, &s);
+}
+
 int64_t r_stat(struct koru_ring *r, uint32_t handle, uint32_t slot, uint64_t off, uint32_t len,
                uint64_t *extra)
 {

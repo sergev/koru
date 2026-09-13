@@ -81,7 +81,7 @@ static atomic_uint handle_pool[POOL];
 static atomic_uint pool_next;
 
 /* One per opcode, plus a bucket for everything that is not one. */
-#define NOPCODES (KORU_OP_RMDIR + 2)
+#define NOPCODES (KORU_OP_RENAME + 2)
 
 static atomic_ullong op_total[NOPCODES], op_ok[NOPCODES];
 static atomic_ullong open_einval, open_ebusy, open_emfile, open_other;
@@ -118,7 +118,7 @@ static int is_path_op(uint8_t op)
 {
     return op == KORU_OP_TRUNCATE || op == KORU_OP_UTIMES || op == KORU_OP_READLINK ||
            op == KORU_OP_STATX_AT || op == KORU_OP_MKDIR || op == KORU_OP_SYMLINK ||
-           op == KORU_OP_UNLINK || op == KORU_OP_RMDIR;
+           op == KORU_OP_UNLINK || op == KORU_OP_RMDIR || op == KORU_OP_RENAME;
 }
 
 /* Which per-opcode counter a completion lands in. Never a mask: an unknown
@@ -126,7 +126,7 @@ static int is_path_op(uint8_t op)
  * opcode nothing ever submitted. */
 static unsigned op_bucket(uint8_t op)
 {
-    return op <= KORU_OP_RMDIR ? op : NOPCODES - 1;
+    return op <= KORU_OP_RENAME ? op : NOPCODES - 1;
 }
 
 /* There is only one Cqe constructor, so any deviation is a real bug. */
@@ -206,6 +206,13 @@ static int res_allowed(uint8_t opcode, int64_t res)
                res == -ENOENT || res == -ENOTDIR || res == -EISDIR || res == -ENOTEMPTY ||
                res == -EACCES || res == -EPERM || res == -ELOOP || res == -ENAMETOOLONG ||
                res == -EROFS;
+    case KORU_OP_RENAME:
+        /* Both names are inside FUZZDIR, so EXDEV never comes up here; the
+         * deterministic matrix owns that one. */
+        return res == 0 || res == -EINVAL || res == -EBUSY || res == -ENOMEM ||
+               res == -ENOENT || res == -ENOTDIR || res == -EISDIR || res == -ENOTEMPTY ||
+               res == -EEXIST || res == -EACCES || res == -EPERM || res == -ELOOP ||
+               res == -ENAMETOOLONG || res == -EROFS || res == -EXDEV;
     default:
         return res == -EINVAL;
     }
@@ -248,7 +255,7 @@ static void gen_path(uint64_t *s, struct koru_sqe *q, uint64_t ud, uint32_t path
     uint8_t *slot = arena + (size_t)path_slot * F_SLOT;
     uint32_t n;
 
-    switch (rnd_below(s, 8)) {
+    switch (rnd_below(s, 9)) {
     case 0: { /* TRUNCATE: only ever its own scratch file. */
         uint64_t size = rnd_below(s, F_SLOT);
 
@@ -289,6 +296,15 @@ static void gen_path(uint64_t *s, struct koru_sqe *q, uint64_t ud, uint32_t path
         n = put_paths(arena, F_SLOT, path_slot, FUZZWRFILE, name);
         sqe_path(q, KORU_OP_SYMLINK, path_slot, 0, n, ud);
         break;
+    case 8: { /* RENAME, both names inside FUZZDIR. */
+        char to[64];
+
+        snprintf(name, sizeof(name), FUZZDIR "/c%u", rnd_below(s, FUZZNAMES));
+        snprintf(to, sizeof(to), FUZZDIR "/c%u", rnd_below(s, FUZZNAMES));
+        n = put_paths(arena, F_SLOT, path_slot, name, to);
+        sqe_path(q, KORU_OP_RENAME, path_slot, 0, n, ud);
+        break;
+    }
     default: /* UNLINK and RMDIR, on the same names and nothing else. Every
               * non-normal last component too, which only our own check
               * refuses. */
@@ -808,7 +824,8 @@ int fuzz_main(unsigned secs, uint64_t seed)
                                            "CLOSE",   "CANCEL", "CKSUM",   "WRITE",
                                            "ADOPT",   "POLL",   "STAT",    "TRUNC",
                                            "UTIMES",  "RDLINK", "STATXAT", "MKDIR",
-                                           "SYMLINK", "UNLINK",  "RMDIR",   "other" };
+                                           "SYMLINK", "UNLINK",  "RMDIR",   "RENAME",
+                                           "other" };
     struct koru_ring m;
     pthread_t th[NWORKERS + 3];
     uint64_t seeds[NWORKERS + 3];
@@ -907,7 +924,7 @@ int fuzz_main(unsigned secs, uint64_t seed)
         check(sub > SUB_FLOOR, "the fuzzer actually exercised the ring");
         /* Completion, not success: the tail sections carry that claim. */
         reached = 1;
-        for (op = 0; op <= KORU_OP_RMDIR; op++)
+        for (op = 0; op <= KORU_OP_RENAME; op++)
             if (atomic_load(&op_total[op]) == 0) {
                 note("opcode %d never completed once", op);
                 reached = 0;

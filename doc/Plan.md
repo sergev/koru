@@ -93,18 +93,6 @@ existing "unimplemented completes `-EINVAL`" rule. A new bit in an existing
 Per-opcode meanings for `Cqe::extra` are within its documented contract. New
 data-plane structs change no existing size or offset.
 
-### T28 [R] — `KORU_OP_RENAME`
-
-`start_renaming`, which calls `lookup_one_common` on both sides so there is
-again no hash work, then `vfs_rename` and `end_renaming`, with `mnt_want_write`
-on both mounts and a cross-mount rejection of `-EXDEV` before anything starts.
-By far the most intricate of the path operations, which is why it is alone and
-last. Reuses T26's two-path parse. `struct renamedata` is already bound.
-
-Done test: rename within a directory, across directories, onto an existing file,
-and across mounts for `-EXDEV`; the creds case; the write-count balance
-assertion on both mounts.
-
 ### T29 [R] — `KORU_OP_READDIR` and `KoruDirent`
 
 A `#[repr(C)]` wrapper whose first field is a `dir_context`, recovered in the

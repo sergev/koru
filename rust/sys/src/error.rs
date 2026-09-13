@@ -89,6 +89,7 @@ pub const EACCES: Errno = Errno(13);
 pub const EFAULT: Errno = Errno(14);
 pub const EBUSY: Errno = Errno(16);
 pub const EEXIST: Errno = Errno(17);
+pub const EXDEV: Errno = Errno(18);
 pub const ENOTDIR: Errno = Errno(20);
 pub const EISDIR: Errno = Errno(21);
 pub const EINVAL: Errno = Errno(22);
@@ -258,6 +259,12 @@ pub const KORU_ERRNOS: &[ErrnoDef] = &[
         name: "EEXIST",
         kind: Kind::Exists,
         produced_by: "filp_open, propagated verbatim",
+    },
+    ErrnoDef {
+        errno: EXDEV,
+        name: "EXDEV",
+        kind: Kind::Unsupported,
+        produced_by: "RENAME whose two paths are on different mounts",
     },
     ErrnoDef {
         errno: ENOTDIR,

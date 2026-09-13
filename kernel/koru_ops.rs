@@ -29,7 +29,7 @@ use core::ptr::NonNull;
 
 use crate::koru_abi::*;
 use crate::koru_path::{
-    Creating, Dirop, Inode, Link, Lookup, Write, LOOKUP_DIRECTORY, LOOKUP_FOLLOW,
+    Creating, Dirop, Inode, Link, Lookup, Renaming, Write, LOOKUP_DIRECTORY, LOOKUP_FOLLOW,
 };
 use crate::{module_get_live, module_put, RingCtx};
 
@@ -364,7 +364,8 @@ impl RingCtx {
             | KORU_OP_MKDIR
             | KORU_OP_SYMLINK
             | KORU_OP_UNLINK
-            | KORU_OP_RMDIR => Some(me.path_op(sqe)),
+            | KORU_OP_RMDIR
+            | KORU_OP_RENAME => Some(me.path_op(sqe)),
             KORU_OP_CANCEL => plain(me.cancel_op(sqe)),
             KORU_OP_CHECKSUM => {
                 if sqe.handle != 0 {
@@ -916,6 +917,7 @@ impl RingCtx {
             KORU_OP_SYMLINK => self.do_symlink(sqe).map_or_else(failed, |()| (0, 0)),
             KORU_OP_UNLINK => self.do_remove(sqe, false).map_or_else(failed, |()| (0, 0)),
             KORU_OP_RMDIR => self.do_remove(sqe, true).map_or_else(failed, |()| (0, 0)),
+            KORU_OP_RENAME => self.do_rename(sqe).map_or_else(failed, |()| (0, 0)),
             _ => self.do_readlink(sqe).map_or_else(failed, |res| (res, 0)),
         }
     }
@@ -947,6 +949,39 @@ impl RingCtx {
         // success it may have replaced it.
         c.replace(de);
         from_err_ptr(de)?;
+        Ok(())
+    }
+
+    /// `RENAME`: two paths, one mount, both parents locked at once. The
+    /// ordering of those two locks is `lock_rename`'s problem, not ours.
+    fn do_rename(&self, sqe: &Sqe) -> Result<()> {
+        let (old, new) = self.take_path_pair(sqe)?;
+        let (old_dir, old_last) = split_path(&old)?;
+        let (new_dir, new_last) = split_path(&new)?;
+        let cold = CStr::from_bytes_with_nul(&old_dir).map_err(|_| EINVAL)?;
+        let cnew = CStr::from_bytes_with_nul(&new_dir).map_err(|_| EINVAL)?;
+
+        let op = Lookup::new(cold, LOOKUP_FOLLOW | LOOKUP_DIRECTORY)?;
+        let np = Lookup::new(cnew, LOOKUP_FOLLOW | LOOKUP_DIRECTORY)?;
+
+        // Before anything is locked or counted: a rename never crosses
+        // filesystems.
+        if !core::ptr::eq(op.mnt(), np.mnt()) {
+            return Err(exdev());
+        }
+        // One, not two: the check above makes them the same mount, which is
+        // why `filename_renameat2` takes only the old one.
+        let _w = Write::want(op.mnt())?;
+
+        let mut oldq = qstr(old_last);
+        let mut newq = qstr(new_last);
+        let mut r = Renaming::start(op.idmap(), op.dentry(), np.dentry(), &mut oldq, &mut newq)?;
+
+        // SAFETY: the section holds both parents locked and both dentries.
+        let ret = unsafe { bindings::vfs_rename(r.as_ptr()) };
+        if ret < 0 {
+            return Err(Error::from_errno(ret));
+        }
         Ok(())
     }
 

@@ -3203,6 +3203,7 @@ fn creds_an_unprivileged_path_op_is_refused() {
     let ro = "/tmp/koru-check-rs-credsro";
     let victim = format!("{ro}/victim");
     let victimdir = format!("{ro}/victimdir");
+    let moved = format!("{ro}/moved");
     let _ = std::fs::remove_dir_all(ro);
     std::fs::create_dir(ro).expect("mkdir ro");
     std::fs::write(&victim, b"x").expect("fill");
@@ -3265,6 +3266,8 @@ fn creds_an_unprivileged_path_op_is_refused() {
                             11
                         } else if rmdir(&m, &victimdir) != -(EACCES.0 as i64) {
                             12
+                        } else if rename(&m, &victim, &moved) != -(EACCES.0 as i64) {
+                            13
                         } else {
                             0
                         }
@@ -3281,7 +3284,7 @@ fn creds_an_unprivileged_path_op_is_refused() {
     let _ = std::fs::remove_dir_all(dir);
     let _ = std::fs::remove_dir_all(ro);
     // 5 truncate, 6 named utimes, 7 touch, 8 statx, 9 mkdir, 10 symlink,
-    // 11 unlink, 12 rmdir.
+    // 11 unlink, 12 rmdir, 13 rename.
     assert_eq!(sys::wexitstatus(status), 0, "child verdict");
 }
 
@@ -3795,5 +3798,144 @@ fn rmdir_does_not_follow_a_final_symlink() {
     );
     assert!(!gone(d.path()), "the directory survives");
     assert!(!gone(link.path()), "and so does the link");
+    m.assert_quiesced();
+}
+
+// ---------------------------------------------------------------------------
+// T28 - RENAME
+// ---------------------------------------------------------------------------
+
+/// The old path first, then the new one, in `rename(2)`'s own argument order.
+fn rename(m: &Mapped, from: &str, to: &str) -> i64 {
+    let n = m.put_paths(1, from, to);
+    m.run_one(&Sqe::path(KORU_OP_RENAME, 0x7d0, 1, 0, n))
+}
+
+#[test]
+fn rename_moves_a_file_within_and_across_directories() {
+    let f = Scratch::new("rename");
+    let d = Dir::new("rename");
+    std::fs::write(f.path(), b"A").expect("fill");
+    std::fs::create_dir(d.path()).expect("mkdir");
+    let inside = format!("{}/moved", d.path());
+    let other = format!("{}-2", f.path());
+    let _ = std::fs::remove_file(&other);
+
+    let m = Mapped::shared();
+    assert_eq!(rename(&m, f.path(), &other), 0, "within a directory");
+    assert!(gone(f.path()), "the old name is gone");
+    assert_eq!(
+        std::fs::read(&other).expect("read"),
+        b"A",
+        "the bytes moved"
+    );
+
+    assert_eq!(rename(&m, &other, &inside), 0, "across directories");
+    assert!(gone(&other), "and that name too");
+    assert_eq!(std::fs::read(&inside).expect("read"), b"A", "bytes again");
+
+    // Onto an existing file: replaced, not merged.
+    let victim = format!("{}/victim", d.path());
+    std::fs::write(&victim, b"BBBB").expect("fill");
+    assert_eq!(rename(&m, &inside, &victim), 0, "onto an existing file");
+    assert_eq!(std::fs::read(&victim).expect("read"), b"A", "replaced");
+    assert!(gone(&inside), "and the source is gone");
+    m.assert_quiesced();
+}
+
+#[test]
+fn rename_moves_a_directory_and_checks_the_types() {
+    let d = Dir::new("renamedir");
+    std::fs::create_dir(d.path()).expect("mkdir");
+    let sub = format!("{}/sub", d.path());
+    let sub2 = format!("{}/sub2", d.path());
+    let file = format!("{}/f", d.path());
+    std::fs::create_dir(&sub).expect("mkdir sub");
+    std::fs::write(format!("{sub}/x"), b"C").expect("fill");
+    std::fs::write(&file, b"D").expect("fill");
+
+    let m = Mapped::shared();
+    assert_eq!(rename(&m, &sub, &sub2), 0, "a directory moves");
+    assert_eq!(
+        std::fs::read(format!("{sub2}/x")).expect("read"),
+        b"C",
+        "with what was in it"
+    );
+    assert_eq!(
+        rename(&m, &file, &sub2),
+        -(EISDIR.0 as i64),
+        "a file onto a directory"
+    );
+    assert_eq!(
+        rename(&m, &sub2, &file),
+        -(ENOTDIR.0 as i64),
+        "a directory onto a file"
+    );
+    m.assert_quiesced();
+}
+
+/// `/tmp` and `/run` are different mounts in the guest, so this needs no
+/// `mount(2)` of its own. The check's C half makes its own tmpfs instead.
+#[test]
+fn rename_across_mounts_is_exdev() {
+    use std::os::linux::fs::MetadataExt;
+
+    let f = Scratch::new("exdev");
+    std::fs::write(f.path(), b"E").expect("fill");
+    let there = "/run/koru-check-rs-exdev";
+    let _ = std::fs::remove_file(there);
+
+    let a = std::fs::metadata("/tmp").expect("stat /tmp").st_dev();
+    let b = std::fs::metadata("/run").expect("stat /run").st_dev();
+    if a == b {
+        skip("rename", "/tmp and /run are one filesystem");
+        return;
+    }
+
+    let m = Mapped::shared();
+    assert_eq!(
+        rename(&m, f.path(), there),
+        -(EXDEV.0 as i64),
+        "across mounts"
+    );
+    assert!(!gone(f.path()), "and the source is untouched");
+    m.assert_quiesced();
+}
+
+#[test]
+fn rename_rejection_matrix() {
+    let d = Dir::new("renamebad");
+    std::fs::create_dir(d.path()).expect("mkdir");
+    let file = format!("{}/f", d.path());
+    let dots = format!("{}/..", d.path());
+    std::fs::write(&file, b"F").expect("fill");
+    let m = Mapped::shared();
+    let bad = -(EINVAL.0 as i64);
+
+    assert_eq!(
+        rename(&m, "/no/such/path", &file),
+        -(ENOENT.0 as i64),
+        "a missing source"
+    );
+    assert_eq!(
+        rename(&m, &file, "/no/such/dir/x"),
+        -(ENOENT.0 as i64),
+        "a missing destination directory"
+    );
+    assert_eq!(rename(&m, &file, &dots), bad, "a destination ending in ..");
+    assert_eq!(rename(&m, &dots, &file), bad, "a source ending in ..");
+    assert_eq!(rename(&m, d.path(), &file), bad, "a directory into itself");
+
+    let n = m.put_paths(1, &file, &format!("{}/g", d.path()));
+    let mut s = Sqe::path(KORU_OP_RENAME, 0x7e0, 1, 0, n);
+    s.handle = 1;
+    assert_eq!(m.run_one(&s), bad, "a non-zero handle");
+    let n = m.put_path(1, &file);
+    assert_eq!(
+        m.run_one(&Sqe::path(KORU_OP_RENAME, 0x7e1, 1, 0, n)),
+        bad,
+        "one path with no NUL between"
+    );
+    assert!(!gone(&file), "no rejected RENAME moved anything");
     m.assert_quiesced();
 }

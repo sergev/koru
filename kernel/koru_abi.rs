@@ -43,6 +43,12 @@ pub(crate) fn enametoolong() -> Error {
     Error::from_errno(-(kernel::uapi::ENAMETOOLONG as i32))
 }
 
+/// `EXDEV`: a rename whose two halves are on different mounts. Not in
+/// `error::code`.
+pub(crate) fn exdev() -> Error {
+    Error::from_errno(-(kernel::uapi::EXDEV as i32))
+}
+
 /// Set by userspace in [`KoruParams::magic`]. Spells "koru" little-endian.
 pub(crate) const KORU_MAGIC: u32 = 0x7572_6f6b;
 
@@ -272,10 +278,17 @@ pub(crate) const KORU_OP_UNLINK: u8 = 17; // T27
 /// `ENOTDIR` for anything else, `ENOTEMPTY` for a directory with entries.
 pub(crate) const KORU_OP_RMDIR: u8 = 18; // T27
 
-// A `UNLINK` or `RMDIR` whose last component is empty, `.`, `..` or followed by
-// a separator completes `EINVAL`, where the syscalls spread `EISDIR`,
-// `ENOTEMPTY`, `EINVAL` and `EBUSY` over those same four cases. Naming the
-// thing above you is a caller bug here, not an outcome.
+/// Rename. **Two** NUL-terminated paths back to back in the slot, as on
+/// `SYMLINK`: the old path first, then the new one, in `rename(2)`'s own
+/// argument order. `handle` must be zero and `res` is 0. Both halves must be on
+/// one mount, else `EXDEV`; an existing destination is replaced, as
+/// `rename(2)` replaces it.
+pub(crate) const KORU_OP_RENAME: u8 = 19; // T28
+
+// A `UNLINK`, `RMDIR` or `RENAME` whose last component is empty, `.`, `..` or
+// followed by a separator completes `EINVAL`, where the syscalls spread
+// `EISDIR`, `ENOTEMPTY`, `EINVAL` and `EBUSY` over those same four cases.
+// Naming the thing above you is a caller bug here, not an outcome.
 
 /// What a `MKDIR` SQE's `handle` may carry: the permission bits and the sticky
 /// bit, which is all `vfs_mkdir` keeps of a requested mode. Any other bit is

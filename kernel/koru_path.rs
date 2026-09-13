@@ -45,6 +45,20 @@ unsafe extern "C" {
         parent: *mut bindings::dentry,
         name: *mut bindings::qstr,
     ) -> *mut bindings::dentry;
+
+    // Also namei.h, and also the only door: it hashes both names and checks
+    // both parents. `struct renamedata` itself is in `bindings::`.
+    //   int start_renaming(struct renamedata *rd, int lookup_flags,
+    //                      struct qstr *old_last, struct qstr *new_last);
+    //   void end_renaming(struct renamedata *rd);
+    fn start_renaming(
+        rd: *mut bindings::renamedata,
+        lookup_flags: c_int,
+        old_last: *mut bindings::qstr,
+        new_last: *mut bindings::qstr,
+    ) -> c_int;
+
+    fn end_renaming(rd: *mut bindings::renamedata);
 }
 
 /// `mnt_idmap`, a static inline. From include/linux/mount.h:
@@ -225,6 +239,48 @@ impl Drop for Dirop {
     fn drop(&mut self) {
         // SAFETY: this dentry came from `start_removing`; released once, here.
         unsafe { bindings::end_dirop(self.0) };
+    }
+}
+
+/// A `start_renaming` section: both parents locked (plus the superblock's
+/// rename mutex when they differ), both names looked up, an extra reference on
+/// the old parent. `end_renaming` on drop.
+pub(crate) struct Renaming(bindings::renamedata);
+
+impl Renaming {
+    /// `flags` stays 0: no `RENAME_NOREPLACE`, `EXCHANGE` or `WHITEOUT` yet.
+    /// NULL `delegated_inode`, as at T26.
+    pub(crate) fn start(
+        idmap: *mut bindings::mnt_idmap,
+        old_parent: *mut bindings::dentry,
+        new_parent: *mut bindings::dentry,
+        old: &mut bindings::qstr,
+        new: &mut bindings::qstr,
+    ) -> Result<Renaming> {
+        let mut rd = bindings::renamedata {
+            mnt_idmap: idmap,
+            old_parent,
+            new_parent,
+            ..bindings::renamedata::default()
+        };
+        // SAFETY: both parents belong to live `Lookup`s, both names outlive the
+        // call, and `rd` is our own.
+        let ret = unsafe { start_renaming(&mut rd, 0, old, new) };
+        if ret < 0 {
+            return Err(Error::from_errno(ret));
+        }
+        Ok(Renaming(rd))
+    }
+
+    pub(crate) fn as_ptr(&mut self) -> *mut bindings::renamedata {
+        &mut self.0
+    }
+}
+
+impl Drop for Renaming {
+    fn drop(&mut self) {
+        // SAFETY: `start_renaming` returned 0, so this is its one match.
+        unsafe { end_renaming(&mut self.0) };
     }
 }
 
