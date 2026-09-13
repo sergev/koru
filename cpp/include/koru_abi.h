@@ -242,6 +242,17 @@ KORU_STATIC_ASSERT(KORU_IOC_ENTER == 0xc0406b02u, "ioctl ENTER");
  * in symlink(2)'s own argument order. Exactly one NUL may fall inside those len
  * bytes and neither half may be empty. handle must be zero and res is 0. */
 #define KORU_OP_SYMLINK 16
+/* Remove the file the path names. handle must be zero and res is 0. Refuses a
+ * directory with EISDIR, as unlink(2) does. */
+#define KORU_OP_UNLINK 17
+/* Remove the directory the path names. handle must be zero and res is 0.
+ * ENOTDIR for anything else, ENOTEMPTY for a directory with entries.
+ *
+ * A UNLINK or RMDIR whose last component is empty, ., .. or followed by a
+ * separator completes EINVAL, where the syscalls spread EISDIR, ENOTEMPTY,
+ * EINVAL and EBUSY over those same four cases. Naming the thing above you is a
+ * caller bug here, not an outcome. */
+#define KORU_OP_RMDIR 18
 
 KORU_STATIC_ASSERT(KORU_OP_NOP == 0, "op NOP");
 KORU_STATIC_ASSERT(KORU_OP_DELAY_NS == 1, "op DELAY_NS");
@@ -260,6 +271,8 @@ KORU_STATIC_ASSERT(KORU_OP_READLINK == 13, "op READLINK");
 KORU_STATIC_ASSERT(KORU_OP_STATX_AT == 14, "op STATX_AT");
 KORU_STATIC_ASSERT(KORU_OP_MKDIR == 15, "op MKDIR");
 KORU_STATIC_ASSERT(KORU_OP_SYMLINK == 16, "op SYMLINK");
+KORU_STATIC_ASSERT(KORU_OP_UNLINK == 17, "op UNLINK");
+KORU_STATIC_ASSERT(KORU_OP_RMDIR == 18, "op RMDIR");
 
 /* Any bit set in an SQE's flags is rejected. */
 #define KORU_SQE_FLAGS_ALL 0u

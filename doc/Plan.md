@@ -93,28 +93,6 @@ existing "unimplemented completes `-EINVAL`" rule. A new bit in an existing
 Per-opcode meanings for `Cqe::extra` are within its documented contract. New
 data-plane structs change no existing size or offset.
 
-### T27 [R] — `KORU_OP_UNLINK` and `KORU_OP_RMDIR`
-
-`start_removing_path` is not exported, and the only exported variant takes a
-`__user` name and is unusable. So the sequence is assembled by hand: split the
-path at its last separator in the module, `kern_path` the parent with
-`LOOKUP_FOLLOW | LOOKUP_DIRECTORY`, `mnt_want_write`, build a `qstr` whose hash
-`start_removing` computes for you, `start_removing`, `vfs_unlink` or
-`vfs_rmdir`, `end_dirop` — exported and bound, the one lucky break — then
-unwind. That hand-assembly is why these are separate from T26.
-
-Rejecting what `filename_parentat` would have rejected as a non-normal last
-component — empty, `.`, `..`, a trailing separator — is our own job here.
-Missing it is how removing a path ending in `..` does something surprising.
-
-Done test: both verified with `access(2)`; `rmdir` on a non-empty directory
-giving `-ENOTEMPTY`, `unlink` on a directory giving `-EISDIR`, `rmdir` on a
-regular file giving `-ENOTDIR`; a path ending in `..` giving `-EINVAL` from our
-own check, which when deleted must fail *differently* rather than not at all;
-the creds case; and the write-count balance assertion T26 built — its own tmpfs,
-a loop, then a read-only remount, which is the only instrument that sees an
-unbalanced `mnt_want_write`.
-
 ### T28 [R] — `KORU_OP_RENAME`
 
 `start_renaming`, which calls `lookup_one_common` on both sides so there is

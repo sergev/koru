@@ -28,7 +28,9 @@ use core::mem::offset_of;
 use core::ptr::NonNull;
 
 use crate::koru_abi::*;
-use crate::koru_path::{Creating, Link, Lookup, LOOKUP_DIRECTORY, LOOKUP_FOLLOW};
+use crate::koru_path::{
+    Creating, Dirop, Inode, Link, Lookup, Write, LOOKUP_DIRECTORY, LOOKUP_FOLLOW,
+};
 use crate::{module_get_live, module_put, RingCtx};
 
 /// Nanoseconds to jiffies, rounded up so a sub-millisecond delay still waits.
@@ -360,7 +362,9 @@ impl RingCtx {
             | KORU_OP_READLINK
             | KORU_OP_STATX_AT
             | KORU_OP_MKDIR
-            | KORU_OP_SYMLINK => Some(me.path_op(sqe)),
+            | KORU_OP_SYMLINK
+            | KORU_OP_UNLINK
+            | KORU_OP_RMDIR => Some(me.path_op(sqe)),
             KORU_OP_CANCEL => plain(me.cancel_op(sqe)),
             KORU_OP_CHECKSUM => {
                 if sqe.handle != 0 {
@@ -910,6 +914,8 @@ impl RingCtx {
             KORU_OP_STATX_AT => self.do_statx_at(sqe).unwrap_or_else(failed),
             KORU_OP_MKDIR => self.do_mkdir(sqe).map_or_else(failed, |()| (0, 0)),
             KORU_OP_SYMLINK => self.do_symlink(sqe).map_or_else(failed, |()| (0, 0)),
+            KORU_OP_UNLINK => self.do_remove(sqe, false).map_or_else(failed, |()| (0, 0)),
+            KORU_OP_RMDIR => self.do_remove(sqe, true).map_or_else(failed, |()| (0, 0)),
             _ => self.do_readlink(sqe).map_or_else(failed, |res| (res, 0)),
         }
     }
@@ -941,6 +947,45 @@ impl RingCtx {
         // success it may have replaced it.
         c.replace(de);
         from_err_ptr(de)?;
+        Ok(())
+    }
+
+    /// `UNLINK` and `RMDIR`, assembled by hand: `start_removing_path` is not
+    /// exported and its exported sibling takes a `char __user *`.
+    ///
+    /// The unwind order is the acquisition order reversed, which is what the
+    /// guards' declaration order gives: the dirop unlocks the parent, then the
+    /// victim's `iput` runs, then the write count, then the path.
+    fn do_remove(&self, sqe: &Sqe, isdir: bool) -> Result<()> {
+        if sqe.handle != 0 {
+            return Err(EINVAL);
+        }
+        let path = self.take_path(sqe)?;
+        let (parent, last) = split_path(&path)?;
+        let cparent = CStr::from_bytes_with_nul(&parent).map_err(|_| EINVAL)?;
+
+        // `filename_parentat` resolves the parent as a directory, so we do.
+        let p = Lookup::new(cparent, LOOKUP_FOLLOW | LOOKUP_DIRECTORY)?;
+        let _w = Write::want(p.mnt())?;
+
+        // Declared before the dirop, so its `iput` runs after the unlock.
+        let mut victim = Inode::none();
+        let mut name = qstr(last);
+        let d = Dirop::removing(p.idmap(), p.dentry(), &mut name)?;
+
+        let ret = if isdir {
+            // SAFETY: the dirop holds `p`'s inode locked and `d` is the child
+            // it looked up in it. NULL `delegated_inode`, as at T26.
+            unsafe { bindings::vfs_rmdir(p.idmap(), p.inode(), d.dentry(), core::ptr::null_mut()) }
+        } else {
+            // SAFETY: the parent is locked, so the child dentry is stable.
+            victim.hold(unsafe { (*d.dentry()).d_inode });
+            // SAFETY: as the `vfs_rmdir` above.
+            unsafe { bindings::vfs_unlink(p.idmap(), p.inode(), d.dentry(), core::ptr::null_mut()) }
+        };
+        if ret < 0 {
+            return Err(Error::from_errno(ret));
+        }
         Ok(())
     }
 
@@ -1419,6 +1464,48 @@ impl RingCtx {
             OpWork::held_slot(&target),
         );
         0
+    }
+}
+
+/// Split a path into its parent and its last component, and refuse what
+/// `filename_parentat` would have called a non-normal last component: empty,
+/// `.`, `..`, or anything with a trailing separator, which leaves it empty.
+///
+/// `start_removing` refuses all four too, with `-EACCES`. Saying `EINVAL` here
+/// is what makes naming the directory above you a caller bug rather than a
+/// permission one; see doc/Notes.md.
+fn split_path(path: &[u8]) -> Result<(KVec<u8>, &[u8])> {
+    // Without the NUL `copy_path` appended.
+    let bytes = &path[..path.len() - 1];
+    let (dir, last) = match bytes.iter().rposition(|&b| b == b'/') {
+        // No separator: the parent is the working directory, which is the
+        // submitting task's, because this runs inline.
+        None => (&b"."[..], bytes),
+        // The root is its own parent.
+        Some(0) => (&b"/"[..], &bytes[1..]),
+        Some(i) => (&bytes[..i], &bytes[i + 1..]),
+    };
+    if last.is_empty() || last == b"." || last == b".." {
+        return Err(EINVAL);
+    }
+
+    let mut parent = KVec::with_capacity(dir.len() + 1, GFP_KERNEL)?;
+    parent.extend_from_slice(dir, GFP_KERNEL)?;
+    parent.push(0u8, GFP_KERNEL)?;
+    Ok((parent, last))
+}
+
+/// A `qstr` over borrowed bytes. `hash` stays zero: `lookup_one_common`
+/// computes it, which is the whole reason `start_removing` is the door.
+fn qstr(name: &[u8]) -> bindings::qstr {
+    bindings::qstr {
+        __bindgen_anon_1: bindings::qstr__bindgen_ty_1 {
+            __bindgen_anon_1: bindings::qstr__bindgen_ty_1__bindgen_ty_1 {
+                hash: 0,
+                len: name.len() as u32,
+            },
+        },
+        name: name.as_ptr(),
     }
 }
 

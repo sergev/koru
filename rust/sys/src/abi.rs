@@ -175,6 +175,18 @@ pub const KORU_OP_MKDIR: u8 = 15;
 /// `res` is 0.
 pub const KORU_OP_SYMLINK: u8 = 16;
 
+/// Remove the file the path names. `handle` must be zero and `res` is 0.
+/// Refuses a directory with `EISDIR`, as `unlink(2)` does.
+pub const KORU_OP_UNLINK: u8 = 17;
+/// Remove the directory the path names. `handle` must be zero and `res` is 0.
+/// `ENOTDIR` for anything else, `ENOTEMPTY` for a directory with entries.
+pub const KORU_OP_RMDIR: u8 = 18;
+
+// A `UNLINK` or `RMDIR` whose last component is empty, `.`, `..` or followed by
+// a separator completes `EINVAL`, where the syscalls spread `EISDIR`,
+// `ENOTEMPTY`, `EINVAL` and `EBUSY` over those same four cases. Naming the thing
+// above you is a caller bug here, not an outcome.
+
 /// What a `MKDIR` SQE's `handle` may carry: the permission bits and the sticky
 /// bit, which is all `vfs_mkdir` keeps of a requested mode. Any other bit is
 /// `EINVAL` rather than silently dropped, as an unknown open flag is.

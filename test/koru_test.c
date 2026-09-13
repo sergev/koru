@@ -335,6 +335,16 @@ int64_t r_symlink(struct koru_ring *r, uint32_t slot, const char *target, const 
     return run_one(r->fd, &s);
 }
 
+int64_t r_unlink(struct koru_ring *r, uint32_t slot, const char *path)
+{
+    return r_path(r, KORU_OP_UNLINK, slot, path, NULL, 0);
+}
+
+int64_t r_rmdir(struct koru_ring *r, uint32_t slot, const char *path)
+{
+    return r_path(r, KORU_OP_RMDIR, slot, path, NULL, 0);
+}
+
 int64_t r_stat(struct koru_ring *r, uint32_t handle, uint32_t slot, uint64_t off, uint32_t len,
                uint64_t *extra)
 {

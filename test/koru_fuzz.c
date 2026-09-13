@@ -81,7 +81,7 @@ static atomic_uint handle_pool[POOL];
 static atomic_uint pool_next;
 
 /* One per opcode, plus a bucket for everything that is not one. */
-#define NOPCODES (KORU_OP_SYMLINK + 2)
+#define NOPCODES (KORU_OP_RMDIR + 2)
 
 static atomic_ullong op_total[NOPCODES], op_ok[NOPCODES];
 static atomic_ullong open_einval, open_ebusy, open_emfile, open_other;
@@ -117,7 +117,8 @@ static int extra_allowed(uint8_t opcode, const struct koru_cqe *c)
 static int is_path_op(uint8_t op)
 {
     return op == KORU_OP_TRUNCATE || op == KORU_OP_UTIMES || op == KORU_OP_READLINK ||
-           op == KORU_OP_STATX_AT || op == KORU_OP_MKDIR || op == KORU_OP_SYMLINK;
+           op == KORU_OP_STATX_AT || op == KORU_OP_MKDIR || op == KORU_OP_SYMLINK ||
+           op == KORU_OP_UNLINK || op == KORU_OP_RMDIR;
 }
 
 /* Which per-opcode counter a completion lands in. Never a mask: an unknown
@@ -125,7 +126,7 @@ static int is_path_op(uint8_t op)
  * opcode nothing ever submitted. */
 static unsigned op_bucket(uint8_t op)
 {
-    return op <= KORU_OP_SYMLINK ? op : NOPCODES - 1;
+    return op <= KORU_OP_RMDIR ? op : NOPCODES - 1;
 }
 
 /* There is only one Cqe constructor, so any deviation is a real bug. */
@@ -198,6 +199,13 @@ static int res_allowed(uint8_t opcode, int64_t res)
                res == -EEXIST || res == -ENOENT || res == -ENOTDIR || res == -EACCES ||
                res == -EPERM || res == -ELOOP || res == -ENAMETOOLONG || res == -EROFS ||
                res == -ENOSPC || res == -EDQUOT || res == -EMLINK;
+    case KORU_OP_UNLINK:
+    case KORU_OP_RMDIR:
+        /* The same race the other way: the janitor may have got there first. */
+        return res == 0 || res == -EINVAL || res == -EBUSY || res == -ENOMEM ||
+               res == -ENOENT || res == -ENOTDIR || res == -EISDIR || res == -ENOTEMPTY ||
+               res == -EACCES || res == -EPERM || res == -ELOOP || res == -ENAMETOOLONG ||
+               res == -EROFS;
     default:
         return res == -EINVAL;
     }
@@ -240,7 +248,7 @@ static void gen_path(uint64_t *s, struct koru_sqe *q, uint64_t ud, uint32_t path
     uint8_t *slot = arena + (size_t)path_slot * F_SLOT;
     uint32_t n;
 
-    switch (rnd_below(s, 6)) {
+    switch (rnd_below(s, 8)) {
     case 0: { /* TRUNCATE: only ever its own scratch file. */
         uint64_t size = rnd_below(s, F_SLOT);
 
@@ -276,10 +284,30 @@ static void gen_path(uint64_t *s, struct koru_sqe *q, uint64_t ud, uint32_t path
         /* The one field a create may have fuzzed: it names no path. */
         q->handle = one_in(s, 8) ? (uint32_t)rnd(s) : (uint32_t)(rnd(s) & 01777);
         break;
-    default: /* SYMLINK, the same name and its own file as the target. */
+    case 5: /* SYMLINK, the same name and its own file as the target. */
         snprintf(name, sizeof(name), FUZZDIR "/c%u", rnd_below(s, FUZZNAMES));
         n = put_paths(arena, F_SLOT, path_slot, FUZZWRFILE, name);
         sqe_path(q, KORU_OP_SYMLINK, path_slot, 0, n, ud);
+        break;
+    default: /* UNLINK and RMDIR, on the same names and nothing else. Every
+              * non-normal last component too, which only our own check
+              * refuses. */
+        switch (rnd_below(s, 4)) {
+        case 0:
+            snprintf(name, sizeof(name), FUZZDIR "/.");
+            break;
+        case 1:
+            snprintf(name, sizeof(name), FUZZDIR "/..");
+            break;
+        case 2:
+            snprintf(name, sizeof(name), FUZZDIR "/c%u/", rnd_below(s, FUZZNAMES));
+            break;
+        default:
+            snprintf(name, sizeof(name), FUZZDIR "/c%u", rnd_below(s, FUZZNAMES));
+            break;
+        }
+        n = put_path(arena, F_SLOT, path_slot, name);
+        sqe_path(q, one_in(s, 2) ? KORU_OP_UNLINK : KORU_OP_RMDIR, path_slot, 0, n, ud);
         break;
     }
 }
@@ -701,7 +729,9 @@ static void child_body(uint64_t seed)
 }
 
 /* Empties FUZZDIR, so a name is sometimes free and sometimes taken and both
- * outcomes of a create are reached. Racing the kernel ops on purpose. */
+ * outcomes of a create are reached. Racing the kernel ops on purpose. Slow
+ * enough since T27 that koru's own UNLINK and RMDIR get some of the removals:
+ * a janitor that swept every millisecond left them nothing to find. */
 static void *janitor(void *arg)
 {
     uint64_t seed = *(uint64_t *)arg;
@@ -714,7 +744,7 @@ static void *janitor(void *arg)
             if (unlink(name) != 0)
                 rmdir(name);
         }
-        usleep(500 + rnd_below(&seed, 2000));
+        usleep(5000 + rnd_below(&seed, 15000));
     }
     return NULL;
 }
@@ -778,7 +808,7 @@ int fuzz_main(unsigned secs, uint64_t seed)
                                            "CLOSE",   "CANCEL", "CKSUM",   "WRITE",
                                            "ADOPT",   "POLL",   "STAT",    "TRUNC",
                                            "UTIMES",  "RDLINK", "STATXAT", "MKDIR",
-                                           "SYMLINK", "other" };
+                                           "SYMLINK", "UNLINK",  "RMDIR",   "other" };
     struct koru_ring m;
     pthread_t th[NWORKERS + 3];
     uint64_t seeds[NWORKERS + 3];
@@ -877,7 +907,7 @@ int fuzz_main(unsigned secs, uint64_t seed)
         check(sub > SUB_FLOOR, "the fuzzer actually exercised the ring");
         /* Completion, not success: the tail sections carry that claim. */
         reached = 1;
-        for (op = 0; op <= KORU_OP_SYMLINK; op++)
+        for (op = 0; op <= KORU_OP_RMDIR; op++)
             if (atomic_load(&op_total[op]) == 0) {
                 note("opcode %d never completed once", op);
                 reached = 0;

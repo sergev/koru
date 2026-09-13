@@ -3198,6 +3198,15 @@ fn creds_an_unprivileged_path_op_is_refused() {
     let inner = format!("{dir}/inside");
     let sub = format!("{dir}/sub");
     let newlink = format!("{dir}/new");
+    // Searchable but not writable, so the lookup succeeds and the `vfs_*` call
+    // is what refuses.
+    let ro = "/tmp/koru-check-rs-credsro";
+    let victim = format!("{ro}/victim");
+    let victimdir = format!("{ro}/victimdir");
+    let _ = std::fs::remove_dir_all(ro);
+    std::fs::create_dir(ro).expect("mkdir ro");
+    std::fs::write(&victim, b"x").expect("fill");
+    std::fs::create_dir(&victimdir).expect("mkdir victimdir");
     let _ = std::fs::remove_dir_all(dir);
     std::fs::create_dir(dir).expect("mkdir");
     std::fs::write(&inner, b"x").expect("fill");
@@ -3250,6 +3259,12 @@ fn creds_an_unprivileged_path_op_is_refused() {
                             9
                         } else if symlink(&m, "/any/target", &newlink) != -(EACCES.0 as i64) {
                             10
+                        // Removing needs write on the parent, which the
+                        // searchable directory does not give.
+                        } else if unlink(&m, &victim) != -(EACCES.0 as i64) {
+                            11
+                        } else if rmdir(&m, &victimdir) != -(EACCES.0 as i64) {
+                            12
                         } else {
                             0
                         }
@@ -3264,7 +3279,9 @@ fn creds_an_unprivileged_path_op_is_refused() {
     unsafe { sys::waitpid(pid, &mut status, 0) };
     assert!(sys::wifexited(status), "the child died");
     let _ = std::fs::remove_dir_all(dir);
-    // 5 truncate, 6 named utimes, 7 touch, 8 statx, 9 mkdir, 10 symlink.
+    let _ = std::fs::remove_dir_all(ro);
+    // 5 truncate, 6 named utimes, 7 touch, 8 statx, 9 mkdir, 10 symlink,
+    // 11 unlink, 12 rmdir.
     assert_eq!(sys::wexitstatus(status), 0, "child verdict");
 }
 
@@ -3644,5 +3661,139 @@ fn symlink_two_path_parse_matrix() {
         std::fs::symlink_metadata(&link).is_err(),
         "no rejected SYMLINK left a link behind"
     );
+    m.assert_quiesced();
+}
+
+// ---------------------------------------------------------------------------
+// T27 - UNLINK and RMDIR
+// ---------------------------------------------------------------------------
+
+fn unlink(m: &Mapped, path: &str) -> i64 {
+    let n = m.put_path(1, path);
+    m.run_one(&Sqe::path(KORU_OP_UNLINK, 0x7b0, 1, 0, n))
+}
+
+fn rmdir(m: &Mapped, path: &str) -> i64 {
+    let n = m.put_path(1, path);
+    m.run_one(&Sqe::path(KORU_OP_RMDIR, 0x7b1, 1, 0, n))
+}
+
+/// `access(2)`, which is what the plan's done test names.
+fn gone(path: &str) -> bool {
+    !std::fs::symlink_metadata(path).is_ok()
+}
+
+#[test]
+fn unlink_removes_a_file_and_a_dangling_symlink() {
+    let f = Scratch::new("unlink");
+    std::fs::write(f.path(), b"x").expect("fill");
+    let Some(link) = Symlink::new("dangling", "/no/such/target") else {
+        skip("unlink", "cannot symlink");
+        return;
+    };
+    let m = Mapped::shared();
+
+    assert_eq!(unlink(&m, f.path()), 0, "UNLINK a file");
+    assert!(gone(f.path()), "and it is gone");
+    // The link itself, never what it points at.
+    assert_eq!(unlink(&m, link.path()), 0, "UNLINK a dangling symlink");
+    assert!(gone(link.path()), "and that is gone too");
+    m.assert_quiesced();
+}
+
+#[test]
+fn rmdir_removes_a_directory_and_refuses_a_full_one() {
+    let d = Dir::new("rmdir");
+    let sub = format!("{}/sub", d.path());
+    std::fs::create_dir(d.path()).expect("mkdir");
+    std::fs::create_dir(&sub).expect("mkdir sub");
+    let m = Mapped::shared();
+
+    assert_eq!(
+        rmdir(&m, d.path()),
+        -(ENOTEMPTY.0 as i64),
+        "a non-empty directory"
+    );
+    assert!(!gone(d.path()), "and it is still there");
+    assert_eq!(rmdir(&m, &sub), 0, "the child goes first");
+    assert_eq!(rmdir(&m, d.path()), 0, "and then the parent");
+    assert!(gone(d.path()), "both are gone");
+    m.assert_quiesced();
+}
+
+/// The type checks are `may_delete_dentry`'s; the rest are our own split's.
+#[test]
+fn remove_rejection_matrix() {
+    let f = Scratch::new("removebad");
+    let d = Dir::new("removebad");
+    std::fs::write(f.path(), b"x").expect("fill");
+    std::fs::create_dir(d.path()).expect("mkdir");
+    let m = Mapped::shared();
+    let bad = -(EINVAL.0 as i64);
+
+    // On a writable filesystem: `mnt_want_write` comes first, so a directory
+    // under a read-only mount would answer EROFS and prove nothing.
+    assert_eq!(
+        unlink(&m, d.path()),
+        -(EISDIR.0 as i64),
+        "unlink a directory"
+    );
+    assert_eq!(rmdir(&m, f.path()), -(ENOTDIR.0 as i64), "rmdir a file");
+    assert_eq!(
+        unlink(&m, "/no/such/path"),
+        -(ENOENT.0 as i64),
+        "a missing path"
+    );
+    assert_eq!(
+        unlink(&m, "/etc/hostname/x"),
+        -(ENOTDIR.0 as i64),
+        "through a regular file"
+    );
+
+    // Our own, and every one of them is -EACCES from `start_removing` when the
+    // check is deleted rather than a success.
+    assert_eq!(unlink(&m, "/tmp/."), bad, "a last component of .");
+    assert_eq!(unlink(&m, "/tmp/.."), bad, "a last component of ..");
+    assert_eq!(rmdir(&m, "/tmp/.."), bad, "and for rmdir too");
+    assert_eq!(unlink(&m, "/tmp/"), bad, "a trailing separator");
+    assert_eq!(unlink(&m, "/"), bad, "the root itself");
+
+    let n = m.put_path(1, f.path());
+    let mut s = Sqe::path(KORU_OP_UNLINK, 0x7c0, 1, 0, n);
+    s.handle = 1;
+    assert_eq!(m.run_one(&s), bad, "a non-zero handle");
+    assert_eq!(
+        m.run_one(&Sqe::path(KORU_OP_RMDIR, 0x7c1, 1, 0, 0)),
+        bad,
+        "a zero-length path"
+    );
+    assert_eq!(
+        m.run_one(&Sqe::path(KORU_OP_UNLINK, 0x7c2, m.slot_count(), 0, 8)),
+        bad,
+        "a slot past the arena"
+    );
+    assert!(!gone(f.path()), "no rejected UNLINK removed anything");
+    assert!(!gone(d.path()), "and no rejected RMDIR either");
+    m.assert_quiesced();
+}
+
+/// A symlink to a directory is not a directory, and the link must survive.
+#[test]
+fn rmdir_does_not_follow_a_final_symlink() {
+    let d = Dir::new("rmdirlink");
+    std::fs::create_dir(d.path()).expect("mkdir");
+    let Some(link) = Symlink::new("todir", d.path()) else {
+        skip("rmdir", "cannot symlink");
+        return;
+    };
+    let m = Mapped::shared();
+
+    assert_eq!(
+        rmdir(&m, link.path()),
+        -(ENOTDIR.0 as i64),
+        "through the link"
+    );
+    assert!(!gone(d.path()), "the directory survives");
+    assert!(!gone(link.path()), "and so does the link");
     m.assert_quiesced();
 }

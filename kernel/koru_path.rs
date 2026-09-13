@@ -34,6 +34,25 @@ unsafe extern "C" {
     ) -> *mut bindings::dentry;
 
     fn end_creating_path(path: *const bindings::path, dentry: *mut bindings::dentry);
+
+    // Its `_path` sibling is not exported and the exported `_user_path_at` one
+    // takes a `char __user *`, so this is the only usable door. It computes the
+    // name's hash itself and checks `MAY_EXEC` on the parent.
+    //   struct dentry *start_removing(struct mnt_idmap *idmap,
+    //                                 struct dentry *parent, struct qstr *name);
+    fn start_removing(
+        idmap: *mut bindings::mnt_idmap,
+        parent: *mut bindings::dentry,
+        name: *mut bindings::qstr,
+    ) -> *mut bindings::dentry;
+}
+
+/// `mnt_idmap`, a static inline. From include/linux/mount.h:
+///   /* Pairs with smp_store_release() in do_idmap_mount(). */
+///   return READ_ONCE(mnt->mnt_idmap);
+fn mnt_idmap(mnt: *mut bindings::vfsmount) -> *mut bindings::mnt_idmap {
+    // SAFETY: the caller holds a reference to the mount.
+    unsafe { core::ptr::read_volatile(&raw const (*mnt).mnt_idmap) }
 }
 
 // From include/linux/namei.h:
@@ -66,6 +85,21 @@ impl Lookup {
 
     pub(crate) fn dentry(&self) -> *mut bindings::dentry {
         self.0.dentry
+    }
+
+    pub(crate) fn mnt(&self) -> *mut bindings::vfsmount {
+        self.0.mnt
+    }
+
+    pub(crate) fn idmap(&self) -> *mut bindings::mnt_idmap {
+        mnt_idmap(self.0.mnt)
+    }
+
+    /// The resolved directory's inode. Only meaningful on a directory, which
+    /// is what `LOOKUP_DIRECTORY` makes sure of.
+    pub(crate) fn inode(&self) -> *mut bindings::inode {
+        // SAFETY: `kern_path` took a reference to this dentry.
+        unsafe { (*self.0.dentry).d_inode }
     }
 }
 
@@ -117,12 +151,8 @@ impl Creating {
         unsafe { (*self.path.dentry).d_inode }
     }
 
-    /// `mnt_idmap`, a static inline. From include/linux/mount.h:
-    ///   /* Pairs with smp_store_release() in do_idmap_mount(). */
-    ///   return READ_ONCE(mnt->mnt_idmap);
     pub(crate) fn idmap(&self) -> *mut bindings::mnt_idmap {
-        // SAFETY: as above, and the mount outlives this section.
-        unsafe { core::ptr::read_volatile(&raw const (*self.path.mnt).mnt_idmap) }
+        mnt_idmap(self.path.mnt)
     }
 
     /// What `vfs_mkdir` returned: it may have replaced the dentry and `dput`
@@ -138,6 +168,92 @@ impl Drop for Creating {
         // SAFETY: `start_creating_path` filled the path and returned this
         // dentry, or `vfs_mkdir` replaced it. Called once, here.
         unsafe { end_creating_path(&self.path, self.dentry) };
+    }
+}
+
+/// The mount's write count, `mnt_drop_write` on drop. **This is the guard the
+/// plan asked for at T24 and T26 and that neither needed**: the `vfs_*`
+/// wrappers they call take the count themselves. A removal is assembled by
+/// hand, so here it is ours, and an unbalanced one pins the filesystem against
+/// a read-only remount until reboot.
+pub(crate) struct Write(*mut bindings::vfsmount);
+
+impl Write {
+    pub(crate) fn want(mnt: *mut bindings::vfsmount) -> Result<Write> {
+        // SAFETY: the caller holds a reference to the mount.
+        let ret = unsafe { bindings::mnt_want_write(mnt) };
+        if ret < 0 {
+            return Err(Error::from_errno(ret));
+        }
+        Ok(Write(mnt))
+    }
+}
+
+impl Drop for Write {
+    fn drop(&mut self) {
+        // SAFETY: paired with the `mnt_want_write` above, once.
+        unsafe { bindings::mnt_drop_write(self.0) };
+    }
+}
+
+/// A directory operation: the parent locked and the child looked up,
+/// `end_dirop` on drop. `end_dirop` is in `bindings::` because it is declared
+/// in fs.h rather than namei.h, which is the one lucky break in this file.
+pub(crate) struct Dirop(*mut bindings::dentry);
+
+impl Dirop {
+    /// `start_removing`: it hashes the name, refuses `.`, `..`, an empty name
+    /// and anything with a separator in it, and checks `MAY_EXEC` on the
+    /// parent — all before locking it and looking the child up.
+    pub(crate) fn removing(
+        idmap: *mut bindings::mnt_idmap,
+        parent: *mut bindings::dentry,
+        name: &mut bindings::qstr,
+    ) -> Result<Dirop> {
+        // SAFETY: `parent` belongs to a live `Lookup` and `name` points into a
+        // buffer that outlives the call.
+        let d = unsafe { start_removing(idmap, parent, name) };
+        Ok(Dirop(from_err_ptr(d)?))
+    }
+
+    pub(crate) fn dentry(&self) -> *mut bindings::dentry {
+        self.0
+    }
+}
+
+impl Drop for Dirop {
+    fn drop(&mut self) {
+        // SAFETY: this dentry came from `start_removing`; released once, here.
+        unsafe { bindings::end_dirop(self.0) };
+    }
+}
+
+/// An inode reference, `iput` on drop. `UNLINK` holds one across `end_dirop`,
+/// because the last `iput` truncates and that must not happen under the
+/// parent's rwsem — the reason `filename_unlinkat` gives in its own comment.
+pub(crate) struct Inode(*mut bindings::inode);
+
+impl Inode {
+    pub(crate) fn none() -> Inode {
+        Inode(core::ptr::null_mut())
+    }
+
+    /// `ihold`, or nothing at all for a negative dentry.
+    pub(crate) fn hold(&mut self, inode: *mut bindings::inode) {
+        if !inode.is_null() {
+            // SAFETY: the dirop holds the parent locked, so this inode is live.
+            unsafe { bindings::ihold(inode) };
+            self.0 = inode;
+        }
+    }
+}
+
+impl Drop for Inode {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            // SAFETY: paired with the `ihold` above, once.
+            unsafe { bindings::iput(self.0) };
+        }
     }
 }
 

@@ -1330,6 +1330,101 @@ deterministic rejection matrices carry instead — they cover every field of eve
 path op, and the validation is shared code. What it buys is that no fuzz run can
 touch anything outside four names, provable by reading one function.
 
+### Removing things, assembled by hand
+
+T27's `UNLINK` and `RMDIR` are the first path ops with no wrapper to call.
+`start_removing_path` is declared in namei.h but not exported, and the exported
+`start_removing_user_path_at` takes a `char __user *`, which a module holding a
+kernel string cannot use. So the sequence is `filename_unlinkat`'s, written out:
+split the path, `kern_path` the parent, `mnt_want_write`, `start_removing`,
+`vfs_unlink` or `vfs_rmdir`, then unwind in reverse. `end_dirop` is in
+`bindings::` because it is declared in fs.h rather than namei.h — the one lucky
+break in `koru_path.rs`.
+
+**`start_removing` is the right door**, not `start_dirop`: it calls
+`lookup_one_common`, which computes the name's hash with `full_name_hash`,
+rejects an empty name, `.`, `..` and anything containing a separator or a NUL,
+and checks `MAY_EXEC` on the parent — all the work `filename_parentat` would
+have done and none of it available to us otherwise. The `qstr` we hand it
+carries `len` and `name`; `hash` stays zero because that call fills it in.
+
+**The `mnt_want_write` guard finally lands**, three tasks after the plan first
+asked for it. T24's ops call `vfs_truncate` and `vfs_utimes`, which take the
+count themselves; T26's call `start_creating_path`, which does the same. A
+removal has no such wrapper, so the count is ours, and an unbalanced one is
+invisible until a filesystem refuses to go read-only.
+
+**Four guards unwind in declaration order reversed**, which is what Rust gives
+for free and what the C does by hand with `goto`: the dirop unlocks the parent,
+then the victim's `iput`, then the write count, then the path. `UNLINK` holds
+that inode reference across `end_dirop` for the reason `filename_unlinkat`
+states in its own comment — the last `iput` truncates, and truncation must not
+happen under the parent's `i_rwsem`.
+
+#### Our own split, and an errno the syscalls do not give
+
+`filename_parentat` classifies the last component and its callers act on that:
+`rmdir` answers `-ENOTEMPTY` for `..`, `-EINVAL` for `.` and `-EBUSY` for the
+root, while `unlink` answers `-EISDIR` for all three. koru splits the path
+itself, so it owes its own answer, and that answer is **`-EINVAL` for all four
+cases** — empty, `.`, `..`, and a trailing separator, which leaves the last
+component empty. Naming the directory above you is a caller bug, not an outcome.
+
+Deleting that check does not make the removals succeed: `start_removing` refuses
+the same four with `-EACCES`. That is exactly why the plan asked for the
+assertion to fail *differently* rather than not at all, and it does — six
+assertions turn from `-EINVAL` into `-EACCES`, or `-EROFS` for the root, whose
+parent is itself.
+
+A path with no separator resolves against the submitting task's working
+directory, which is a second reason these ops are inline: a kworker's `cwd` is
+the init root. The check has an assertion for that, and it fails with `-ENOENT`
+the moment the op is deferred.
+
+#### The read-only test that tested nothing
+
+The first version of the `mnt_want_write` test mounted a tmpfs, remounted it
+read-only and asserted `-EROFS`. It passed with the guard deleted. `IS_RDONLY`
+is `sb_rdonly`, and `inode_permission` refuses `MAY_WRITE` on a read-only
+superblock all by itself — so the superblock case never reaches the mount's
+write count at all.
+
+What isolates the guard is a **read-only bind mount** of a writable filesystem:
+the inode is perfectly writable, `inode_permission` is content, and only
+`mnt_want_write` refuses. The check makes one, asserts `-EROFS` through it, and
+then removes the same inodes through the writable mount to show the mount was
+the only thing that objected. With the guard deleted the read-only removal
+succeeds — a read-only bypass, which is what that assertion is for.
+
+#### What was verified, and how
+
+Six perturbations, each applied and reverted. Five fail; the sixth is the
+finding below.
+
+- **Delete the non-normal last-component check.** Six assertions fail, each with
+  a different errno rather than a success, as described above.
+- **Drop `mnt_want_write`.** Five assertions fail: the read-only bind mount is
+  bypassed and both removals succeed through it.
+- **Defer `UNLINK` to the workqueue.** The unprivileged child removes a file
+  from a directory only root can write, and the bare-name case fails with
+  `-ENOENT` because a kworker's working directory is not the submitter's. Two
+  independent signals for one mistake.
+- **Drop `LOOKUP_DIRECTORY` from the parent lookup.** A path through a regular
+  file gives `-EACCES` from `lookup_one_common` instead of `-ENOTDIR`.
+- **Call `vfs_rmdir` for `UNLINK`.** Eleven assertions fail.
+- **Drop the inode reference across `end_dirop`.** *Nothing fails*, and lockdep
+  says nothing. It is a lock-hold-time property — the truncation happens under
+  the parent's rwsem instead of after it — not a correctness one, so no errno
+  and no instrument in this tree can see it. The code keeps it because the VFS
+  keeps it and says why; it is an untested guard, like the arena-mutex rule on
+  `STAT`.
+
+The fuzzer grew an arm for both, on the same `FUZZDIR` names its creates use, so
+the two directions race each other and the janitor. It also names `.`, `..` and
+a trailing separator there, which only our own check refuses. The janitor slowed
+from a sweep every millisecond to every five to twenty, because at the old rate
+it removed everything before `UNLINK` or `RMDIR` could find it.
+
 ### Cancellation
 
 `CANCEL` names its target by `user_data` in `off`. A duplicate `user_data`

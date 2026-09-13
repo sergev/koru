@@ -5,12 +5,12 @@ code in this repository.
 
 ## State of the repository
 
-**T0–T26 are done: Braam's hello world runs through koru, and the ring can
+**T0–T27 are done: Braam's hello world runs through koru, and the ring can
 wait for a descriptor.** The module registers `/dev/koru`, configures a ring
 with `SETUP`, and submits `NOP`, `DELAY_NS`, `CHECKSUM`, `OPEN`, `READ`,
 `WRITE`, `CLOSE`, `CANCEL`, `ADOPT_FD`, `POLL_ADD`, `STAT`, `TRUNCATE`,
-`UTIMES`, `READLINK`, `STATX_AT`, `MKDIR` and `SYMLINK` through `ENTER`, which
-blocks for completions. The arena
+`UTIMES`, `READLINK`, `STATX_AT`, `MKDIR`, `SYMLINK`, `UNLINK` and `RMDIR`
+through `ENTER`, which blocks for completions. The arena
 is mmap'd, with slot exclusivity enforced by the kernel. Open files live in a
 generational handle table. A queued op can be genuinely dequeued, and
 `close(fd)` cancels whatever is still queued. The whole validation surface has
@@ -127,6 +127,18 @@ never real** — one shared path slot per thread meant a batched `MKDIR` could
 name a truncated prefix of anything another SQE had written. doc/Notes.md has
 the six perturbations and the sandbox rebuild.
 
+T27 added `KORU_OP_UNLINK` and `KORU_OP_RMDIR`, the first path ops with no
+wrapper to call: `start_removing_path` is not exported and its exported sibling
+takes a `__user` name, so `filename_unlinkat`'s sequence is written out by hand.
+`koru_path.rs` gained `Write`, `Dirop` and `Inode`; the `mnt_want_write` guard
+the plan has asked for since T24 belongs here and nowhere earlier. koru splits
+the path itself, so a last component that is empty, `.`, `..` or followed by a
+separator is **`EINVAL`**, where the syscalls spread four different errnos over
+those cases. A read-only *bind mount* is the only shape that tests the write
+count: with the superblock read-only, `inode_permission` refuses on its own and
+the guard can be missing with nothing saying so. doc/Notes.md has the six
+perturbations.
+
 T14 made the two userspace ABI mirrors a diff rather than a promise.
 `cpp/include/koru_abi.h` and `cpp/include/koru_errno.h` are the C mirrors,
 shared with `test/`, and an `abi_dump` on each side emits a canonical record
@@ -230,7 +242,7 @@ survived**.
 
 ## Commands
 
-These work today (T0 through T26):
+These work today (T0 through T27):
 
 ```sh
 KDIR=../kernel-dev/linux-source-7.1

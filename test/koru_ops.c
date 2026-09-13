@@ -1612,9 +1612,181 @@ static void path_symlink(void)
     check(readlink(NEWLINK, got, sizeof(got)) < 0, "and no rejected SYMLINK left a link behind");
 }
 
-/* Heavy: start_creating_path takes the mount's write count and end_creating_path
- * drops it. Nothing else sees an unbalanced one — no splat, no leak report —
- * until the filesystem refuses to go read-only. Its own tmpfs, so the count the
+/* T27: UNLINK and RMDIR, the hand-assembled removal. */
+
+#define GONE(path) (access(path, F_OK) != 0 && errno == ENOENT)
+
+static void path_unlink(void)
+{
+    struct koru_sqe s;
+    char deep[128];
+
+    unlink(NEWLINK);
+    rmdir(NEWDIR);
+    if (make_file(TRFILE, 64) != 0 || symlink("/any/target", NEWLINK) != 0) {
+        check(0, "create the UNLINK targets");
+        return;
+    }
+
+    check_res(r_unlink(&R, 1, TRFILE), 0, "UNLINK removes a file");
+    check(GONE(TRFILE), "  and access(2) says it is gone");
+    /* The link itself, never what it points at. */
+    check_res(r_unlink(&R, 1, NEWLINK), 0, "  and a dangling symlink");
+    check(GONE(NEWLINK), "  which access(2) also stops finding");
+
+    /* On a writable filesystem: `mnt_want_write` comes first, so a directory
+     * under a read-only mount would answer EROFS and prove nothing. */
+    if (mkdir(NEWDIR, 0700) == 0)
+        check_res(r_unlink(&R, 1, NEWDIR), -EISDIR, "UNLINK of a directory is EISDIR");
+    else
+        check(0, "UNLINK of a directory is EISDIR");
+    rmdir(NEWDIR);
+    check_res(r_unlink(&R, 1, "/no/such/path"), -ENOENT, "  of a missing path is ENOENT");
+    check_res(r_unlink(&R, 1, "/etc/hostname/x"), -ENOTDIR,
+              "  through a regular file is ENOTDIR");
+
+    /* Our own rejections, before start_removing sees the name. Every one of
+     * these is -EACCES from the VFS when our check is deleted, never a pass. */
+    check_res(r_unlink(&R, 1, "/tmp/."), -EINVAL, "UNLINK of a path ending in . is EINVAL");
+    check_res(r_unlink(&R, 1, "/tmp/.."), -EINVAL, "  ending in .. is EINVAL");
+    check_res(r_unlink(&R, 1, "/tmp/"), -EINVAL, "  with a trailing separator is EINVAL");
+    check_res(r_unlink(&R, 1, "/"), -EINVAL, "  and the root itself is EINVAL");
+
+    /* A path with no separator at all resolves against the caller's cwd, which
+     * is the submitting task's only because this runs inline. */
+    {
+        char cwd[256];
+
+        if (getcwd(cwd, sizeof(cwd)) && make_file("/tmp/koru-check-cwd", 8) == 0 &&
+            chdir("/tmp") == 0) {
+            check_res(r_unlink(&R, 1, "koru-check-cwd"), 0, "UNLINK of a bare name uses the cwd");
+            check(GONE("/tmp/koru-check-cwd"), "  and removed that one");
+            if (chdir(cwd) != 0)
+                note("could not return to %s", cwd);
+        } else {
+            check(0, "UNLINK of a bare name uses the cwd");
+            unlink("/tmp/koru-check-cwd");
+        }
+    }
+
+    put_path(R.arena, R.slot_size, 1, "/tmp");
+    sqe_path(&s, KORU_OP_UNLINK, 1, 0, 4, 0x7a0);
+    s.handle = 1;
+    check_res(run_one(R.fd, &s), -EINVAL, "  a non-zero handle is EINVAL");
+    sqe_path(&s, KORU_OP_UNLINK, 1, 0, 0, 0x7a1);
+    check_res(run_one(R.fd, &s), -EINVAL, "  a zero-length path is EINVAL");
+    sqe_path(&s, KORU_OP_UNLINK, R.slot_count, 0, 8, 0x7a2);
+    check_res(run_one(R.fd, &s), -EINVAL, "  a slot past the arena is EINVAL");
+
+    /* Deep enough that the parent lookup is doing real work. */
+    snprintf(deep, sizeof(deep), "%s/a/b", NEWDIR);
+    if (mkdir(NEWDIR, 0700) == 0 && mkdir(NEWDIR "/a", 0700) == 0 &&
+        make_file(NEWDIR "/a/b", 3) == 0) {
+        check_res(r_unlink(&R, 1, deep), 0, "UNLINK three components down");
+        check(GONE(deep), "  and only that one went");
+        check(access(NEWDIR "/a", F_OK) == 0, "  its parent is untouched");
+    } else {
+        check(0, "UNLINK three components down");
+    }
+    rmdir(NEWDIR "/a");
+    rmdir(NEWDIR);
+}
+
+/* A **read-only bind mount** of a writable filesystem, which is the only shape
+ * that isolates our own `mnt_want_write`: with the superblock read-only,
+ * `inode_permission` answers EROFS on its own and the guard could be missing
+ * without anything saying so. Here the inode is perfectly writable and only the
+ * mount refuses. */
+#define ROBIND "/run/koru-check-robind"
+
+static void path_readonly(void)
+{
+    const char *what = "UNLINK through a read-only bind mount is EROFS";
+
+    rmdir(BALDIR);
+    rmdir(ROBIND);
+    if (mkdir(BALDIR, 0700) != 0 || mount("none", BALDIR, "tmpfs", 0, NULL) != 0) {
+        printf("%-58s SKIP (cannot mount a tmpfs)\n", what);
+        rmdir(BALDIR);
+        return;
+    }
+    if (make_file(BALDIR "/f", 4) != 0 || mkdir(BALDIR "/d", 0700) != 0 ||
+        mkdir(ROBIND, 0700) != 0 || mount(BALDIR, ROBIND, NULL, MS_BIND, NULL) != 0 ||
+        mount(NULL, ROBIND, NULL, MS_REMOUNT | MS_BIND | MS_RDONLY, NULL) != 0) {
+        check(0, what);
+    } else {
+        check_res(r_unlink(&R, 1, ROBIND "/f"), -EROFS, what);
+        check_res(r_rmdir(&R, 1, ROBIND "/d"), -EROFS, "  and so is RMDIR");
+        check(access(BALDIR "/f", F_OK) == 0, "  and the file is still there");
+        /* The same two through the writable view of the same inodes, so the
+         * mount is demonstrably the only thing that refused. */
+        check_res(r_unlink(&R, 1, BALDIR "/f"), 0, "  while the writable mount still removes it");
+        check_res(r_rmdir(&R, 1, BALDIR "/d"), 0, "  and the directory too");
+    }
+    if (umount(ROBIND) != 0)
+        note("could not unmount %s", ROBIND);
+    rmdir(ROBIND);
+    unlink(BALDIR "/f");
+    rmdir(BALDIR "/d");
+    if (umount(BALDIR) != 0)
+        note("could not unmount %s", BALDIR);
+    rmdir(BALDIR);
+}
+
+static void path_rmdir(void)
+{
+    struct koru_sqe s;
+
+    rmdir(NEWDIR "/sub");
+    rmdir(NEWDIR);
+    if (mkdir(NEWDIR, 0700) != 0) {
+        check(0, "create the RMDIR target");
+        return;
+    }
+
+    check_res(r_rmdir(&R, 1, NEWDIR), 0, "RMDIR removes a directory");
+    check(GONE(NEWDIR), "  and access(2) says it is gone");
+
+    if (mkdir(NEWDIR, 0700) != 0 || mkdir(NEWDIR "/sub", 0700) != 0) {
+        check(0, "create the non-empty directory");
+        return;
+    }
+    check_res(r_rmdir(&R, 1, NEWDIR), -ENOTEMPTY, "RMDIR of a non-empty directory is ENOTEMPTY");
+    check(access(NEWDIR, F_OK) == 0, "  and it is still there");
+    check_res(r_rmdir(&R, 1, NEWDIR "/sub"), 0, "  the child goes first");
+    check_res(r_rmdir(&R, 1, NEWDIR), 0, "  and then the parent");
+
+    if (make_file(TRFILE, 8) == 0)
+        check_res(r_rmdir(&R, 1, TRFILE), -ENOTDIR, "RMDIR of a regular file is ENOTDIR");
+    else
+        check(0, "RMDIR of a regular file is ENOTDIR");
+    unlink(TRFILE);
+    check_res(r_rmdir(&R, 1, "/no/such/path"), -ENOENT, "  of a missing path is ENOENT");
+    check_res(r_rmdir(&R, 1, "/tmp/.."), -EINVAL, "  of a path ending in .. is EINVAL");
+    check_res(r_rmdir(&R, 1, "/"), -EINVAL, "  and the root itself is EINVAL");
+
+    put_path(R.arena, R.slot_size, 1, "/tmp");
+    sqe_path(&s, KORU_OP_RMDIR, 1, 0, 4, 0x7b0);
+    s.handle = 1;
+    check_res(run_one(R.fd, &s), -EINVAL, "  a non-zero handle is EINVAL");
+
+    /* A symlink to a directory is not a directory: RMDIR must not follow it,
+     * and the link must survive being refused. */
+    unlink(NEWLINK);
+    if (mkdir(NEWDIR, 0700) == 0 && symlink(NEWDIR, NEWLINK) == 0) {
+        check_res(r_rmdir(&R, 1, NEWLINK), -ENOTDIR, "RMDIR does not follow a final symlink");
+        check(access(NEWDIR, F_OK) == 0, "  and the directory it names survives");
+        unlink(NEWLINK);
+    } else {
+        check(0, "RMDIR does not follow a final symlink");
+    }
+    rmdir(NEWDIR);
+}
+
+/* Heavy: every create and every removal takes the mount's write count and must
+ * put it back — `start_creating_path` for T26's pair, our own `Write` guard for
+ * T27's. Nothing else sees an unbalanced one — no splat, no leak report — until
+ * the filesystem refuses to go read-only. Its own tmpfs, so the count the
  * remount weighs is ours alone. */
 #define BALANCE 2000u
 
@@ -1636,13 +1808,13 @@ static void path_create_balance(void)
         snprintf(link, sizeof(link), BALDIR "/l%u", i);
         if (r_mkdir(&R, 1, dir, 0700) != 0 || r_symlink(&R, 1, LONGTARGET, link) != 0)
             break;
-        if (rmdir(dir) != 0 || unlink(link) != 0) {
+        if (r_rmdir(&R, 1, dir) != 0 || r_unlink(&R, 1, link) != 0) {
             ok = 0;
             break;
         }
         made++;
     }
-    check(made == BALANCE && ok, "2,000 MKDIR and SYMLINK pairs");
+    check(made == BALANCE && ok, "2,000 create-and-remove rounds, all four opcodes");
 
     /* A leaked mnt_want_write is EBUSY here and nothing anywhere else. */
     if (mount(NULL, BALDIR, NULL, MS_REMOUNT | MS_RDONLY, NULL) == 0) {
@@ -1707,6 +1879,15 @@ static int path_creds_child(struct koru_ring *m)
         return 12;
     if (r_symlink(m, 0, "/any/target", CREDSRO "/new") != -EACCES)
         return 13;
+    /* Removing needs write on the parent, which CREDSRO does not give. The
+     * lookup succeeds, so this reaches vfs_unlink's own permission check. */
+    if (r_unlink(m, 0, CREDSRO "/victim") != -EACCES)
+        return 14;
+    if (r_rmdir(m, 0, CREDSRO "/victimdir") != -EACCES)
+        return 15;
+    /* And the unreachable directory refuses before that. */
+    if (r_unlink(m, 0, CREDSLINK) != -EACCES)
+        return 16;
     return 0;
 }
 
@@ -1728,7 +1909,8 @@ static void path_creds(void)
     rmdir(CREDSDIR);
     rmdir(CREDSRO);
     if (mkdir(CREDSDIR, 0700) != 0 || symlink("/etc/hostname", CREDSLINK) != 0 ||
-        mkdir(CREDSRO, 0755) != 0) {
+        mkdir(CREDSRO, 0755) != 0 || make_file(CREDSRO "/victim", 4) != 0 ||
+        mkdir(CREDSRO "/victimdir", 0700) != 0) {
         check(0, "create the root-only directory");
         unlink(TRFILE);
         return;
@@ -1745,7 +1927,8 @@ static void path_creds(void)
             check(0, "fork the path creds child");
         } else {
             /* 5 truncate, 6 utimes, 7 touch, 8 readlink, 9 statx, 10 mkdir,
-             * 11 symlink, 12 and 13 the same two where the lookup succeeds. */
+             * 11 symlink, 12 and 13 the same two where the lookup succeeds,
+             * 14 unlink, 15 rmdir, 16 unlink behind the unreachable one. */
             check(WIFEXITED(st) && WEXITSTATUS(st) == 0,
                   "every unprivileged path op is refused");
             if (WIFEXITED(st) && WEXITSTATUS(st) != 0)
@@ -1755,6 +1938,8 @@ static void path_creds(void)
     }
     unlink(CREDSLINK);
     rmdir(CREDSDIR);
+    unlink(CREDSRO "/victim");
+    rmdir(CREDSRO "/victimdir");
     rmdir(CREDSRO);
     unlink(TRFILE);
 }
@@ -1800,6 +1985,9 @@ void sec_path(void)
     path_statx();
     path_mkdir();
     path_symlink();
+    path_unlink();
+    path_rmdir();
+    path_readonly();
     path_creds();
     path_readlink_leak();
     path_create_balance();
