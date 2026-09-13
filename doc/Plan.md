@@ -67,25 +67,6 @@ ABI.
 
 ## Phase 8 — the Rust surface
 
-### T30 [M] — the operation layer, Rust
-
-The Braam signatures, unchanged: `open_at`, `open_read`, `read_chunk`,
-`read_some`, `read_file`, `dup_fd`, `seek_fd`, `truncate_fd`, `sleep_for`,
-`stat_of`, `stat_fd`, `list_dir`, `make_dir`, `make_dir_all`, `remove_path`,
-`touch_path`, `make_link`, `read_link`, `rename_path`, `copy_file`, `copy_tree`,
-`cwd_get`, `cwd_set`, `clock_now`, `errln`. `write_all` and `close_fd` already
-exist from T21. Each is a slot acquisition, a submit, an await and a copy out.
-
-`seek_fd` is pure userspace bookkeeping, because `READ` and `WRITE` carry an
-explicit file offset and never touch `f_pos`. That is the one place koru's
-design makes a POSIX concept unnecessary rather than merely different; say so in
-the binding's documentation.
-
-Done test: a signature-conformance check that every declaration matches Braam's
-prototype for the same name, so a drift in argument order or type is a compile
-error rather than a surprise. Then a behavioural matrix per function against its
-libc equivalent on a fixture tree.
-
 ### T31 [M] — buffered `File` and the iterators, Rust
 
 `File` with `open`, `of`, the standard-stream accessors, `get`, `unget`, `read`,

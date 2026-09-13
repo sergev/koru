@@ -5,11 +5,11 @@ code in this repository.
 
 ## State of the repository
 
-**T0–T29 are done, and the kernel surface is complete.** Braam's hello world
-runs through koru, and the ring can wait for a descriptor. The module registers
-`/dev/koru`, configures a ring with `SETUP`, and submits `NOP`, `DELAY_NS`,
-`CHECKSUM`, `OPEN`, `READ`, `WRITE`, `CLOSE`, `CANCEL`, `ADOPT_FD`,
-`POLL_ADD`, `STAT`, `TRUNCATE`,
+**T0–T30 are done.** The kernel surface was complete at T29 and grew once more
+at T30, for `OPEN`'s creation flags. Braam's hello world runs through koru, and
+the ring can wait for a descriptor. The module registers `/dev/koru`, configures
+a ring with `SETUP`, and submits `NOP`, `DELAY_NS`, `CHECKSUM`, `OPEN`, `READ`,
+`WRITE`, `CLOSE`, `CANCEL`, `ADOPT_FD`, `POLL_ADD`, `STAT`, `TRUNCATE`,
 `UTIMES`, `READLINK`, `STATX_AT`, `MKDIR`, `SYMLINK`, `UNLINK`, `RMDIR`,
 `RENAME` and `READDIR` through `ENTER`, which blocks for completions. The arena
 is mmap'd, with slot exclusivity enforced by the kernel. Open files live in a
@@ -161,6 +161,25 @@ deliberate breakage — the arena mutex inside the callback — turns out to be
 benign on its own: the cycle needs T10's bug beside it. doc/Notes.md has the
 five perturbations and that finding.
 
+T30 built `rust/runtime/src/ops.rs`, Braam's operation layer: the twenty-five
+calls of its `src/proc/io.h` that this substrate carries, signatures unchanged.
+Four are koru's rather than Braam's and doc/Notes.md says why each is honest —
+`seek_fd` is an assignment to a number userspace owns, `dup_fd` is a reference
+count on one handle, `truncate_fd` goes by the path `open_at` recorded, and
+`stat_of(path, false)` is an `lstat` composed out of `READLINK`. The done test
+is `rust/runtime/tests/ops.rs`: a never-called `async fn` carrying every Braam
+prototype, so a drift is a compile error, plus nineteen tests against libc on a
+fixture tree.
+
+T30 needed `OPEN` to create, so it is also the first kernel change since T29.
+`KORU_O_CREAT`, `KORU_O_EXCL`, `KORU_O_TRUNC` and `KORU_O_APPEND` joined
+`KORU_OPEN_FLAGS_ALL`, and **the creation mode rides after the path in the
+slot**, where every path op has put its argument since T24 — which is the
+placement `OPEN` itself originated. It also found that the fuzzer's *hostile*
+generator could mutate an `OPEN`'s flags into a create-and-truncate on a path
+outside the sandbox, and that five slot-exclusivity tests across both suites
+were passing on luck.
+
 T14 made the two userspace ABI mirrors a diff rather than a promise.
 `cpp/include/koru_abi.h` and `cpp/include/koru_errno.h` are the C mirrors,
 shared with `test/`, and an `abi_dump` on each side emits a canonical record
@@ -183,10 +202,11 @@ its fastest gate: no VM, no device, no module.
 - `rust/` — the Cargo workspace. **Directories are named by role and packages
   by name**: `rust/sys` is `koru-sys`, the raw binding; `rust/runtime` is
   `koru` itself, holding the futures, the executor and the Braam surface
-  (`vocab.rs`, `rt.rs`, `ops.rs`, `args.rs`); `rust/macros` is `koru-macros`,
-  `#[koru::main]` alone. Cargo names the package, so `-p koru-sys` and
-  `use koru_sys::` are unaffected by the directory. The examples in
-  `rust/runtime/examples/` are programs, so the guest runs them.
+  (`vocab.rs`, `rt.rs`, `ops.rs`, `args.rs`, and `tz.rs`, which exists only
+  because `clock_now` has no opcode and no std API); `rust/macros` is
+  `koru-macros`, `#[koru::main]` alone. Cargo names the package, so `-p
+  koru-sys` and `use koru_sys::` are unaffected by the directory. The examples
+  in `rust/runtime/examples/` are programs, so the guest runs them.
 - `cpp/` — the C ABI mirrors and `abi_dump`, built by the top-level
   `CMakeLists.txt`. The binding itself arrives at T39.
 - `scripts/` — the guest-side check and the host-side runner that boots the VM,
@@ -264,7 +284,7 @@ survived**.
 
 ## Commands
 
-These work today (T0 through T29):
+These work today (T0 through T30):
 
 ```sh
 KDIR=../kernel-dev/linux-source-7.1
@@ -294,10 +314,10 @@ KORU_SEED=12345 scripts/run.sh    # replay a fuzz failure
 # under a second; the integration suite needs /dev/koru, so it runs in a VM.
 (cd rust && cargo fmt --all -- --check)
 (cd rust && cargo test -p koru-sys --lib)      # ABI, ioctl numbers, errnos
-(cd rust && cargo test -p koru --lib)          # cookie, slab, ops, vocabulary
+(cd rust && cargo test -p koru --lib)          # cookie, slab, ops, vocab, tz
 (cd rust && cargo test --workspace --no-run)   # build before the runner
 (cd rust && cargo build --examples)            # the programs the runner runs
-scripts/run-rust.sh
+scripts/run-rust.sh                            # kernel, runtime and ops suites
 scripts/run-rust.sh cancel read                # only matching test names
 KORU_SEED=12345 scripts/run-rust.sh            # replay a race loop
 KORU_ITERS=100000 TIMEOUT=2400 scripts/run-rust.sh drop_safety
@@ -318,11 +338,13 @@ only the kernel one is unchecked: `scripts/abi.sh` diffs the other two, and the
 header's own `static_assert`s catch a layout slip at compile time. The C++
 suite comes at T39.
 
-`scripts/rust.sh` runs both Rust suites in one VM boot:
-`rust/sys/tests/kernel.rs`, which is T4–T11 plus the T3 matrices, and
-`rust/runtime/tests/runtime.rs`, which is the futures and the executor. Neither
-supersedes `koru_check`, which keeps the fuzz, the two `rmmod` races and the
-heavy-phase leak window. Two gates exist because `#[test]` can pass without
+`scripts/rust.sh` runs all three Rust suites in one VM boot:
+`rust/sys/tests/kernel.rs`, which is T4–T11 plus the T3 matrices;
+`rust/runtime/tests/runtime.rs`, which is the futures and the executor; and
+`rust/runtime/tests/ops.rs`, which is Braam's prototypes and the operation layer
+against libc. None supersedes `koru_check`, which keeps the fuzz, the two
+`rmmod` races and the heavy-phase leak window. Two gates exist because `#[test]`
+can pass without
 proving anything: a filter matching nothing exits 0, so `rust.sh` asserts a
 minimum passed count **per suite**, taken from the `SUITES` list in
 `scripts/run-rust.sh` and raised when a test is added; and a skipped
@@ -432,7 +454,12 @@ explicitly: an in-flight `OpWork` holds its own `Arc<RingCtx>`, so dropping the
 `OPEN` carries its flags in the SQE's `handle` field, using koru's own
 `KORU_O_*` bit values rather than the host `O_*` constants. Add a flag by
 whitelisting it in `KORU_OPEN_FLAGS_ALL` and translating it; an unlisted bit
-must stay `-EINVAL`.
+must stay `-EINVAL`. **`KORU_O_CREAT` means the slot also carries a `u64`
+creation mode after the path**, at `arg_offset(off, len)`, where every path op
+has put its argument since T24 — so an `OPEN` that does not create needs no room
+for one, and there is a test for a path at the very end of a slot. The mode is
+masked to `KORU_OPEN_MODE_ALL`, which is `MKDIR`'s `0o1777`: koru creates
+nothing setuid and says so rather than dropping the bits.
 
 **kmemleak cannot see a leaked handle** — the file stays referenced by our own
 table. Use field 1 of `/proc/sys/fs/file-nr`. `/proc/<pid>/fd` sees nothing
@@ -459,6 +486,20 @@ match their own pattern.
 
 `scripts/check.sh` carries every pass condition there is. Keep it small and
 obvious: a bug in it weakens the whole verdict at once.
+
+**A test that depends on losing a race has to loop until it wins.** Five
+slot-exclusivity tests asserted that an op behind a deferred one gets `-EBUSY`
+on the first try, and passed for twelve tasks because a whole-slot `CHECKSUM`
+usually outlives the submit loop. Usually, not always: adding a test ahead of
+them made the Rust suite fail one run in ten. Both suites now round the pair 64
+times and assert the window is reached at least once — `Mapped::slot_race` in
+`rust/sys/tests/common/mod.rs` and `race_round` in `test/koru_test.c`. Write a
+new one that way from the start.
+
+**After restoring a perturbed source file by hand, `touch` it.** `mv` keeps the
+old mtime, `make` then skips the rebuild, and the guest runs the *previous*
+perturbation's module. It presents as a test that passes alone and fails in the
+full run.
 
 Assert the exact errno, never just that a call failed. The T3 dispatcher
 returned `EPROTO` where it owed `ENOTTY`, and only an exact-errno assertion

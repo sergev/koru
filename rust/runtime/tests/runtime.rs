@@ -36,7 +36,7 @@ fn the_demo_reads_a_file_while_timers_complete_out_of_order() {
 
     let text = rt.block_on(async {
         let slot = rt.acquire().expect("a slot");
-        let (h, slot) = rt.open(slot, DATAFILE, KORU_O_RDONLY).await;
+        let (h, slot) = rt.open(slot, DATAFILE, KORU_O_RDONLY, 0).await;
         let h = h.expect("open");
         let (n, slot) = rt.read(h, slot, 0, DATASIZE as u32).await;
         let n = n.expect("read");
@@ -77,7 +77,7 @@ fn an_inline_open_costs_exactly_one_enter() {
     let rt = runtime();
     let h = rt.block_on(async {
         let slot = rt.acquire().expect("a slot");
-        let (h, _slot) = rt.open(slot, DATAFILE, KORU_O_RDONLY).await;
+        let (h, _slot) = rt.open(slot, DATAFILE, KORU_O_RDONLY, 0).await;
         h.expect("open")
     });
     assert_eq!(rt.stats().enters, 1, "an inline op should not park");
@@ -91,7 +91,7 @@ fn a_read_returns_the_file_bytes() {
     let want = std::fs::read(DATAFILE).expect("read back");
     rt.block_on(async {
         let slot = rt.acquire().expect("a slot");
-        let (h, slot) = rt.open(slot, DATAFILE, KORU_O_RDONLY).await;
+        let (h, slot) = rt.open(slot, DATAFILE, KORU_O_RDONLY, 0).await;
         let h = h.expect("open");
         let (n, slot) = rt.read(h, slot, 0, DATASIZE as u32).await;
         assert_eq!(n.expect("read"), DATASIZE);
@@ -127,7 +127,7 @@ fn open_rejects_a_bad_path_without_spending_a_submission() {
     rt.block_on(async {
         for (path, what) in [("", "an empty path"), ("a\0b", "an embedded NUL")] {
             let slot = rt.acquire().expect("a slot");
-            let (res, _slot) = rt.open(slot, path, KORU_O_RDONLY).await;
+            let (res, _slot) = rt.open(slot, path, KORU_O_RDONLY, 0).await;
             assert_eq!(res.expect_err(what).raw(), EINVAL, "{what}");
         }
     });
@@ -229,7 +229,7 @@ fn drop_safety_under_a_race_holds_a_slot_until_its_completion() {
 
     let (read_won, cancelled, uncancelled) = rt.block_on(async {
         let slot = rt.acquire().expect("a slot");
-        let (h, slot) = rt.open(slot, BIGFILE, KORU_O_RDONLY).await;
+        let (h, slot) = rt.open(slot, BIGFILE, KORU_O_RDONLY, 0).await;
         let h = h.expect("open");
         drop(slot);
 
@@ -397,7 +397,7 @@ fn a_retired_handle_is_rejected() {
     let rt = runtime();
     rt.block_on(async {
         let slot = rt.acquire().expect("a slot");
-        let (h, _slot) = rt.open(slot, DATAFILE, KORU_O_RDONLY).await;
+        let (h, _slot) = rt.open(slot, DATAFILE, KORU_O_RDONLY, 0).await;
         let h = h.expect("open");
         rt.close(h).await.expect("close");
         let e = rt.close(h).await.expect_err("a second close");
@@ -515,7 +515,7 @@ fn write_all_to_a_regular_file_advances_its_own_position() {
 
     rt.block_on(async {
         let slot = rt.acquire().expect("a slot");
-        let (h, slot) = rt.open(slot, path, KORU_O_WRONLY).await;
+        let (h, slot) = rt.open(slot, path, KORU_O_WRONLY, 0).await;
         let h = h.expect("open for writing");
         drop(slot);
         koru::rt::register_handle(h, true);

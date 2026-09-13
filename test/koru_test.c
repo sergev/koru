@@ -260,6 +260,39 @@ int64_t r_open(struct koru_ring *r, uint32_t slot, const char *path, uint32_t fl
     return run_one(r->fd, &s);
 }
 
+int64_t r_create(struct koru_ring *r, uint32_t slot, const char *path, uint32_t flags,
+                 uint64_t mode)
+{
+    struct koru_sqe s;
+    uint32_t n = put_path(r->arena, r->slot_size, slot, path);
+
+    // The mode goes where every path op's argument goes.
+    memcpy(r->arena + (size_t)slot * r->slot_size + arg_offset(0, n), &mode, sizeof(mode));
+    sqe_open(&s, slot, 0, n, flags, 0x108);
+    return run_one(r->fd, &s);
+}
+
+int64_t race_round(struct koru_ring *r, const struct koru_sqe *first,
+                   const struct koru_sqe *second, uint64_t *extra)
+{
+    struct koru_sqe sq[2];
+    struct koru_cqe cq[2];
+    const struct koru_cqe *a, *b;
+    unsigned completed = 0;
+
+    sq[0] = *first;
+    sq[1] = *second;
+    if (submit(r->fd, sq, 2, cq, 2, 2, &completed) != 2 || completed != 2)
+        return INT64_MIN;
+    a = find_cqe(cq, completed, first->user_data);
+    b = find_cqe(cq, completed, second->user_data);
+    if (!a || !b)
+        return INT64_MIN;
+    if (extra)
+        *extra = b->extra;
+    return b->res;
+}
+
 int64_t r_close(struct koru_ring *r, uint32_t handle)
 {
     struct koru_sqe s;

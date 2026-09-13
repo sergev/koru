@@ -98,6 +98,10 @@ pub const KORU_OP_NOP: u8 = 0;
 pub const KORU_OP_DELAY_NS: u8 = 1;
 /// Open the path in `len` bytes at `off` in slot `slot`; `handle` carries the
 /// open flags. `res` is the new handle, always positive.
+///
+/// With [`KORU_O_CREAT`] the slot also carries a `u64` creation mode after the
+/// path, as a path op carries its argument; without it nothing past the path is
+/// read.
 pub const KORU_OP_OPEN: u8 = 2;
 /// Read `len` bytes from file offset `off` of `handle` into slot `slot` at slot
 /// offset 0. `res` is the count read: short at EOF, 0 past it. Regular files,
@@ -252,10 +256,32 @@ pub const KORU_O_DIRECTORY: u32 = 1 << 3;
 /// **koru never sets or clears `O_NONBLOCK` on a file it did not open.**
 pub const KORU_O_NONBLOCK: u32 = 1 << 4;
 
-/// Any bit outside this completes `EINVAL`. No `O_CREAT`: no field carries a
-/// creation mode.
-pub const KORU_OPEN_FLAGS_ALL: u32 =
-    KORU_O_ACCMODE | KORU_O_NOFOLLOW | KORU_O_DIRECTORY | KORU_O_NONBLOCK;
+/// Create the file if it is not there. The creation mode is a `u64` argument
+/// **after the path in the same slot**, at [`crate::ring::arg_offset`], where
+/// every path op puts its argument. Read only when this bit is set.
+pub const KORU_O_CREAT: u32 = 1 << 5;
+/// With [`KORU_O_CREAT`], `EEXIST` if the path is already there. Without it,
+/// `EINVAL`: a flag that cannot act is rejected, not dropped.
+pub const KORU_O_EXCL: u32 = 1 << 6;
+/// Truncate an existing regular file to zero length on the way in.
+pub const KORU_O_TRUNC: u32 = 1 << 7;
+/// Every `WRITE` on this handle appends and its `off` is ignored.
+pub const KORU_O_APPEND: u32 = 1 << 8;
+
+/// Any bit outside this completes `EINVAL`.
+pub const KORU_OPEN_FLAGS_ALL: u32 = KORU_O_ACCMODE
+    | KORU_O_NOFOLLOW
+    | KORU_O_DIRECTORY
+    | KORU_O_NONBLOCK
+    | KORU_O_CREAT
+    | KORU_O_EXCL
+    | KORU_O_TRUNC
+    | KORU_O_APPEND;
+
+/// What a [`KORU_O_CREAT`] open's mode argument may carry, which is
+/// [`KORU_MKDIR_MODE_ALL`]'s rule for the same reason: `S_ISUID` and `S_ISGID`
+/// are refused rather than silently dropped, and koru creates nothing setuid.
+pub const KORU_OPEN_MODE_ALL: u64 = 0o1777;
 
 /// Multishot bit, reserved and never set.
 pub const KORU_CQE_F_MORE: u32 = 1 << 0;
@@ -603,11 +629,17 @@ mod tests {
 
     #[test]
     fn open_flags_mask_covers_exactly_the_defined_bits() {
-        assert_eq!(KORU_OPEN_FLAGS_ALL, 0x1f);
+        assert_eq!(KORU_OPEN_FLAGS_ALL, 0x1ff);
         assert_eq!(KORU_O_ACCMODE, 0x3);
         assert_eq!(KORU_O_NOFOLLOW, 0x4);
         assert_eq!(KORU_O_DIRECTORY, 0x8);
         assert_eq!(KORU_O_NONBLOCK, 0x10);
+        assert_eq!(KORU_O_CREAT, 0x20);
+        assert_eq!(KORU_O_EXCL, 0x40);
+        assert_eq!(KORU_O_TRUNC, 0x80);
+        assert_eq!(KORU_O_APPEND, 0x100);
+        // The mode is not a flag: it rides after the path, not in `handle`.
+        assert_eq!(KORU_OPEN_MODE_ALL, 0o1777);
     }
 
     #[test]

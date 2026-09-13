@@ -2842,6 +2842,227 @@ Six perturbations, each applied and reverted.
   Both are a compile error naming the reason, rather than an expansion that
   fails somewhere else.
 
+## `OPEN` learns to create
+
+T30 needed `copy_file`, `copy_file` needs to create its destination, and
+nothing in the ring could create a regular file. `MKDIR` makes directories and
+`SYMLINK` makes symlinks; `OPEN` had no `O_CREAT`, for the reason Notes gave
+above and T26 already qualified: on that opcode `handle` is spent on the flags,
+so there is no field for a creation mode.
+
+The way out was there since T24. **Every path op carries its argument after its
+path in the same slot**, at the first 8-aligned offset at or after the path's
+end, and `OPEN` is where that placement came from. So the mode goes there too:
+`KORU_O_CREAT` means "a `u64` mode follows the path", and without that bit
+nothing past the path is read. An `OPEN` that creates nothing therefore needs no
+room for an argument it does not carry, which is a real case — a path can
+sit at the very end of a slot — and has its own test on both sides.
+
+Four flags joined the whitelist: `KORU_O_CREAT`, `KORU_O_EXCL`, `KORU_O_TRUNC`
+and `KORU_O_APPEND`. `O_APPEND` was already described by the ABI — `WRITE`'s
+doc has said since T17 that an appending handle ignores `off` — and until now
+was reachable only by adopting a descriptor somebody else opened that way.
+
+Two rules are koru's rather than the VFS's. `KORU_O_EXCL` without
+`KORU_O_CREAT` is `EINVAL`, where Linux tolerates it and does nothing: a flag
+that cannot act is rejected, not dropped, which is the same rule as an unknown
+flag bit. And the mode is masked to `KORU_OPEN_MODE_ALL`, which is `0o1777` —
+`KORU_MKDIR_MODE_ALL`'s value for `KORU_MKDIR_MODE_ALL`'s reason. `S_ISUID` and
+`S_ISGID` are refused rather than silently dropped, so koru creates nothing
+setuid and a caller who asked for it is told.
+
+The umask applies, and it is the *submitting* task's, because `filp_open` runs
+inline in ioctl context. That is `OPEN`'s original creds argument paying for
+itself a second time: in a kworker the mode would be masked by init's umask.
+
+### The fuzzer's sandbox had a second hole
+
+T26 found that the fuzzer's path sandbox was never real and rebuilt it. The
+creation flags found the other half of the same problem, in the *hostile*
+generator rather than the path one.
+
+`gen_hostile` mutates one field of an SQE the valid generator just built. Case 7
+sets a random `handle` — and on an `OPEN`, `handle` **is** the open flags.
+Before this task the worst that could do was open a path read-write that the
+generator had picked for reading, which nothing then wrote to. With
+`KORU_O_CREAT` and `KORU_O_TRUNC` in the whitelist it could have truncated
+`/etc/hostname` or the check's own pattern file, neither of which is inside the
+sandbox.
+
+The fix is `names_own_path`, and the shape of it is the point: it reads the
+**slot's actual bytes** and the SQE's actual `slot`, `off` and `len`, not what
+the generator meant. A mutated `off` or a shortened `len` names a prefix of
+something else, which is exactly how T26's bug worked. Outside the sandbox only
+a read-only open survives the mutation; access mode 3 is exempt, because it
+never reaches `filp_open` at all.
+
+### What was shown to fail
+
+Six perturbations, each applied and reverted, each failing exactly the tests it
+should and no others.
+
+- **The `O_EXCL`-without-`O_CREAT` check deleted.** One test.
+- **The mode mask never firing.** The setuid case and the above-the-mask case,
+  and nothing else.
+- **The mode read but not passed to `filp_open`.** The two mode assertions;
+  every creation still works, which is what makes the mode worth asserting.
+- **`O_CREAT` not translated.** Eleven tests, the whole section.
+- **`O_TRUNC` not translated.** Two.
+- **`O_APPEND` not translated.** One.
+
+A seventh perturbation was accidental and worth recording: `mv` restoring a
+perturbed file preserves its mtime, so `make` skipped the rebuild and the guest
+ran the *previous* perturbation's module. It presented as a test that passed
+alone and failed in the full run. **After restoring a source file by hand,
+`touch` it.**
+
+## A slot race that was passing on luck
+
+Five tests in the two suites had the same shape: submit a deferred op and an op
+behind it on the same slot, and assert the second gets `-EBUSY`. They had always
+passed. They were passing because a whole-slot `CHECKSUM` in a kworker usually
+takes longer than the submit loop takes to reach the next SQE — usually, not
+always. Adding a test ahead of them was enough to shift the timing: the Rust
+suite then failed about one run in ten, in a different test each time.
+
+Nothing was wrong with the kernel. The assertion was simply stronger than the
+ABI promises: if the first op retires before the second is validated, the second
+gets the slot fairly, and that is a legal outcome. Both suites now round the
+pair — 64 times — and assert that the window is *reached at least once*,
+plus the invariant that holds every round: a result is either the refusal or
+a real success, never a wrong answer. `Mapped::slot_race` in the Rust suite and
+`race_round` in `test/koru_test.c` are the shared shapes; the same treatment
+covers the two-`READDIR`-on-one-handle case, where the contended resource is the
+handle rather than a slot, and the duplicate-slot `CHECKSUM` batches, where the
+refused count was asserted exactly.
+
+Deleting `OPEN`'s slot claim still fails the rounded test, so the teeth are
+intact. Thirty consecutive runs of the Rust suite and five of `koru_check` pass
+after the change; before it, one in ten failed.
+
+The general lesson is the one the project keeps relearning from the other
+direction: **a test that depends on losing a race has to loop until it wins.**
+The cancel-during-execution window has always been written that way — Notes
+records it as one to three hits per thousand rounds — and these five were the
+same kind of window written as a single try.
+
+## Braam's operation layer in Rust
+
+T30 is `rust/runtime/src/ops.rs`: the twenty-five calls of Braam's
+`src/proc/io.h` that this substrate can carry, with their signatures unchanged.
+Each is a slot acquisition, a submit, an await and a copy out.
+
+### Four things koru does differently, and why each is honest
+
+**`seek_fd` is an assignment.** `READ` and `WRITE` carry an explicit file offset
+and never touch `f_pos`, so there is nothing in the kernel to move: the position
+is a number this process owns, in the ambient ring's handle record. This is the
+one place koru's design makes a POSIX concept unnecessary rather than merely
+different, and the binding's own documentation says so.
+
+**`dup_fd` is a reference count.** koru has no `DUP` opcode and needs none.
+Braam's contract for the operation is "one handle behind both, so a file's
+offset is shared and closing one shuts nothing" — which is precisely what
+returning the same handle with a `refs` bump gives, with `close_fd` issuing the
+`CLOSE` only when the last name goes. The semantics are not approximated here;
+they are the definition.
+
+**`truncate_fd` goes by path.** koru's `TRUNCATE` names a path and there is no
+handle form, so the operation uses the path `open_at` recorded for that handle.
+Two consequences, both documented at the call site: a handle nothing opened by
+name — an adopted descriptor, a standard stream — is `Err(Unsupported)`,
+which is what Braam's `seek_fd` says about the same set; and a file renamed
+between the open and the truncate would be truncated at its *new* occupant of
+the old name. That is a genuine difference from `ftruncate(2)` and the only
+gap in the layer. Closing it means a handle form of `TRUNCATE`, which is kernel
+work nothing yet needs. The access-mode check is not the VFS's here — it is
+ours, from the recorded open flags, because a path-named truncate would
+otherwise succeed on a read-only handle whose path is writable.
+
+**`stat_of(path, false)` is an `lstat` composed out of `READLINK`.** `STATX_AT`
+always follows a final symlink and koru has no `lstat`. But `READLINK` does not
+follow, so a successful `READLINK` *is* "this is a symlink", and the length it
+returns is what `lstat(2)` reports as the size. `EINVAL` from it means "not a
+link", and then following changes nothing, so the `STATX_AT` is exact. The only
+thing lost is a symlink's own mtime, which reads as 0 — and Braam's `DirEntry`
+for a link says nothing better. No kernel change was needed.
+
+### Where Rust is stricter than Braam, deliberately
+
+Braam's `String` is *declared* UTF-8 and not checked; Rust's is checked. So
+`read_chunk`, `read_some`, `read_file`, `read_link` and `cwd_get` answer
+`Err(Invalid)` on bytes that are not UTF-8, where Braam's would hand back the
+bytes. That is the right trade for a text-oriented surface, and it costs nothing
+where it would matter: `copy_file` and `copy_tree` never build a `String` at
+all. They move bytes slot to slot through the arena, which is both binary-safe
+and one copy fewer.
+
+`errln` uses `Kind::name()` — Braam's `error_name`, word for word — and not
+`Display`, which falls back to the OS message. The OS message says more. It is
+the wrong choice anyway, because T49 compares the two bindings' output byte for
+byte and only the name is shared.
+
+### `open_at` speaks Braam's flags, not koru's
+
+Braam's `SYS_O_READ`/`SYS_O_WRITE` are two independent bits; koru's access mode
+is a two-bit field. The surface exposes `O_READ`, `O_WRITE`, `O_CREATE`,
+`O_TRUNC`, `O_APPEND` and `O_EXCL` with Braam's own values and translates, so a
+Braam call site compiles unchanged. A bit outside `O_ALL` is `Err(Invalid)`.
+Braam's filesystem has no modes and so its `open_at` has no argument for one;
+created files get `CREATE_MODE`, which is `creat(2)`'s `0o666` before the umask.
+
+`open_at` also spends one `STAT` learning whether the thing it opened is
+seekable, because only the creator of a handle knows that, and `write_all`'s
+offset bookkeeping and `seek_fd` both depend on it. One extra op per open is the
+price; nothing else in the layer pays it.
+
+### `POLL_ADD` retires the `EAGAIN` backoff
+
+T21's `write_all` slept a millisecond and retried when a non-blocking write said
+`EAGAIN`, with a comment saying `POLL_ADD` would replace it at T22. T22 landed
+and the comment outlived it. The read and write paths now arm a one-shot
+`POLL_ADD` and await it. A regular file is on no waitqueue and completes at once
+with `res` 0, which is why the caller retries the transfer rather than trusting
+the returned mask.
+
+### The time zone, which has no opcode and no std API
+
+`clock_now`'s `tz_min` is the local offset from UTC. Braam asks the browser;
+koru has no opcode for it, and Rust's standard library has no local-time API at
+all. `rust/runtime/src/tz.rs` reads the host's TZif file (RFC 8536) — `$TZ`
+where it names a zone, else `/etc/localtime` — finds the last transition at or
+before now, and reports that type's offset. Anything unreadable or unparseable
+is 0, which is what UTC looks like anyway.
+
+The oracle is `date +%z` under `TZ`, run as a child process: a reader that
+agrees with itself proves nothing. Six zones, including a half-hour offset
+(Kolkata), a quarter-hour one (Chatham) and two whose summer time moves. Made to
+fail by taking type 0 instead of the transition's, which reports Los Angeles's
+1883 local mean time, −472 minutes.
+
+### The done test, in two halves
+
+**Signatures.** `braam_prototypes` in `rust/runtime/tests/ops.rs` is an `async
+fn` that is never called: it names every operation with typed arguments and an
+explicitly typed awaited result, with the C++ prototype in a comment above each
+line. A drift in a name, an argument order or a type is a compile error rather
+than a surprise at a call site. This is the whole of what the plan asked for and
+it costs one function.
+
+**Behaviour.** Nineteen tests against libc on a fixture tree, each owning its
+own corner of `/tmp/koru-ops` so libtest's ordering does not matter. `stat_of`
+against `std::fs::metadata` and `symlink_metadata`, `list_dir` against
+`read_dir` field for field, `copy_file` against a file of every byte value two
+slots long, `cwd_get` against `current_dir`, `seek_fd` against `lseek`'s own
+three forms including the negative and past-the-end cases.
+
+Five perturbations, each failing exactly the right tests: `close_fd` ignoring
+the reference count; `SEEK_END` using 0 rather than the size; `stat_of` ignoring
+`follow`; a listing keeping `.` and `..`; `truncate_fd` not checking the access
+mode. The listing one fails four tests rather than one, because a `.` entry
+breaks the recursive removal and the tree copy as well — which is a better
+result than one, since it says those two are reading the listing for real.
+
 ## C++20 userspace binding
 
 The kernel side is **unchanged** — same device, same ioctls, same wire format,
@@ -2978,6 +3199,13 @@ common logic across them.
   thing bounding it.
 - **Handles are per-ring**, so two rings in one process cannot share an open
   file. Nothing needs it yet.
+- **`truncate_fd` truncates a path, not a handle.** `TRUNCATE` has no handle
+  form, so the surface uses the path `open_at` recorded. A rename between the
+  open and the truncate retargets it, and a handle nothing opened by name
+  answers `Err(Unsupported)`. Closing this means a kernel change.
+- **A symlink's own mtime is unreachable.** `stat_of(path, false)` composes an
+  `lstat` out of `READLINK`, which gives the kind and the size exactly and no
+  times at all, so a link's `mtime` reads as 0. `STATX_AT` always follows.
 
 ## Files
 
@@ -3018,6 +3246,16 @@ arrive with their tasks.
 - `rust/runtime/src/combinator.rs` — `race` and `Either`, and the only place a
   koru future is dropped for you. *exists*
 - `rust/runtime/tests/runtime.rs` — the device suite for all of it. *exists*
+- `rust/runtime/src/vocab.rs` — Braam's fifteen names and three aliases over
+  koru-sys's own `Error`, never a second type. *exists*
+- `rust/runtime/src/rt.rs` — the ambient ring, the handle records that carry a
+  position, a reference count and a path, and the runtime entry. *exists*
+- `rust/runtime/src/args.rs` — Braam's `Args`. *exists*
+- `rust/runtime/src/ops.rs` — Braam's operation layer, T30. *exists*
+- `rust/runtime/src/tz.rs` — the TZif reader `clock_now` needs, because there
+  is no opcode and no std API for a local time offset. *exists*
+- `rust/runtime/tests/ops.rs` — Braam's prototypes, and the operation layer
+  against libc on a fixture tree. *exists*
 - `cpp/include/koru_abi.h` — the C mirror of `koru_abi.rs`, kept in step by
   the T14 conformance diff. *exists*
 - `cpp/include/koru_errno.h` — the C mirror of `error.rs`'s vocabulary and

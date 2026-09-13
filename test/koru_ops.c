@@ -177,7 +177,7 @@ static void flag_matrix(void)
 {
     int64_t h;
 
-    check_res(r_open(&R, PATH_SLOT, HOSTNAME, 1u << 8), -EINVAL, "an unknown open flag is EINVAL");
+    check_res(r_open(&R, PATH_SLOT, HOSTNAME, 1u << 9), -EINVAL, "an unknown open flag is EINVAL");
     check_res(r_open(&R, PATH_SLOT, HOSTNAME, KORU_O_ACCMODE), -EINVAL, "access mode 3 is EINVAL");
 
     h = r_open(&R, PATH_SLOT, "/etc", KORU_O_RDONLY | KORU_O_DIRECTORY);
@@ -208,6 +208,79 @@ static void flag_matrix(void)
     } else {
         printf("%-58s SKIP (cannot create a symlink)\n", "O_NOFOLLOW on a symlink is ELOOP");
     }
+}
+
+#define NEWFILE "/tmp/koru-check-created"
+
+// The creation flags, and the mode argument after the path.
+static void create_matrix(void)
+{
+    struct koru_sqe s;
+    struct stat sb;
+    mode_t old;
+    int64_t h;
+    uint32_t n;
+
+    unlink(NEWFILE);
+    old = umask(0);
+
+    h = r_create(&R, PATH_SLOT, NEWFILE, KORU_O_WRONLY | KORU_O_CREAT, 0640);
+    check(h > 0, "O_CREAT of a missing path yields a handle");
+    if (h > 0)
+        check_res(r_close(&R, (uint32_t)h), 0, "  and closes");
+    check(stat(NEWFILE, &sb) == 0 && (sb.st_mode & 07777) == 0640,
+          "  the file is there with the mode asked for");
+
+    // Without O_EXCL an existing path is opened, not refused.
+    h = r_create(&R, PATH_SLOT, NEWFILE, KORU_O_WRONLY | KORU_O_CREAT, 0600);
+    check(h > 0, "O_CREAT over an existing path opens it");
+    if (h > 0)
+        r_close(&R, (uint32_t)h);
+    check(stat(NEWFILE, &sb) == 0 && (sb.st_mode & 07777) == 0640, "  and leaves its mode alone");
+
+    check_res(r_create(&R, PATH_SLOT, NEWFILE, KORU_O_WRONLY | KORU_O_CREAT | KORU_O_EXCL, 0640),
+              -EEXIST, "O_CREAT|O_EXCL over an existing path is EEXIST");
+    check_res(r_open(&R, PATH_SLOT, NEWFILE, KORU_O_WRONLY | KORU_O_EXCL), -EINVAL,
+              "O_EXCL without O_CREAT is EINVAL");
+
+    check_res(r_create(&R, PATH_SLOT, NEWFILE, KORU_O_WRONLY | KORU_O_CREAT, 04755), -EINVAL,
+              "a setuid creation mode is EINVAL");
+    check_res(r_create(&R, PATH_SLOT, NEWFILE, KORU_O_WRONLY | KORU_O_CREAT, 1ull << 32), -EINVAL,
+              "a mode above the mask is EINVAL");
+
+    // The mode is read only when O_CREAT asked for one, so an open of an
+    // existing path needs no room for it.
+    n = put_path(R.arena, R.slot_size, PATH_SLOT, NEWFILE);
+    sqe_open(&s, PATH_SLOT, R.slot_size - n, n, KORU_O_RDONLY, 0x310);
+    memmove(R.arena + (size_t)PATH_SLOT * R.slot_size + R.slot_size - n, R.arena, n);
+    h = run_one(R.fd, &s);
+    check(h > 0, "a path at the very end of the slot opens without O_CREAT");
+    if (h > 0)
+        r_close(&R, (uint32_t)h);
+    sqe_open(&s, PATH_SLOT, R.slot_size - n, n, KORU_O_RDONLY | KORU_O_CREAT, 0x311);
+    check_res(run_one(R.fd, &s), -EINVAL, "  and with O_CREAT there is no room for the mode");
+
+    // O_TRUNC and O_APPEND, over the file just made.
+    check(truncate(NEWFILE, 8) == 0, "the created file grows to eight bytes");
+    h = r_open(&R, PATH_SLOT, NEWFILE, KORU_O_WRONLY | KORU_O_TRUNC);
+    check(h > 0, "O_TRUNC opens");
+    if (h > 0)
+        r_close(&R, (uint32_t)h);
+    check(stat(NEWFILE, &sb) == 0 && sb.st_size == 0, "  and the file is empty");
+
+    memset(R.arena + (size_t)1 * R.slot_size, 'a', 4);
+    h = r_open(&R, PATH_SLOT, NEWFILE, KORU_O_WRONLY | KORU_O_APPEND);
+    check(h > 0, "O_APPEND opens");
+    if (h > 0) {
+        // off is ignored on an appending handle, so two writes at 0 stack up.
+        check_res(r_write(&R, (uint32_t)h, 1, 0, 4), 4, "  a write of four bytes");
+        check_res(r_write(&R, (uint32_t)h, 1, 0, 4), 4, "  and another at off 0");
+        r_close(&R, (uint32_t)h);
+    }
+    check(stat(NEWFILE, &sb) == 0 && sb.st_size == 8, "  leaves eight bytes, not four");
+
+    umask(old);
+    unlink(NEWFILE);
 }
 
 // Its own ring: a table of eight makes exhaustion cheap to reach.
@@ -253,23 +326,26 @@ static void exhaustion(void)
 static void open_slot_test(void)
 {
     struct koru_sqe sq[2];
-    struct koru_cqe cq[2];
-    const struct koru_cqe *a, *b;
-    unsigned completed = 0;
+    unsigned round, refused = 0, broke = 0;
+    int64_t res;
     uint32_t n;
-    int ret;
 
-    n = put_path(R.arena, R.slot_size, 1, HOSTNAME);
-    sqe_checksum(&sq[0], 1, 0, R.slot_size, 0xa0);
-    sqe_open(&sq[1], 1, 0, n, KORU_O_RDONLY, 0xa1);
-    ret = submit(R.fd, sq, 2, cq, 2, 2, &completed);
-    a   = find_cqe(cq, completed, 0xa0);
-    b   = find_cqe(cq, completed, 0xa1);
-    check(ret == 2 && completed == 2 && a && b, "a CHECKSUM and an OPEN on one slot both complete");
-    if (a && b) {
-        check(a->res >= 0, "  the deferred CHECKSUM holds the slot");
-        check_res(b->res, -EBUSY, "  and the OPEN behind it gets -EBUSY");
+    for (round = 0; round < 64; round++) {
+        n = put_path(R.arena, R.slot_size, 1, HOSTNAME);
+        sqe_checksum(&sq[0], 1, 0, R.slot_size, 0xa0);
+        sqe_open(&sq[1], 1, 0, n, KORU_O_RDONLY, 0xa1);
+        res = race_round(&R, &sq[0], &sq[1], NULL);
+        if (res == INT64_MIN || (res != -EBUSY && res <= 0)) {
+            broke++;
+            break;
+        }
+        if (res == -EBUSY)
+            refused++;
+        else
+            r_close(&R, (uint32_t)res);
     }
+    check(broke == 0, "a CHECKSUM and an OPEN on one slot both complete, 64 rounds");
+    check(refused > 0, "  the slot is held across the SQE behind it, at least once");
 }
 
 void sec_open(void)
@@ -277,6 +353,7 @@ void sec_open(void)
     handle_matrix();
     path_matrix();
     flag_matrix();
+    create_matrix();
     open_slot_test();
     exhaustion();
 }
@@ -360,17 +437,14 @@ void sec_read(void)
     // 4. A CHECKSUM holding the slot refuses the READ behind it.
     {
         struct koru_sqe sq[2];
-        struct koru_cqe cq[2];
-        const struct koru_cqe *b;
-        unsigned completed = 0;
+        unsigned round, refused = 0;
 
         sqe_checksum(&sq[0], 5, 0, R.slot_size, 0xa0);
         sqe_read(&sq[1], (uint32_t)h, 5, 0, 64, 0xa1);
-        submit(R.fd, sq, 2, cq, 2, 2, &completed);
-        b = find_cqe(cq, completed, 0xa1);
-        check(completed == 2 && b, "a CHECKSUM and a READ on one slot both complete");
-        if (b)
-            check_res(b->res, -EBUSY, "  the READ behind it gets -EBUSY");
+        for (round = 0; round < 64; round++)
+            if (race_round(&R, &sq[0], &sq[1], NULL) == -EBUSY)
+                refused++;
+        check(refused > 0, "the READ behind a CHECKSUM gets -EBUSY");
     }
 
     stale = h;
@@ -427,7 +501,6 @@ void sec_write(void)
 {
     struct koru_sqe sq[2];
     struct koru_cqe cq[2];
-    const struct koru_cqe *a, *b;
     unsigned completed = 0;
     int64_t h, ro;
     int fd;
@@ -482,17 +555,18 @@ void sec_write(void)
         check_res(r_close(&R, (uint32_t)ro), 0, "  and it closes");
     }
 
-    // 4. Two WRITEs on one slot: one wins, one gets -EBUSY.
-    fill_slot(3, 0, R.slot_size);
-    sqe_write(&sq[0], (uint32_t)h, 3, 0, R.slot_size, 0xb0);
-    sqe_write(&sq[1], (uint32_t)h, 3, 0, R.slot_size, 0xb1);
-    submit(R.fd, sq, 2, cq, 2, 2, &completed);
-    a = find_cqe(cq, completed, 0xb0);
-    b = find_cqe(cq, completed, 0xb1);
-    check(completed == 2 && a && b, "two WRITEs on one slot both complete");
-    if (a && b)
-        check(((a->res >= 0) ^ (b->res >= 0)) && ((a->res == -EBUSY) ^ (b->res == -EBUSY)),
-              "  exactly one succeeds, the other gets -EBUSY");
+    // 4. Two WRITEs on one slot: the one behind gets -EBUSY.
+    {
+        unsigned round, refused = 0;
+
+        fill_slot(3, 0, R.slot_size);
+        sqe_write(&sq[0], (uint32_t)h, 3, 0, R.slot_size, 0xb0);
+        sqe_write(&sq[1], (uint32_t)h, 3, 0, R.slot_size, 0xb1);
+        for (round = 0; round < 64; round++)
+            if (race_round(&R, &sq[0], &sq[1], NULL) == -EBUSY)
+                refused++;
+        check(refused > 0, "the second of two WRITEs on one slot gets -EBUSY");
+    }
 
     // 5. A cancelled WRITE must release its slot. Without KORU_OP_WRITE in
     // OpWork::held_slot this is the only thing that says so.
@@ -1011,7 +1085,6 @@ void sec_stat(void)
 {
     struct koru_sqe sq[2];
     struct koru_cqe cq[2];
-    const struct koru_cqe *a, *b;
     uint8_t *slot = R.arena + (size_t)STAT_SLOT * R.slot_size;
     unsigned completed = 0;
     uint64_t extra;
@@ -1068,16 +1141,19 @@ void sec_stat(void)
 
     // 5. Slot exclusivity. A whole-slot CHECKSUM is slow enough to still hold
     // the slot when the STAT behind it is dispatched.
-    sqe_checksum(&sq[0], STAT_SLOT, 0, R.slot_size, 0xd0);
-    sqe_stat(&sq[1], (uint32_t)h, STAT_SLOT, 0, sizeof(struct koru_stat), 0xd1);
-    submit(R.fd, sq, 2, cq, 2, 2, &completed);
-    a = find_cqe(cq, completed, 0xd0);
-    b = find_cqe(cq, completed, 0xd1);
-    check(completed == 2 && a && b, "a CHECKSUM and a STAT on one slot both complete");
-    if (a && b) {
-        check(a->res >= 0, "  the deferred CHECKSUM holds the slot");
-        check_res(b->res, -EBUSY, "  and the STAT behind it gets -EBUSY");
-        check(b->extra == 0, "  a refused STAT reports no mask");
+    {
+        unsigned round, refused = 0, masked = 0;
+        uint64_t extra;
+
+        sqe_checksum(&sq[0], STAT_SLOT, 0, R.slot_size, 0xd0);
+        sqe_stat(&sq[1], (uint32_t)h, STAT_SLOT, 0, sizeof(struct koru_stat), 0xd1);
+        for (round = 0; round < 64; round++)
+            if (race_round(&R, &sq[0], &sq[1], &extra) == -EBUSY) {
+                refused++;
+                masked += extra != 0;
+            }
+        check(refused > 0, "the STAT behind a CHECKSUM gets -EBUSY");
+        check(masked == 0, "  and a refused STAT reports no mask");
     }
 
     // 6. A cancelled STAT must release its slot: KORU_OP_STAT in held_slot is
@@ -1405,12 +1481,9 @@ static uint64_t statx_both_ways(const char *path, const char *what)
 static void path_statx(void)
 {
     struct koru_sqe sq[2];
-    struct koru_cqe cq[2];
-    const struct koru_cqe *a, *b;
     uint8_t *slot = R.arena + (size_t)STATXSLOT * R.slot_size;
     struct koru_stat got;
     struct stat sb;
-    unsigned completed = 0;
     uint64_t extra;
     uint32_t n;
 
@@ -1477,17 +1550,22 @@ static void path_statx(void)
               "  while one that exactly fits is accepted");
 
     // 5. Slot exclusivity, the CHECKSUM idiom STAT uses.
-    put_path(R.arena, R.slot_size, STATXSLOT, PATFILE);
-    sqe_checksum(&sq[0], STATXSLOT, 0, R.slot_size, 0xd4);
-    sqe_path(&sq[1], KORU_OP_STATX_AT, STATXSLOT, 0, n, 0xd5);
-    submit(R.fd, sq, 2, cq, 2, 2, &completed);
-    a = find_cqe(cq, completed, 0xd4);
-    b = find_cqe(cq, completed, 0xd5);
-    check(completed == 2 && a && b, "a CHECKSUM and a STATX_AT on one slot both complete");
-    if (a && b) {
-        check(a->res >= 0, "  the deferred CHECKSUM holds the slot");
-        check_res(b->res, -EBUSY, "  and the STATX_AT behind it gets -EBUSY");
-        check(b->extra == 0, "  a refused STATX_AT reports no mask");
+    {
+        unsigned round, refused = 0, masked = 0;
+        uint64_t extra;
+
+        sqe_checksum(&sq[0], STATXSLOT, 0, R.slot_size, 0xd4);
+        sqe_path(&sq[1], KORU_OP_STATX_AT, STATXSLOT, 0, n, 0xd5);
+        for (round = 0; round < 64; round++) {
+            // The answer replaces the path, so it goes back every round.
+            put_path(R.arena, R.slot_size, STATXSLOT, PATFILE);
+            if (race_round(&R, &sq[0], &sq[1], &extra) == -EBUSY) {
+                refused++;
+                masked += extra != 0;
+            }
+        }
+        check(refused > 0, "the STATX_AT behind a CHECKSUM gets -EBUSY");
+        check(masked == 0, "  and a refused STATX_AT reports no mask");
     }
 }
 
@@ -2834,7 +2912,6 @@ void sec_readdir(void)
     static struct dent got[DIRCOUNT + 8], want[DIRCOUNT + 8];
     struct koru_sqe sq[2];
     struct koru_cqe cq[2];
-    const struct koru_cqe *a, *b;
     unsigned completed = 0, rounds = 0;
     uint64_t next = 0;
     uint32_t flags = 0;
@@ -2903,25 +2980,29 @@ void sec_readdir(void)
     check(r_readdir((uint32_t)h, 1, next, DIRBUDGET, NULL, &flags) >= 0 && flags == 0,
           "  and no entry was skipped");
 
-    // 5. Two concurrent READDIRs on one handle: one wins, one gets EBUSY.
-    memset(&sq[0], 0, sizeof(sq[0]));
-    sq[0].opcode    = KORU_OP_READDIR;
-    sq[0].handle    = (uint32_t)h;
-    sq[0].slot      = 1;
-    sq[0].len       = DIRBUDGET;
-    sq[0].user_data = 0x910;
-    sq[1]           = sq[0];
-    sq[1].slot      = 2;
-    sq[1].user_data = 0x911;
-    submit(R.fd, sq, 2, cq, 2, 2, &completed);
-    a = find_cqe(cq, completed, 0x910);
-    b = find_cqe(cq, completed, 0x911);
-    check(completed == 2 && a && b, "two READDIRs on one handle both complete");
-    if (a && b) {
-        int busy = (a->res == -EBUSY) + (b->res == -EBUSY);
+    // 5. Two concurrent READDIRs on one handle: the one behind gets EBUSY.
+    {
+        unsigned round, refused = 0, wrong = 0;
+        int64_t res;
 
-        check(busy == 1, "  exactly one of them gets EBUSY");
-        check((a->res >= 0) + (b->res >= 0) == 1, "  and exactly one reads");
+        memset(&sq[0], 0, sizeof(sq[0]));
+        sq[0].opcode    = KORU_OP_READDIR;
+        sq[0].handle    = (uint32_t)h;
+        sq[0].slot      = 1;
+        sq[0].len       = DIRBUDGET;
+        sq[0].user_data = 0x910;
+        sq[1]           = sq[0];
+        sq[1].slot      = 2;
+        sq[1].user_data = 0x911;
+        for (round = 0; round < 64; round++) {
+            res = race_round(&R, &sq[0], &sq[1], NULL);
+            if (res == -EBUSY)
+                refused++;
+            else if (res < 0)
+                wrong++;
+        }
+        check(refused > 0, "the second of two READDIRs on one handle gets EBUSY");
+        check(wrong == 0, "  and whatever did not lose read");
     }
 
     // 6. The claims came back: the content check, for a claim never returned.

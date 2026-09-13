@@ -59,8 +59,18 @@ int64_t run_one(int fd, struct koru_sqe *s);
 // Find a completion by user_data, or NULL.
 const struct koru_cqe *find_cqe(const struct koru_cqe *cq, unsigned n, uint64_t user_data);
 
+// One round of a slot race: a deferred op and one behind it that should be
+// refused what it holds. Returns the second's res, or INT64_MIN if the pair did
+// not complete. Callers round it: a fast enough kworker can retire the first
+// before the submit loop reaches the second, and then nothing is refused.
+int64_t race_round(struct koru_ring *r, const struct koru_sqe *first,
+                   const struct koru_sqe *second, uint64_t *extra);
+
 // Whole ops on a mapped ring, each to completion. `slot` is the caller's.
 int64_t r_open(struct koru_ring *r, uint32_t slot, const char *path, uint32_t flags);
+// KORU_O_CREAT's mode, after the path where a path op's argument goes.
+int64_t r_create(struct koru_ring *r, uint32_t slot, const char *path, uint32_t flags,
+                 uint64_t mode);
 int64_t r_close(struct koru_ring *r, uint32_t handle);
 int64_t r_adopt(struct koru_ring *r, int fd);
 int64_t r_read(struct koru_ring *r, uint32_t handle, uint32_t slot, uint64_t off, uint32_t len);

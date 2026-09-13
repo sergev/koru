@@ -115,7 +115,12 @@ int main()
     konst("KORU_O_NOFOLLOW", "u32", KORU_O_NOFOLLOW);
     konst("KORU_O_DIRECTORY", "u32", KORU_O_DIRECTORY);
     konst("KORU_O_NONBLOCK", "u32", KORU_O_NONBLOCK);
+    konst("KORU_O_CREAT", "u32", KORU_O_CREAT);
+    konst("KORU_O_EXCL", "u32", KORU_O_EXCL);
+    konst("KORU_O_TRUNC", "u32", KORU_O_TRUNC);
+    konst("KORU_O_APPEND", "u32", KORU_O_APPEND);
     konst("KORU_OPEN_FLAGS_ALL", "u32", KORU_OPEN_FLAGS_ALL);
+    konst("KORU_OPEN_MODE_ALL", "u64", KORU_OPEN_MODE_ALL);
     konst("KORU_MKDIR_MODE_ALL", "u32", KORU_MKDIR_MODE_ALL);
     konst("KORU_CQE_F_SKIPPED", "u32", KORU_CQE_F_SKIPPED);
     konst("KORU_CQE_F_MORE", "u32", KORU_CQE_F_MORE);

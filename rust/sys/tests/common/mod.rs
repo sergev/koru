@@ -112,6 +112,14 @@ impl Mapped {
         self.run_one(&Sqe::open(0x100, slot, 0, n, flags))
     }
 
+    /// `KORU_O_CREAT`'s mode, after the path where a path op's argument goes.
+    pub fn create_path(&self, slot: u32, path: &str, flags: u32, mode: u64) -> i64 {
+        let n = self.put_path(slot, path);
+        let at = koru_sys::ring::arg_offset(0, n) as usize;
+        self.slot(slot)[at..at + 8].copy_from_slice(&mode.to_ne_bytes());
+        self.run_one(&Sqe::open(0x108, slot, 0, n, flags))
+    }
+
     pub fn close_handle(&self, handle: u32) -> i64 {
         self.run_one(&Sqe::close(0x101, handle))
     }
@@ -142,6 +150,29 @@ impl Mapped {
             .expect("ENTER");
         assert_eq!(r.progress.completed, 1, "STAT did not complete");
         (cq[0].res, cq[0].extra)
+    }
+
+    /// A deferred op and one behind it that should be refused the slot — or
+    /// the handle — it holds, submitted `rounds` times. Returns the second
+    /// SQE's `res` and `extra` per round.
+    ///
+    /// Rounding is not decoration: a whole-slot CHECKSUM in a kworker can be
+    /// done before the submit loop reaches the second SQE, and then the second
+    /// one wins fairly. One run in ten misses the window on the first try, so
+    /// a single pair is a flaky gate. See doc/Notes.md.
+    pub fn slot_race(&self, rounds: u64, build: impl Fn(u64, u64) -> [Sqe; 2]) -> Vec<(i64, u64)> {
+        (0..rounds)
+            .map(|r| {
+                let (first, second) = (0xaa_0000 + r * 2, 0xaa_0001 + r * 2);
+                let sq = build(first, second);
+                let mut cq = [Cqe::default(); 2];
+                let e = self.ring.enter(&sq, &mut cq, 2, None).expect("ENTER");
+                assert_eq!(e.progress.completed, 2, "both complete");
+                assert!(find_cqe(&cq, first).res >= 0, "the first op wins");
+                let c = find_cqe(&cq, second);
+                (c.res, c.extra)
+            })
+            .collect()
     }
 
     /// Assert nothing was left in flight.

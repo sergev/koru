@@ -22,6 +22,8 @@
 #include "koru_check.h"
 
 // The only path the fuzzer ever opens for writing, truncates or touches.
+// Everything the fuzzer may create, write or destroy is under this prefix.
+#define FUZZPREFIX "/tmp/koru-fuzz"
 #define FUZZWRFILE "/tmp/koru-fuzz-write"
 // Its own symlink, the only one it ever reads.
 #define FUZZLINK "/tmp/koru-fuzz-link"
@@ -367,6 +369,27 @@ static void gen_valid(uint64_t *s, struct koru_sqe *q, uint64_t ud, uint32_t pat
     case 4: {
         const char *path;
         uint32_t flags;
+        char name[64];
+
+        if (one_in(s, 4)) {
+            // The creation flags, on a name inside FUZZDIR that the janitor
+            // keeps emptying and the path arm keeps renaming away.
+            uint64_t mode = one_in(s, 8) ? rnd(s) : (rnd(s) & 01777);
+            uint32_t n;
+
+            snprintf(name, sizeof(name), FUZZDIR "/c%u", rnd_below(s, FUZZNAMES));
+            n     = put_path(arena, F_SLOT, path_slot, name);
+            flags = KORU_O_WRONLY | KORU_O_CREAT;
+            if (one_in(s, 3))
+                flags |= KORU_O_EXCL;
+            if (one_in(s, 3))
+                flags |= KORU_O_TRUNC;
+            if (one_in(s, 3))
+                flags |= KORU_O_APPEND;
+            memcpy(arena + (size_t)path_slot * F_SLOT + arg_offset(0, n), &mode, sizeof(mode));
+            sqe_open(q, path_slot, 0, n, flags, ud);
+            break;
+        }
 
         // WRFILE is the only path ever opened for writing. A writable handle
         // plus a random offset would otherwise corrupt whatever it names.
@@ -465,6 +488,17 @@ static void gen_valid(uint64_t *s, struct koru_sqe *q, uint64_t ud, uint32_t pat
     }
 }
 
+// Whether the bytes this SQE actually names are the fuzzer's to write. Read off
+// the slot rather than off what the generator meant: a mutated slot, off or len
+// points at a prefix of something else, and that is the whole T26 lesson.
+static int names_own_path(const struct koru_sqe *q, uint32_t path_slot)
+{
+    const char *p = (const char *)(arena + (size_t)path_slot * F_SLOT);
+
+    return q->slot == path_slot && q->off == 0 && q->len == strlen(p) &&
+           strncmp(p, FUZZPREFIX, sizeof(FUZZPREFIX) - 1) == 0;
+}
+
 // Every field the opcode does not read, every boundary, and opcodes that do not
 // exist.
 static void gen_hostile(uint64_t *s, struct koru_sqe *q, uint64_t ud, uint32_t path_slot)
@@ -511,7 +545,8 @@ static void gen_hostile(uint64_t *s, struct koru_sqe *q, uint64_t ud, uint32_t p
         break;
     case 8:
         q->opcode = KORU_OP_OPEN;
-        q->handle = 3 | (rnd(s) & 0xf0); // accmode 3, unknown flag bits
+        // Access mode 3 and bits outside the whitelist, both EINVAL.
+        q->handle = KORU_O_ACCMODE | (rnd(s) & ~(uint32_t)KORU_OPEN_FLAGS_ALL);
         break;
     case 9:
         // Strictly over the cap: an accepted long delay bricks the ring.
@@ -532,6 +567,14 @@ static void gen_hostile(uint64_t *s, struct koru_sqe *q, uint64_t ud, uint32_t p
     // it. See `gen_path`.
     if (is_path_op(q->opcode))
         gen_path(s, q, ud, path_slot);
+
+    // On an OPEN, `handle` is the open flags, so a mutated one can ask to
+    // create, truncate or write. Outside the sandbox only a read-only open
+    // survives that. Access mode 3 is exempt: it never reaches filp_open.
+    if (q->opcode == KORU_OP_OPEN && (q->handle & KORU_O_ACCMODE) != KORU_O_ACCMODE &&
+        !names_own_path(q, path_slot))
+        q->handle &= ~(uint32_t)(KORU_O_ACCMODE | KORU_O_CREAT | KORU_O_EXCL | KORU_O_TRUNC |
+                                 KORU_O_APPEND);
 }
 
 struct wctx {

@@ -45,12 +45,20 @@ struct Ambient {
 }
 
 /// Userspace's own bookkeeping: `READ` and `WRITE` carry an explicit offset
-/// and never touch `f_pos`, so a stream's position lives here. T30 exposes it
-/// as `seek_fd`.
-#[derive(Copy, Clone)]
+/// and never touch `f_pos`, so a stream's position lives here. `seek_fd`
+/// exposes it.
+///
+/// `refs` is what makes `dup_fd` possible with no `DUP` opcode: both names are
+/// the one handle, so the offset is shared and the `CLOSE` waits for the last
+/// of them. `path` is what makes `truncate_fd` possible with only a path-named
+/// `TRUNCATE`; see doc/Notes.md for what that costs.
+#[derive(Clone)]
 struct Pos {
     seekable: bool,
     off: u64,
+    refs: u32,
+    writable: bool,
+    path: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -70,7 +78,9 @@ pub fn install(rt: Runtime) {
     for fd in 0..3i32 {
         let (h, seekable) = adopt_std(&rt, fd);
         if h.0 != 0 {
-            register_handle(h, seekable);
+            // No path: nothing here was opened by name, so `truncate_fd`
+            // refuses a standard stream as Braam's `seek_fd` refuses one.
+            register_opened(h, seekable, fd != 0, None);
         }
         AMBIENT.with(|c| {
             if let Some(a) = c.borrow_mut().as_mut() {
@@ -170,15 +180,88 @@ pub(crate) fn advance(h: Handle, n: u64) {
     });
 }
 
-/// Called wherever a handle is created, because only its creator knows
-/// whether an offset means anything on it: T30's `open_at` does it for an
-/// opened path, and `install` for the standard streams.
-pub fn register_handle(h: Handle, seekable: bool) {
+/// `seek_fd`'s half of the bookkeeping. Silent on an unregistered handle, as
+/// `position` is: it reads back as the 0 an unseekable file demands.
+pub(crate) fn seek_to(h: Handle, off: u64) {
     AMBIENT.with(|c| {
-        if let Some(a) = c.borrow_mut().as_mut() {
-            a.pos.insert(h.0, Pos { seekable, off: 0 });
+        if let Some(p) = c.borrow_mut().as_mut().and_then(|a| a.pos.get_mut(&h.0)) {
+            p.off = off;
         }
     });
+}
+
+pub(crate) fn is_seekable(h: Handle) -> bool {
+    with_pos(h, |p| p.seekable).unwrap_or(false)
+}
+
+pub(crate) fn is_writable(h: Handle) -> bool {
+    with_pos(h, |p| p.writable).unwrap_or(false)
+}
+
+/// The path `open_at` named, for the operations koru has only by path.
+pub(crate) fn handle_path(h: Handle) -> Option<String> {
+    with_pos(h, |p| p.path.clone()).flatten()
+}
+
+fn with_pos<T>(h: Handle, f: impl Fn(&Pos) -> T) -> Option<T> {
+    AMBIENT.with(|c| c.borrow().as_ref().and_then(|a| a.pos.get(&h.0)).map(f))
+}
+
+/// Called wherever a handle is created, because only its creator knows
+/// whether an offset means anything on it: `open_at` does it for an opened
+/// path, and `install` for the standard streams.
+pub fn register_handle(h: Handle, seekable: bool) {
+    register_opened(h, seekable, false, None);
+}
+
+pub(crate) fn register_opened(h: Handle, seekable: bool, writable: bool, path: Option<String>) {
+    AMBIENT.with(|c| {
+        if let Some(a) = c.borrow_mut().as_mut() {
+            a.pos.insert(
+                h.0,
+                Pos {
+                    seekable,
+                    off: 0,
+                    refs: 1,
+                    writable,
+                    path,
+                },
+            );
+        }
+    });
+}
+
+/// One more name for the same handle. False where there is no record, which is
+/// every handle the runtime did not create.
+pub(crate) fn retain_handle(h: Handle) -> bool {
+    AMBIENT.with(
+        |c| match c.borrow_mut().as_mut().and_then(|a| a.pos.get_mut(&h.0)) {
+            Some(p) => {
+                p.refs += 1;
+                true
+            }
+            None => false,
+        },
+    )
+}
+
+/// Drops one name. True when the kernel handle should now be closed, which an
+/// unrecorded handle also is: nothing else is holding it.
+pub(crate) fn release_handle(h: Handle) -> bool {
+    AMBIENT.with(|c| {
+        let mut b = c.borrow_mut();
+        let Some(a) = b.as_mut() else { return true };
+        match a.pos.get_mut(&h.0) {
+            Some(p) if p.refs > 1 => {
+                p.refs -= 1;
+                false
+            }
+            _ => {
+                a.pos.remove(&h.0);
+                true
+            }
+        }
+    })
 }
 
 pub fn forget_handle(h: Handle) {

@@ -320,10 +320,26 @@ KORU_STATIC_ASSERT(KORU_OP_READDIR == 20, "op READDIR");
 // or clears O_NONBLOCK on a file it did not open.
 #define KORU_O_NONBLOCK (1u << 4)
 
-// Any bit outside this completes EINVAL. No O_CREAT: no field carries a
-// creation mode.
+// Create the file if it is not there. The creation mode is a u64 argument after
+// the path in the same slot, at the first 8-aligned offset at or after its end,
+// where every path op puts its argument. Read only when this bit is set.
+#define KORU_O_CREAT (1u << 5)
+// With KORU_O_CREAT, EEXIST if the path is already there. Without it, EINVAL.
+#define KORU_O_EXCL (1u << 6)
+// Truncate an existing regular file to zero length on the way in.
+#define KORU_O_TRUNC (1u << 7)
+// Every WRITE on this handle appends and its off is ignored.
+#define KORU_O_APPEND (1u << 8)
+
+// Any bit outside this completes EINVAL.
 #define KORU_OPEN_FLAGS_ALL                                                                        \
-    (KORU_O_ACCMODE | KORU_O_NOFOLLOW | KORU_O_DIRECTORY | KORU_O_NONBLOCK)
+    (KORU_O_ACCMODE | KORU_O_NOFOLLOW | KORU_O_DIRECTORY | KORU_O_NONBLOCK | KORU_O_CREAT |         \
+     KORU_O_EXCL | KORU_O_TRUNC | KORU_O_APPEND)
+
+// What a KORU_O_CREAT open's mode argument may carry, which is
+// KORU_MKDIR_MODE_ALL's rule for the same reason: S_ISUID and S_ISGID are
+// refused rather than silently dropped, and koru creates nothing setuid.
+#define KORU_OPEN_MODE_ALL 01777u
 
 // What a MKDIR SQE's handle may carry: the permission bits and the sticky bit,
 // which is all vfs_mkdir keeps of a requested mode. Any other bit is EINVAL

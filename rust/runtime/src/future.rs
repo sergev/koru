@@ -9,7 +9,9 @@ use crate::exec::Runtime;
 use crate::reactor::Inner;
 use crate::slab::Cookie;
 use crate::vocab::{Error, Result};
+use koru_sys::abi::KORU_O_CREAT;
 use koru_sys::error::from_res;
+use koru_sys::ring::arg_offset;
 use koru_sys::{BufSlot, Sqe};
 use std::future::Future;
 use std::pin::Pin;
@@ -255,7 +257,7 @@ abandon_on_drop!(Adopt);
 pub struct Open<'a> {
     inner: Rc<Inner>,
     cookie: Option<Cookie>,
-    args: Option<(BufSlot, &'a str, u32)>,
+    args: Option<(BufSlot, &'a str, u32, u64)>,
 }
 
 impl Future for Open<'_> {
@@ -266,21 +268,31 @@ impl Future for Open<'_> {
 
         // The kernel checks the same things and answers a bare EINVAL.
         if me.cookie.is_none() {
-            let (slot, path, _) = me.args.as_ref().expect("args survive to the first poll");
+            let (slot, path, flags, _) = me.args.as_ref().expect("args survive to the first poll");
+            let need = if flags & KORU_O_CREAT != 0 {
+                arg_offset(0, path.len() as u32) as usize + size_of::<u64>()
+            } else {
+                path.len()
+            };
             let bad = path.is_empty()
                 || path.len() >= PATH_MAX
-                || path.len() > slot.len()
+                || need > slot.len()
                 || path.as_bytes().contains(&0);
             if bad {
-                let (slot, _, _) = me.args.take().expect("checked above");
+                let (slot, ..) = me.args.take().expect("checked above");
                 return Poll::Ready((Err(err(koru_sys::error::EINVAL)), slot));
             }
         }
 
         let landed = poll_body!(me, cx, {
-            let (mut slot, path, flags) = me.args.take().expect("args survive to the first poll");
+            let (mut slot, path, flags, mode) =
+                me.args.take().expect("args survive to the first poll");
             let len = path.len() as u32;
             slot[..path.len()].copy_from_slice(path.as_bytes());
+            if flags & KORU_O_CREAT != 0 {
+                let at = arg_offset(0, len) as usize;
+                slot[at..at + size_of::<u64>()].copy_from_slice(&mode.to_ne_bytes());
+            }
             let index = slot.index();
             me.inner
                 .register(Some(slot), |c| Sqe::open(c.0, index, 0, len, flags))
@@ -295,6 +307,133 @@ impl Future for Open<'_> {
 }
 
 abandon_on_drop!(Open<'a>);
+
+#[must_use = "a koru op does nothing until it is awaited"]
+pub struct PollAdd {
+    inner: Rc<Inner>,
+    cookie: Option<Cookie>,
+    handle: Handle,
+    events: u32,
+}
+
+impl Future for PollAdd {
+    type Output = Result<u32>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let me = self.get_mut();
+        let (h, events) = (me.handle.0, me.events);
+        let landed = poll_body!(
+            me,
+            cx,
+            me.inner.register(None, |c| Sqe::poll_add(c.0, h, events))
+        );
+        let (res, _, _) = match landed {
+            Poll::Ready(v) => v,
+            Poll::Pending => return Poll::Pending,
+        };
+        // Always non-negative on success, and 0 where nothing asked for can come.
+        Poll::Ready(from_res(res).map(|m| m as u32).map_err(err))
+    }
+}
+
+abandon_on_drop!(PollAdd);
+
+#[must_use = "a koru op does nothing until it is awaited"]
+pub struct Stat {
+    inner: Rc<Inner>,
+    cookie: Option<Cookie>,
+    args: Option<(Handle, BufSlot, u64, u32)>,
+}
+
+impl Future for Stat {
+    type Output = BufResult<(usize, u64)>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let me = self.get_mut();
+        let landed = poll_body!(me, cx, {
+            let (handle, slot, off, len) = me.args.take().expect("args survive to the first poll");
+            let index = slot.index();
+            me.inner
+                .register(Some(slot), |c| Sqe::stat(c.0, handle.0, index, off, len))
+        });
+        let (res, extra, slot) = match landed {
+            Poll::Ready(v) => v,
+            Poll::Pending => return Poll::Pending,
+        };
+        let slot = slot.expect("a stat op owns its slot");
+        let out = from_res(res).map(|n| (n as usize, extra)).map_err(err);
+        Poll::Ready((out, slot))
+    }
+}
+
+abandon_on_drop!(Stat);
+
+#[must_use = "a koru op does nothing until it is awaited"]
+pub struct ReadDir {
+    inner: Rc<Inner>,
+    cookie: Option<Cookie>,
+    args: Option<(Handle, BufSlot, u64, u32)>,
+}
+
+impl Future for ReadDir {
+    type Output = BufResult<(usize, u64)>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let me = self.get_mut();
+        let landed = poll_body!(me, cx, {
+            let (handle, slot, off, len) = me.args.take().expect("args survive to the first poll");
+            let index = slot.index();
+            me.inner
+                .register(Some(slot), |c| Sqe::readdir(c.0, handle.0, index, off, len))
+        });
+        let (res, extra, slot) = match landed {
+            Poll::Ready(v) => v,
+            Poll::Pending => return Poll::Pending,
+        };
+        let slot = slot.expect("a readdir op owns its slot");
+        // `res` 0 is end of directory, as on `READ`; `extra` is the next cookie.
+        let out = from_res(res).map(|n| (n as usize, extra)).map_err(err);
+        Poll::Ready((out, slot))
+    }
+}
+
+abandon_on_drop!(ReadDir);
+
+/// Every path op, which differ only in opcode and in what the caller put in the
+/// slot. `handle` is zero on all but `MKDIR`, which spends it on the mode.
+#[must_use = "a koru op does nothing until it is awaited"]
+pub struct PathOp {
+    inner: Rc<Inner>,
+    cookie: Option<Cookie>,
+    args: Option<(u8, BufSlot, u64, u32, u32)>,
+}
+
+impl Future for PathOp {
+    type Output = BufResult<(usize, u64)>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let me = self.get_mut();
+        let landed = poll_body!(me, cx, {
+            let (op, slot, off, len, handle) =
+                me.args.take().expect("args survive to the first poll");
+            let index = slot.index();
+            me.inner.register(Some(slot), |c| {
+                let mut sqe = Sqe::path(op, c.0, index, off, len);
+                sqe.handle = handle;
+                sqe
+            })
+        });
+        let (res, extra, slot) = match landed {
+            Poll::Ready(v) => v,
+            Poll::Pending => return Poll::Pending,
+        };
+        let slot = slot.expect("a path op owns its slot");
+        let out = from_res(res).map(|n| (n as usize, extra)).map_err(err);
+        Poll::Ready((out, slot))
+    }
+}
+
+abandon_on_drop!(PathOp);
 
 // ---------------------------------------------------------------------------
 // Constructors
@@ -365,12 +504,53 @@ impl Runtime {
     }
 
     /// The slot carries the path and comes back unchanged in shape. `flags`
-    /// are koru's own `KORU_O_*`, not the host `O_*`.
-    pub fn open<'a>(&self, slot: BufSlot, path: &'a str, flags: u32) -> Open<'a> {
+    /// are koru's own `KORU_O_*`, not the host `O_*`; `mode` is read only when
+    /// they include `KORU_O_CREAT`, and goes after the path as an argument.
+    pub fn open<'a>(&self, slot: BufSlot, path: &'a str, flags: u32, mode: u64) -> Open<'a> {
         Open {
             inner: Rc::clone(self.inner()),
             cookie: None,
-            args: Some((slot, path, flags)),
+            args: Some((slot, path, flags, mode)),
+        }
+    }
+
+    /// Wait once for one of `events`. Single-shot, and a file on no waitqueue
+    /// completes at once with 0.
+    pub fn poll_add(&self, handle: Handle, events: u32) -> PollAdd {
+        PollAdd {
+            inner: Rc::clone(self.inner()),
+            cookie: None,
+            handle,
+            events,
+        }
+    }
+
+    /// `off` is a within-slot offset and must be 8-aligned; `len` is the
+    /// caller's buffer size. The answer is `(bytes written, field mask)`.
+    pub fn stat(&self, handle: Handle, slot: BufSlot, off: u64, len: u32) -> Stat {
+        Stat {
+            inner: Rc::clone(self.inner()),
+            cookie: None,
+            args: Some((handle, slot, off, len)),
+        }
+    }
+
+    /// `off` is a resume cookie, 0 for the beginning; the answer is
+    /// `(bytes written, next cookie)` and 0 bytes is end of directory.
+    pub fn readdir(&self, handle: Handle, slot: BufSlot, off: u64, len: u32) -> ReadDir {
+        ReadDir {
+            inner: Rc::clone(self.inner()),
+            cookie: None,
+            args: Some((handle, slot, off, len)),
+        }
+    }
+
+    /// The caller has already put the path at `off` and any argument after it.
+    pub fn path_op(&self, op: u8, slot: BufSlot, off: u64, len: u32, handle: u32) -> PathOp {
+        PathOp {
+            inner: Rc::clone(self.inner()),
+            cookie: None,
+            args: Some((op, slot, off, len, handle)),
         }
     }
 }

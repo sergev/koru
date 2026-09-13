@@ -34,7 +34,7 @@ async fn main(args: Args) -> Result<i32> {
     }
 
     let slot = rt.acquire().expect("a slot");
-    let (h, slot) = rt.open(slot, path, KORU_O_RDONLY).await;
+    let (h, slot) = rt.open(slot, path, KORU_O_RDONLY, 0).await;
     let h = h?;
     let len = slot.len() as u32;
     let (n, slot) = rt.read(h, slot, 0, len).await;

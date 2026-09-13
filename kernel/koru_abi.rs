@@ -184,6 +184,10 @@ pub(crate) const KORU_OP_NOP: u8 = 0; // T4
 pub(crate) const KORU_OP_DELAY_NS: u8 = 1; // T5
 /// Open the path held in `len` bytes at `off` in slot `slot`. `handle` carries
 /// the open flags. On success `res` is the new handle, always positive.
+///
+/// With [`KORU_O_CREAT`] the slot also carries a `u64` creation mode after the
+/// path, as a path op carries its argument; without it nothing past the path is
+/// read.
 pub(crate) const KORU_OP_OPEN: u8 = 2; // T9
 /// Read `len` bytes from file offset `off` of `handle` into slot `slot`, at
 /// slot offset 0. `res` is the count actually read: short at EOF, 0 at or past
@@ -355,10 +359,33 @@ pub(crate) const KORU_O_DIRECTORY: u32 = 1 << 3;
 /// so flipping it on stdin would change behaviour for every other holder.
 pub(crate) const KORU_O_NONBLOCK: u32 = 1 << 4;
 
-/// Any bit outside this completes with `EINVAL`. No `O_CREAT`: there is no
-/// field for a creation mode.
-pub(crate) const KORU_OPEN_FLAGS_ALL: u32 =
-    KORU_O_ACCMODE | KORU_O_NOFOLLOW | KORU_O_DIRECTORY | KORU_O_NONBLOCK;
+/// Create the file if it is not there. The creation mode is a `u64` argument
+/// **after the path in the same slot**, at the first 8-aligned offset at or
+/// after its end — the placement every path op has used since `TRUNCATE`. The
+/// argument is read only when this bit is set.
+pub(crate) const KORU_O_CREAT: u32 = 1 << 5;
+/// With [`KORU_O_CREAT`], fail with `EEXIST` if the path is already there.
+/// Without it, `EINVAL`: a flag that cannot act is rejected, not dropped.
+pub(crate) const KORU_O_EXCL: u32 = 1 << 6;
+/// Truncate an existing regular file to zero length on the way in.
+pub(crate) const KORU_O_TRUNC: u32 = 1 << 7;
+/// Every `WRITE` on this handle appends and its `off` is ignored.
+pub(crate) const KORU_O_APPEND: u32 = 1 << 8;
+
+/// Any bit outside this completes with `EINVAL`.
+pub(crate) const KORU_OPEN_FLAGS_ALL: u32 = KORU_O_ACCMODE
+    | KORU_O_NOFOLLOW
+    | KORU_O_DIRECTORY
+    | KORU_O_NONBLOCK
+    | KORU_O_CREAT
+    | KORU_O_EXCL
+    | KORU_O_TRUNC
+    | KORU_O_APPEND;
+
+/// What a `KORU_O_CREAT` open's mode argument may carry, which is
+/// [`KORU_MKDIR_MODE_ALL`]'s rule for the same reason: `S_ISUID` and `S_ISGID`
+/// are refused rather than silently dropped, and koru creates nothing setuid.
+pub(crate) const KORU_OPEN_MODE_ALL: u64 = 0o1777;
 
 /// Multishot bit, reserved and never set: admission control forecloses multishot.
 #[expect(dead_code)]

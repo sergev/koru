@@ -607,6 +607,12 @@ impl RingCtx {
         if sqe.handle != 0 {
             return Err(EINVAL);
         }
+        self.path_and_arg_raw(sqe, size)
+    }
+
+    /// The same without that rule, for `OPEN`: it spends `handle` on its flags
+    /// and still carries a creation mode where a path op carries its argument.
+    fn path_and_arg_raw(&self, sqe: &Sqe, size: usize) -> Result<(KVec<u8>, KVec<u8>)> {
         let pos = self.path_validate(sqe)?;
         let apos = self.slot_pos(sqe.slot, self.arg_offset(sqe, size)?)?;
 
@@ -632,12 +638,13 @@ impl RingCtx {
 
     fn do_open(&self, sqe: &Sqe) -> Result<u32> {
         let flags = open_flags(sqe.handle)?;
-        let path = self.take_path(sqe)?;
+        let (path, mode) = self.take_path_and_mode(sqe)?;
         let cpath = CStr::from_bytes_with_nul(&path).map_err(|_| EINVAL)?;
 
         // SAFETY: `cpath` is NUL-terminated and lives across the call. Runs in
-        // the submitting task, so creds and namespaces are the caller's.
-        let ptr = from_err_ptr(unsafe { bindings::filp_open(cpath.as_char_ptr(), flags, 0) })?;
+        // the submitting task, so creds, namespaces and the umask are the
+        // caller's.
+        let ptr = from_err_ptr(unsafe { bindings::filp_open(cpath.as_char_ptr(), flags, mode) })?;
         let ptr = NonNull::new(ptr.cast::<File>()).ok_or(EINVAL)?;
         // SAFETY: `filp_open` returned a reference and we take ownership of it.
         let file = unsafe { ARef::from_raw(ptr) };
@@ -657,6 +664,21 @@ impl RingCtx {
                 Err(EMFILE)
             }
         }
+    }
+
+    /// `OPEN`'s path, and its creation mode when [`KORU_O_CREAT`] asked for one.
+    /// Without that bit nothing past the path is read, so an `OPEN` that creates
+    /// nothing needs no room for an argument it does not carry.
+    fn take_path_and_mode(&self, sqe: &Sqe) -> Result<(KVec<u8>, u16)> {
+        if sqe.handle & KORU_O_CREAT == 0 {
+            return Ok((self.take_path(sqe)?, 0));
+        }
+        let (path, arg) = self.path_and_arg_raw(sqe, core::mem::size_of::<u64>())?;
+        let mode = u64::from_bytes_copy(&arg).ok_or(EINVAL)?;
+        if mode & !KORU_OPEN_MODE_ALL != 0 {
+            return Err(EINVAL);
+        }
+        Ok((path, mode as u16))
     }
 
     /// `READ`: deferred, with the file resolved and the slot claimed here, in
@@ -2153,6 +2175,23 @@ fn open_flags(flags: u32) -> Result<i32> {
     }
     if flags & KORU_O_NONBLOCK != 0 {
         out |= bindings::O_NONBLOCK;
+    }
+    // `O_EXCL` alone changes nothing in the VFS, so koru refuses it rather than
+    // let a caller believe it asked for something.
+    if flags & KORU_O_EXCL != 0 && flags & KORU_O_CREAT == 0 {
+        return Err(EINVAL);
+    }
+    if flags & KORU_O_CREAT != 0 {
+        out |= bindings::O_CREAT;
+    }
+    if flags & KORU_O_EXCL != 0 {
+        out |= bindings::O_EXCL;
+    }
+    if flags & KORU_O_TRUNC != 0 {
+        out |= bindings::O_TRUNC;
+    }
+    if flags & KORU_O_APPEND != 0 {
+        out |= bindings::O_APPEND;
     }
     // Always: kernel opens of regular files, with no controlling terminal.
     out |= bindings::O_LARGEFILE | bindings::O_NOCTTY;

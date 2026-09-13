@@ -846,25 +846,33 @@ fn checksum_batch(m: &Mapped, slots: &[u32], len: u32) -> Vec<i64> {
         .collect()
 }
 
+/// `n` CHECKSUMs on one slot, rounded, reporting how many were refused each
+/// round. Which of them lose depends on how fast the kworker is — see
+/// `Mapped::slot_race` — so only the *best* round is a fact about the bitmap.
+/// Every round is checked for the thing that must always hold: a result is
+/// either the right checksum or `EBUSY`, never a wrong answer.
+fn collisions(m: &Mapped, slot: u32, n: usize, want: i64) -> usize {
+    let busy = -(EBUSY.0 as i64);
+    let mut best = 0;
+    for _ in 0..64 {
+        let res = checksum_batch(m, &vec![slot; n], S_SLOT);
+        assert!(
+            res.iter().all(|&r| r == want || r == busy),
+            "a result that is neither the checksum nor EBUSY: {res:?}"
+        );
+        best = best.max(res.iter().filter(|&&r| r == busy).count());
+    }
+    best
+}
+
 #[test]
 fn slots_one_op_wins_and_the_rest_get_ebusy() {
     let m = Mapped::new(&SetupConfig::new(32, 64, S_SLOT, S_COUNT, 8));
     let pattern: Vec<u8> = (0..S_SLOT as usize).map(|i| (i * 17 + 3) as u8).collect();
     let want = fnv1a(&pattern);
-    let busy = -(EBUSY.0 as i64);
     m.slot(3).copy_from_slice(&pattern);
 
-    let res = checksum_batch(&m, &[3, 3], S_SLOT);
-    assert_eq!(
-        res.iter().filter(|&&r| r == want).count(),
-        1,
-        "exactly one succeeds"
-    );
-    assert_eq!(
-        res.iter().filter(|&&r| r == busy).count(),
-        1,
-        "the other gets -EBUSY"
-    );
+    assert_eq!(collisions(&m, 3, 2, want), 1, "one of two gets -EBUSY");
 
     // Released in the same critical section that posts the CQE, so it is free
     // exactly when userspace can see the completion.
@@ -874,17 +882,7 @@ fn slots_one_op_wins_and_the_rest_get_ebusy() {
         "the slot is free again"
     );
 
-    let res = checksum_batch(&m, &[3, 3, 3], S_SLOT);
-    assert_eq!(
-        res.iter().filter(|&&r| r == want).count(),
-        1,
-        "three on one slot: one wins"
-    );
-    assert_eq!(
-        res.iter().filter(|&&r| r == busy).count(),
-        2,
-        "two get -EBUSY"
-    );
+    assert_eq!(collisions(&m, 3, 3, want), 2, "two of three get -EBUSY");
     m.assert_quiesced();
 }
 
@@ -899,13 +897,10 @@ fn slots_distinct_slots_never_collide() {
             .all(|&r| r != busy),
         "slots 3 and 4"
     );
-    // Slot 70 lives in the second bitmap word.
-    let res = checksum_batch(&m, &[70, 70], S_SLOT);
-    assert_eq!(
-        res.iter().filter(|&&r| r == busy).count(),
-        1,
-        "slot 70 is tracked too"
-    );
+    // Slot 70 lives in the second bitmap word. Its contents are whatever the
+    // arena was zeroed to, which is all `collisions` needs to compare against.
+    let zeros = fnv1a(&vec![0u8; S_SLOT as usize]);
+    assert_eq!(collisions(&m, 70, 2, zeros), 1, "slot 70 is tracked too");
     assert!(
         checksum_batch(&m, &[6, 70], S_SLOT)
             .iter()
@@ -1094,7 +1089,7 @@ fn open_flag_matrix() {
     let bad = -(EINVAL.0 as i64);
 
     assert_eq!(
-        m.open_path(0, "/etc/hostname", 1 << 8),
+        m.open_path(0, "/etc/hostname", 1 << 9),
         bad,
         "an unknown open flag bit"
     );
@@ -1137,19 +1132,105 @@ fn open_flag_matrix() {
 fn open_holds_its_slot_only_for_the_path_snapshot() {
     let m = Mapped::shared();
     let len = m.put_path(1, "/etc/hostname");
-    let sq = [
-        Sqe::checksum(0xa0, 1, 0, m.slot_size()),
-        Sqe::open(0xa1, 1, 0, len, KORU_O_RDONLY),
-    ];
-    let mut cq = [Cqe::default(); 2];
-    let r = m.ring.enter(&sq, &mut cq, 2, None).expect("ENTER");
-    assert_eq!(r.progress.completed, 2);
-    assert!(find_cqe(&cq, 0xa0).res >= 0, "the CHECKSUM wins the slot");
-    assert_eq!(
-        find_cqe(&cq, 0xa1).res,
-        -(EBUSY.0 as i64),
-        "the OPEN is refused it"
+    let n = m.slot_size();
+
+    let res = m.slot_race(64, |a, b| {
+        [
+            Sqe::checksum(a, 1, 0, n),
+            Sqe::open(b, 1, 0, len, KORU_O_RDONLY),
+        ]
+    });
+    let busy = -(EBUSY.0 as i64);
+    assert!(
+        res.iter().any(|&(r, _)| r == busy),
+        "the slot was never held across the OPEN behind it"
     );
+    // The only two outcomes: refused the slot, or given a real handle.
+    for (r, _) in res {
+        if r != busy {
+            assert!(r > 0, "the OPEN got neither the slot nor a handle: {r}");
+            assert_eq!(m.close_handle(r as u32), 0);
+        }
+    }
+    m.assert_quiesced();
+}
+
+/// The creation flags, and the mode argument after the path.
+#[test]
+fn open_creation_matrix() {
+    let m = Mapped::shared();
+    let bad = -(EINVAL.0 as i64);
+    let path = "/tmp/koru-check-rs-created";
+    let _ = std::fs::remove_file(path);
+
+    let h = m.create_path(0, path, KORU_O_WRONLY | KORU_O_CREAT, 0o640);
+    assert!(h > 0, "O_CREAT of a missing path");
+    assert_eq!(m.close_handle(h as u32), 0);
+    assert!(std::fs::metadata(path).is_ok(), "the file is there");
+    assert_eq!(mode_of(path), 0o640, "the mode asked for");
+
+    // Without O_EXCL an existing path is opened, not refused.
+    let h = m.create_path(0, path, KORU_O_WRONLY | KORU_O_CREAT, 0o600);
+    assert!(h > 0, "O_CREAT over an existing path opens it");
+    assert_eq!(m.close_handle(h as u32), 0);
+    assert_eq!(mode_of(path), 0o640, "and leaves its mode alone");
+
+    assert_eq!(
+        m.create_path(0, path, KORU_O_WRONLY | KORU_O_CREAT | KORU_O_EXCL, 0o640),
+        -(EEXIST.0 as i64),
+        "O_CREAT|O_EXCL over an existing path"
+    );
+    assert_eq!(
+        m.open_path(0, path, KORU_O_WRONLY | KORU_O_EXCL),
+        bad,
+        "O_EXCL without O_CREAT"
+    );
+    assert_eq!(
+        m.create_path(0, path, KORU_O_WRONLY | KORU_O_CREAT, 0o4755),
+        bad,
+        "a setuid creation mode"
+    );
+    assert_eq!(
+        m.create_path(0, path, KORU_O_WRONLY | KORU_O_CREAT, 1 << 32),
+        bad,
+        "a mode above the mask"
+    );
+
+    // The mode is read only when O_CREAT asked for one, so an open of an
+    // existing path needs no room for it.
+    let n = m.put_path(0, path);
+    let end = (m.slot_size() - n) as u64;
+    m.slot(0).copy_within(0..n as usize, end as usize);
+    let h = m.run_one(&Sqe::open(0x120, 0, end, n, KORU_O_RDONLY));
+    assert!(h > 0, "a path at the very end of the slot, without O_CREAT");
+    assert_eq!(m.close_handle(h as u32), 0);
+    assert_eq!(
+        m.run_one(&Sqe::open(0x121, 0, end, n, KORU_O_RDONLY | KORU_O_CREAT)),
+        bad,
+        "and with O_CREAT there is no room for the mode"
+    );
+
+    // O_TRUNC and O_APPEND, over the file just made.
+    std::fs::write(path, b"12345678").expect("eight bytes");
+    let h = m.open_path(0, path, KORU_O_WRONLY | KORU_O_TRUNC);
+    assert!(h > 0, "O_TRUNC opens");
+    assert_eq!(m.close_handle(h as u32), 0);
+    assert_eq!(std::fs::metadata(path).unwrap().len(), 0, "and empties it");
+
+    m.fill(1, |_| b'a');
+    let h = m.open_path(0, path, KORU_O_WRONLY | KORU_O_APPEND);
+    assert!(h > 0, "O_APPEND opens");
+    // off is ignored on an appending handle, so two writes at 0 stack up.
+    assert_eq!(m.write_from(h as u32, 1, 0, 4), 4);
+    assert_eq!(m.write_from(h as u32, 1, 0, 4), 4);
+    assert_eq!(m.close_handle(h as u32), 0);
+    assert_eq!(
+        std::fs::metadata(path).unwrap().len(),
+        8,
+        "eight bytes, not four"
+    );
+
+    let _ = std::fs::remove_file(path);
     m.assert_quiesced();
 }
 
@@ -1437,13 +1518,11 @@ fn read_rejection_matrix() {
     assert_eq!(m.read_into(h, 1, 1 << 63, n), bad, "a negative file offset");
 
     // READ holds its slot for the whole deferred op.
-    let sq = [Sqe::checksum(0x70, 5, 0, n), Sqe::read(0x71, h, 5, 0, n)];
-    let mut cq = [Cqe::default(); 2];
-    let r = m.ring.enter(&sq, &mut cq, 2, None).expect("ENTER");
-    assert_eq!(r.progress.completed, 2);
-    assert_eq!(
-        find_cqe(&cq, 0x71).res,
-        -(EBUSY.0 as i64),
+    let res = m.slot_race(64, |a, b| {
+        [Sqe::checksum(a, 5, 0, n), Sqe::read(b, h, 5, 0, n)]
+    });
+    assert!(
+        res.iter().any(|&(r, _)| r == -(EBUSY.0 as i64)),
         "two ops on one slot"
     );
 
@@ -1619,13 +1698,11 @@ fn write_rejection_matrix() {
     assert_eq!(m.close_handle(ro), 0);
 
     // WRITE holds its slot for the whole deferred op.
-    let sq = [Sqe::checksum(0x70, 5, 0, n), Sqe::write(0x71, h, 5, 0, n)];
-    let mut cq = [Cqe::default(); 2];
-    let r = m.ring.enter(&sq, &mut cq, 2, None).expect("ENTER");
-    assert_eq!(r.progress.completed, 2);
-    assert_eq!(
-        find_cqe(&cq, 0x71).res,
-        -(EBUSY.0 as i64),
+    let res = m.slot_race(64, |a, b| {
+        [Sqe::checksum(a, 5, 0, n), Sqe::write(b, h, 5, 0, n)]
+    });
+    assert!(
+        res.iter().any(|&(r, _)| r == -(EBUSY.0 as i64)),
         "two ops on one slot"
     );
 
@@ -2872,8 +2949,9 @@ fn stat_rejection_matrix() {
     m.assert_quiesced();
 }
 
-/// A whole-slot CHECKSUM is slow enough to still hold the slot when the STAT
-/// behind it is dispatched.
+/// A whole-slot CHECKSUM is usually slow enough to still hold the slot when
+/// the STAT behind it is dispatched. Usually, not always: see
+/// `open_holds_its_slot_only_for_the_path_snapshot` for why this rounds.
 #[test]
 fn stat_is_refused_a_slot_another_op_holds() {
     ensure_pattern_file();
@@ -2881,18 +2959,23 @@ fn stat_is_refused_a_slot_another_op_holds() {
     let h = m.open_path(0, PATFILE, KORU_O_RDONLY) as u32;
     assert!(h > 0, "OPEN");
     let n = m.slot_size();
+    let want = size_of::<KoruStat>() as u32;
 
-    let sq = [
-        Sqe::checksum(0x610, 5, 0, n),
-        Sqe::stat(0x611, h, 5, 0, size_of::<KoruStat>() as u32),
-    ];
-    let mut cq = [Cqe::default(); 2];
-    let r = m.ring.enter(&sq, &mut cq, 2, None).expect("ENTER");
-    assert_eq!(r.progress.completed, 2, "both complete");
-
-    let refused = find_cqe(&cq, 0x611);
-    assert_eq!(refused.res, -(EBUSY.0 as i64), "the STAT behind it");
-    assert_eq!(refused.extra, 0, "a refused STAT reports no mask");
+    let res = m.slot_race(64, |a, b| {
+        [Sqe::checksum(a, 5, 0, n), Sqe::stat(b, h, 5, 0, want)]
+    });
+    let busy = -(EBUSY.0 as i64);
+    assert!(
+        res.iter().any(|&(r, _)| r == busy),
+        "the slot was never held across the STAT"
+    );
+    for (r, extra) in res {
+        if r == busy {
+            assert_eq!(extra, 0, "a refused STAT reports no mask");
+        } else {
+            assert_eq!(r, i64::from(want), "or it stats");
+        }
+    }
 
     assert_eq!(m.close_handle(h), 0);
     m.assert_quiesced();
@@ -3442,25 +3525,37 @@ fn statx_at_rejection_matrix() {
     m.assert_quiesced();
 }
 
-/// The CHECKSUM idiom again: it still holds slot 7 when the STATX_AT behind it
-/// is dispatched, and that one is inline.
+/// The CHECKSUM idiom again: it holds slot 7 when the STATX_AT behind it is
+/// dispatched, and that one is inline. Rounds for the reason `stat_is_refused`
+/// rounds — this is the test that first caught the kworker winning.
 #[test]
 fn statx_at_is_refused_a_slot_another_op_holds() {
     ensure_pattern_file();
     let m = Mapped::shared();
-    let n = m.put_path(7, PATFILE);
+    let n = m.slot_size();
+    let want = size_of::<KoruStat>() as i64;
 
-    let sq = [
-        Sqe::checksum(0x760, 7, 0, m.slot_size()),
-        Sqe::path(KORU_OP_STATX_AT, 0x761, 7, 0, n),
-    ];
-    let mut cq = [Cqe::default(); 2];
-    let r = m.ring.enter(&sq, &mut cq, 2, None).expect("ENTER");
-    assert_eq!(r.progress.completed, 2, "both complete");
-
-    let refused = find_cqe(&cq, 0x761);
-    assert_eq!(refused.res, -(EBUSY.0 as i64), "the STATX_AT behind it");
-    assert_eq!(refused.extra, 0, "a refused STATX_AT reports no mask");
+    // The STATX_AT overwrites the path with its answer, so it goes back each
+    // round; the CHECKSUM reads whatever is there and its own res is ignored.
+    let res = m.slot_race(64, |a, b| {
+        let len = m.put_path(7, PATFILE);
+        [
+            Sqe::checksum(a, 7, 0, n),
+            Sqe::path(KORU_OP_STATX_AT, b, 7, 0, len),
+        ]
+    });
+    let busy = -(EBUSY.0 as i64);
+    assert!(
+        res.iter().any(|&(r, _)| r == busy),
+        "the slot was never held across the STATX_AT"
+    );
+    for (r, extra) in res {
+        if r == busy {
+            assert_eq!(extra, 0, "a refused STATX_AT reports no mask");
+        } else {
+            assert_eq!(r, want, "or it stats");
+        }
+    }
     m.assert_quiesced();
 }
 
@@ -4122,23 +4217,21 @@ fn readdir_is_serialised_per_handle() {
     let h = m.open_path(0, &e.dir, KORU_O_RDONLY | KORU_O_DIRECTORY) as u32;
     assert!(h > 0, "OPEN");
 
-    let sq = [
-        Sqe::readdir(0x910, h, 1, 0, 4096),
-        Sqe::readdir(0x911, h, 2, 0, 4096),
-    ];
-    let mut cq = [Cqe::default(); 2];
-    let r = m.ring.enter(&sq, &mut cq, 2, None).expect("ENTER");
-    assert_eq!(r.progress.completed, 2, "both complete");
-
-    let a = find_cqe(&cq, 0x910).res;
-    let b = find_cqe(&cq, 0x911).res;
-    let busy = (a == -(EBUSY.0 as i64)) as u32 + (b == -(EBUSY.0 as i64)) as u32;
-    assert_eq!(busy, 1, "exactly one gets EBUSY: {a}, {b}");
-    assert_eq!(
-        (a >= 0) as u32 + (b >= 0) as u32,
-        1,
-        "and exactly one reads"
+    // The handle, not a slot, but the same window and the same rounding.
+    let res = m.slot_race(64, |a, b| {
+        [
+            Sqe::readdir(a, h, 1, 0, 4096),
+            Sqe::readdir(b, h, 2, 0, 4096),
+        ]
+    });
+    let busy = -(EBUSY.0 as i64);
+    assert!(
+        res.iter().any(|&(r, _)| r == busy),
+        "the two never overlapped, so neither ever lost"
     );
+    for (r, _) in res {
+        assert!(r == busy || r > 0, "neither refused nor read: {r}");
+    }
 
     // And the claim came back: the whole directory still reads.
     let (all, _) = read_all_dents(&m, h, 4096);
