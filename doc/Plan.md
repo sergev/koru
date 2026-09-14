@@ -112,50 +112,6 @@ restarted daemon, which a full-screen program would never notice, because the
 resize path already marks the whole grid damaged. Add them here as tasks when
 one of them is actually wanted.
 
-### T36 [R] — the daemon's protocol server
-
-The listening socket with bind-then-rename, one connection, and the frame
-handler written as a **pure `feed()` with no I/O in it** — the event loop does
-`recv`, `feed`, `drain_replies` and nothing else. Both claims as RAII objects
-released on EOF, with the screen restore Braam's `~FullScreen` does. Echo is
-implemented rather than stubbed: koru has no shell to call it, but `feed()` is
-pure, so a test can drive it directly and it can be made falsifiable without a
-caller.
-
-Two rules, one borrowed and one that cannot be. **Every accepted request frame
-produces exactly one reply**, which is C1 transposed and is what keeps the
-client's `seq` map from leaking a coroutine that never resumes. But E1 splits:
-a frame that parses and is then rejected on content gets an exact errno and the
-connection continues, while a frame that does not parse has desynchronised the
-stream with no way to find the next boundary, so the daemon sends one `-EPROTO`
-and closes. An ioctl has a private snapshot; a byte stream does not.
-
-Resize needs care. Braam's kernel cannot invent a reply to a parked key read,
-so it signals; the daemon owns the reply, so it answers a parked `KEY_READ`
-with `-EINTR` **and a full payload** carrying the new geometry. `next_key`
-resizes from what it already has, so the signature and semantics are unchanged
-and source compatibility is exact. One new rule to assert: `-EINTR` is the only
-negative `res` that carries a payload. A blit racing a resize must not report a
-spurious `-EINVAL`, so the blit **carries the geometry the client believed**:
-matching geometry with an out-of-range rectangle is a real bug and gets
-`-EINVAL`, differing geometry is stale, so draw nothing and reply success with
-a stale flag.
-
-Done test: the rejection matrix driven through `feed()` with no socket —
-unknown op, unknown flag bit, non-zero reserved, `len` below the header, above
-the frame cap, or not a multiple of 8, a blit overflowing its declared
-geometry, a stale blit, a second parked key read, a blit without the claim —
-each producing exactly one reply with the exact errno, and each shown to fail
-when its own check is deleted. Framing: one frame split across three `feed()`
-calls and two frames in one both produce the same replies as a whole frame, and
-EOF mid-frame is a clean teardown rather than a protocol error, shown to fail
-by making a partial frame `-EPROTO`. The reply-count invariant asserted after
-every case. The claim lifetime: take the screen, blit, drop the connection,
-assert the saved cells are back, then delete the restore and watch only that
-assertion fail. Then a libFuzzer target on `feed()` under ASan whose oracle is
-that invariant plus T34's grid invariants — remove the `len` bound and it must
-give a heap overflow read immediately.
-
 ### T37 [R] — the screen client, Rust
 
 `ProcScreen`'s six methods unchanged over the ported pure library: `Grid`,

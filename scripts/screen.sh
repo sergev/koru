@@ -69,16 +69,18 @@ else
 	echo "(no sdl3: the pixel oracles were not built)"
 fi
 
-echo
-echo "=== parser fuzz ==="
-out=$("$BUILD/ks_ansi_rand" 2>&1)
-rc=$?
-echo "$out"
-[ "$rc" -eq 0 ] || fail=1
-echo "$out" | grep -q '^ks_ansi_rand: OK$' || {
-	echo "THE FUZZ DRIVER DID NOT FINISH"
-	fail=1
-}
+for f in ansi proto; do
+	echo
+	echo "=== $f fuzz ==="
+	out=$("$BUILD/ks_${f}_rand" 2>&1)
+	rc=$?
+	echo "$out"
+	[ "$rc" -eq 0 ] || fail=1
+	echo "$out" | grep -q "^ks_${f}_rand: OK\$" || {
+		echo "THE $f FUZZ DRIVER DID NOT FINISH"
+		fail=1
+	}
+done
 
 [ "$fail" -eq 0 ] && verdict PASS
 verdict FAIL

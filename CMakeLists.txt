@@ -70,9 +70,9 @@ endif()
 # The model's own suite: Braam's cell-exact assertions, plus the pixel oracles
 # where SDL3 is installed. The sources are compiled again rather than linked,
 # so the sanitizers are this target's.
-set(KS_TEST_SRC screen/screen.cpp screen/ansi.cpp screen/text.cpp
+set(KS_TEST_SRC screen/screen.cpp screen/ansi.cpp screen/text.cpp screen/proto.cpp
                 screen/tests/harness.cpp screen/tests/test_screen.cpp
-                screen/tests/test_ansi.cpp)
+                screen/tests/test_ansi.cpp screen/tests/test_proto.cpp)
 if(SDL3_FOUND)
   list(APPEND KS_TEST_SRC screen/render.cpp screen/window.cpp
                           screen/tests/test_render.cpp)
@@ -85,6 +85,17 @@ target_link_options(ks_model_test PRIVATE ${KORU_SAN_FLAGS})
 if(SDL3_FOUND)
   target_compile_definitions(ks_model_test PRIVATE KS_HAVE_SDL)
   target_link_libraries(ks_model_test PRIVATE SDL3::SDL3)
+endif()
+
+# The daemon itself: a window, a terminal and the socket clients reach it over.
+if(SDL3_FOUND)
+  add_executable(koru-screen
+                 screen/screen.cpp screen/ansi.cpp screen/text.cpp screen/proto.cpp
+                 screen/render.cpp screen/window.cpp screen/ks_daemon.cpp)
+  target_include_directories(koru-screen PRIVATE screen)
+  target_compile_options(koru-screen PRIVATE ${KORU_WARNINGS} ${KORU_SAN_FLAGS})
+  target_link_options(koru-screen PRIVATE ${KORU_SAN_FLAGS})
+  target_link_libraries(koru-screen PRIVATE SDL3::SDL3)
 endif()
 
 # A window over a terminal fed from stdin: the event pump and the resize path,
@@ -108,17 +119,28 @@ target_compile_definitions(ks_ansi_rand PRIVATE KS_FUZZ_STANDALONE)
 target_compile_options(ks_ansi_rand PRIVATE ${KORU_WARNINGS} ${KORU_SAN_FLAGS})
 target_link_options(ks_ansi_rand PRIVATE ${KORU_SAN_FLAGS})
 
+# The protocol server's oracle, the same shape.
+add_executable(ks_proto_rand
+               screen/screen.cpp screen/ansi.cpp screen/text.cpp screen/proto.cpp
+               screen/tests/fuzz_proto.cpp)
+target_include_directories(ks_proto_rand PRIVATE screen)
+target_compile_definitions(ks_proto_rand PRIVATE KS_FUZZ_STANDALONE)
+target_compile_options(ks_proto_rand PRIVATE ${KORU_WARNINGS} ${KORU_SAN_FLAGS})
+target_link_options(ks_proto_rand PRIVATE ${KORU_SAN_FLAGS})
+
 # The same oracle under libFuzzer's coverage guidance. libFuzzer is clang's and
 # lives in libclang-rt-*-dev, so it is opt-in:
 #   cmake -B build-fuzz -DCMAKE_CXX_COMPILER=clang++ -DKORU_FUZZ=ON
 if(KORU_FUZZ)
-  add_executable(ks_ansi_fuzz
-                 screen/screen.cpp screen/ansi.cpp screen/text.cpp
-                 screen/tests/fuzz_ansi.cpp)
-  target_include_directories(ks_ansi_fuzz PRIVATE screen)
-  target_compile_options(ks_ansi_fuzz PRIVATE ${KORU_WARNINGS} -g
-                         -fsanitize=fuzzer,address,undefined -fno-omit-frame-pointer)
-  target_link_options(ks_ansi_fuzz PRIVATE -fsanitize=fuzzer,address,undefined)
+  foreach(target ansi proto)
+    add_executable(ks_${target}_fuzz
+                   screen/screen.cpp screen/ansi.cpp screen/text.cpp screen/proto.cpp
+                   screen/tests/fuzz_${target}.cpp)
+    target_include_directories(ks_${target}_fuzz PRIVATE screen)
+    target_compile_options(ks_${target}_fuzz PRIVATE ${KORU_WARNINGS} -g
+                           -fsanitize=fuzzer,address,undefined -fno-omit-frame-pointer)
+    target_link_options(ks_${target}_fuzz PRIVATE -fsanitize=fuzzer,address,undefined)
+  endforeach()
 endif()
 
 enable_testing()
@@ -134,3 +156,6 @@ set_tests_properties(screen_model PROPERTIES LABELS screen)
 
 add_test(NAME screen_ansi_rand COMMAND ks_ansi_rand)
 set_tests_properties(screen_ansi_rand PROPERTIES LABELS screen)
+
+add_test(NAME screen_proto_rand COMMAND ks_proto_rand)
+set_tests_properties(screen_proto_rand PROPERTIES LABELS screen)

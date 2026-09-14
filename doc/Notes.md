@@ -3558,6 +3558,116 @@ cells and drives `screen_resize` before `win_resize`. With `KORU_SCREEN_SNAP`
 set it draws one frame, writes a BMP and exits, which is the snapshot the plan
 asks for and how a human looks at a failure.
 
+## The daemon's protocol server
+
+T36 is `screen/proto.cpp`, which performs **no I/O at all**, and
+`screen/ks_daemon.cpp`, which is the socket and the event loop around it. The
+loop does `recv`, `feed`, `flush` and nothing else; every decision about a frame
+is in the pure half, which is why the whole rejection matrix is a unit test with
+no socket, no client and no race.
+
+### E1 splits, and the split is the design
+
+koru's E1 says a bad SQE never fails the ioctl. A byte stream cannot keep all of
+that, and the half it cannot keep is the interesting one:
+
+- A frame that **parses** and is then rejected on content gets an exact errno
+  and the connection carries on. Unknown flag bit, non-zero reserved field,
+  wrong length for a fixed op: `-EINVAL`. An op at or past `KS_OP_MAX`, and
+  `TERM_OPEN`: `-ENOSYS`. A claim somebody else holds: `-EPERM`. An op needing a
+  claim this connection does not hold: `-ENOTTY`. A second parked key read:
+  `-EBUSY`.
+- A frame that **does not parse** has desynchronised the stream with no way to
+  find the next boundary, so the daemon sends one `-EPROTO` and closes. A length
+  below the header, above the cap or not a multiple of eight; a `seq` of 0; a
+  non-zero `res`; a handshake that is not first, or a second one; a version this
+  daemon does not know.
+
+An ioctl has a private snapshot of its argument. A stream does not, and
+pretending otherwise is how a protocol ends up resynchronising on a length it
+has just refused.
+
+### C1 transposed, and the two holes the fuzzer found in it
+
+"Every accepted request frame produces exactly one reply" is what keeps a
+client's `seq` map from leaking a coroutine that never resumes. The fuzz oracle
+asserts it after every `feed`, and it failed on its **first input** — twice, for
+two different reasons:
+
+- **A parked `KEY_READ` is a frame whose reply is owed, not written.** The
+  invariant is `replies + parked == frames`, and the exception is exactly one
+  frame deep, which is also why a second parked read is `-EBUSY` rather than a
+  queue.
+- **A frame rejected at frame level was replying without being counted.** The
+  count is over frames that get a reply, malformed ones included, so the
+  `-EPROTO` path increments it too.
+
+Neither is a bug a test written by hand would have found, because both are
+accounting rather than behaviour: every individual case looked right.
+
+### The blit that races a resize
+
+A blit carries the geometry the client believed. Matching geometry with an
+out-of-range rectangle is a real bug and is `-EINVAL`; differing geometry is
+merely late, so the daemon draws nothing and replies success with `KS_F_STALE`
+and the geometry to repaint against. A client that treated a resize as an error
+would be unusable on a window anyone drags.
+
+A blit's cells must be exactly as many as its own rectangle says, whatever the
+geometry: that check is length arithmetic, not staleness, so it is `-EINVAL`
+even when the frame is stale.
+
+### The claims are the connection's lifetime
+
+Braam's `~FullScreen` restores the scrolling screen when the process record
+goes. Here the saved cells are a member of `Conn`, so the same thing happens
+when the connection does — and that is **stronger than Braam's**, because there
+is no process record to leak: the claim's lifetime is the socket's, and the
+kernel guarantees the socket dies. It holds on `SIGKILL`, on `_exit`, on a
+panic.
+
+The restore puts back what still fits, because the grid may have been resized
+under the claim, and it goes through `screen_touch`, so the renderer knows.
+
+### `-EINTR` is the only negative result with a payload
+
+Braam's kernel cannot invent a reply to a parked key read, so it signals. The
+daemon owns the reply, so it answers with `-EINTR` **and a whole `ks_key`**
+carrying the new geometry; `next_key` resizes from what it already has and the
+signature is unchanged. `ks_err_len` in the ABI header states the rule in one
+place, both mirrors dump it, and the fuzz oracle asserts it on every reply.
+
+### What was shown to fail
+
+Eight perturbations, each applied and reverted, each failing its own tests:
+
+- **The length's lower bound is gone.** Two assertions — and under ASan a
+  `heap-buffer-overflow READ of size 40`, exactly the failure the plan
+  predicted, because `len - sizeof(head)` underflows into a huge payload size.
+  The fuzzer alone does not reach it: with the bound gone, a `len` of 0 makes
+  `feed` loop for ever first, so the probe that demonstrates the overflow is a
+  hand-written frame. Two failure modes, one missing check.
+- **The unknown-flag check is gone.** Two.
+- **The claim check never fires.** Two.
+- **A partial frame is a protocol error.** Six, and only after the framing test
+  was fixed: its three-way split stopped short of the header, so the partial
+  path it was written for was never reached. A split has to cross the header to
+  test "the header is here and the body is not".
+- **The screen is never restored.** Two, and only the claim-lifetime ones.
+- **A stale blit is drawn anyway.** Two.
+- **A second key read parks over the first.** Two.
+- **A resize answers with no payload.** Five — after the test was made to check
+  a payload's size before reading it, because the first version simply crashed,
+  which is a failure but not a diagnosis.
+
+### The event loop's own bug
+
+The first version polled a vector of descriptors and then indexed the client
+list by position — and a client accepted in the same turn is not in that poll
+set. libstdc++'s hardened `operator[]` caught it on the first connection. It
+matches on the descriptor now. The pure half could not have had this bug, which
+is the argument for the split stated as a fact rather than a preference.
+
 ## C++20 userspace binding
 
 The kernel side is **unchanged** — same device, same ioctls, same wire format,
@@ -3778,8 +3888,14 @@ arrive with their tasks.
   `screen/tools/mkfont.py` and authored here. *exists*
 - `screen/tools/ks_show.cpp` — a window over a terminal fed from stdin: the
   event pump, the resize path and the snapshot. *exists*
+- `screen/proto.cpp` — the protocol server, pure: frames in, replies out, no
+  I/O. The claims are a connection's members, so a client that is killed gives
+  the screen back. *exists*
+- `screen/ks_daemon.cpp` — the socket, bind-then-rename, and the event loop
+  that does recv, feed and flush. *exists*
 - `screen/tests/` — Braam's own cell-exact suite, ported, the five pixel
-  oracles, and the parser's fuzz oracle in its two drivers. *exists*
+  oracles, the protocol's rejection matrix, and two fuzz oracles in their two
+  drivers each. *exists*
 - `cpp/include/koru_abi.h` — the C mirror of `koru_abi.rs`, kept in step by
   the T14 conformance diff. *exists*
 - `cpp/include/koru_errno.h` — the C mirror of `error.rs`'s vocabulary and

@@ -22,3 +22,4 @@ u32 test_failures();
 void test_screen();
 void test_ansi();
 void test_render();
+void test_proto();

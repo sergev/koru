@@ -62,6 +62,7 @@ int main()
 {
     test_screen();
     test_ansi();
+    test_proto();
 #ifdef KS_HAVE_SDL
     test_render();
 #endif

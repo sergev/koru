@@ -5,7 +5,7 @@ code in this repository.
 
 ## State of the repository
 
-**T0–T35 are done.** The kernel surface was complete at T29 and grew once more
+**T0–T36 are done.** The kernel surface was complete at T29 and grew once more
 at T30, for `OPEN`'s creation flags. Braam's hello world runs through koru, and
 the ring can wait for a descriptor. The module registers `/dev/koru`, configures
 a ring with `SETUP`, and submits `NOP`, `DELAY_NS`, `CHECKSUM`, `OPEN`, `READ`,
@@ -236,6 +236,17 @@ is absolute now and damage stages a change it does not report. The geometry
 oracle found a real bug on its first run — `win_resize` resized the texture but
 not the window. doc/Notes.md has the four perturbations.
 
+T36 added the daemon: `proto.cpp` is the protocol server and performs **no I/O
+at all**, `ks_daemon.cpp` is the socket and the loop around it, which does
+recv, feed and flush and nothing else. E1 splits here — content is an exact
+errno and the connection carries on, a frame that does not parse is one
+`-EPROTO` and the end — and C1 transposes to "every answered frame gets exactly
+one reply", whose two accounting holes the fuzz oracle found on its first
+input. The claims are members of the connection, so a killed client gives the
+screen back, which is **stronger than Braam's**: there is no process record to
+leak. doc/Notes.md has the eight perturbations, one of which is a
+heap-buffer-overflow under ASan and the plan's own prediction.
+
 T14 made the two userspace ABI mirrors a diff rather than a promise.
 `cpp/include/koru_abi.h` and `cpp/include/koru_errno.h` are the C mirrors,
 shared with `test/`, and an `abi_dump` on each side emits a canonical record
@@ -269,11 +280,12 @@ its fastest gate: no VM, no device, no module.
 - `screen/` — the koru-screen daemon. `ks_abi.h` is the canonical screen
   protocol, mirrored by `rust/runtime/src/ks_abi.rs`; `screen.cpp`, `ansi.cpp`
   and `text.cpp` are the terminal model, Braam's ported; `render.cpp` and
-  `window.cpp` are the renderer and the SDL3 platform; `tests/` is Braam's own
-  suite, the pixel oracles and the parser's fuzz oracle; `tools/` holds the
-  dump, the C11 probe, the font generator and `ks_show`. The daemon has **zero
-  koru dependencies** and builds on the host with no VM. SDL3 is the
-  renderer's alone: without it everything else still builds.
+  `window.cpp` are the renderer and the SDL3 platform; `proto.cpp` is the pure
+  protocol server and `ks_daemon.cpp` the socket around it; `tests/` is Braam's
+  own suite, the pixel oracles, the rejection matrix and the two fuzz oracles;
+  `tools/` holds the dump, the C11 probe, the font generator and `ks_show`.
+  The daemon has **zero koru dependencies** and builds on the host with no VM.
+  SDL3 is the renderer's alone: without it everything else still builds.
 - `scripts/` — the guest-side check and the host-side runner that boots the VM,
   plus the dev kernel's config fragment. It has its own README.
 
