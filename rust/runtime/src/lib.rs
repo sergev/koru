@@ -18,10 +18,13 @@ mod future;
 mod iter;
 mod op;
 mod ops;
+mod opt;
 mod reactor;
 pub mod rt;
 mod slab;
+mod time;
 mod tz;
+mod usage;
 mod vocab;
 
 pub use combinator::{Either, race};
@@ -51,6 +54,9 @@ pub use ops::{
     remove_path, rename_path, seek_fd, sleep_for, stat_fd, stat_of, touch_path, truncate_fd,
     write_all,
 };
+pub use opt::{Opt, OptError, OptParse, Opts, help_asked};
 pub use rt::{at_exit, block_on, install, spawn, stderr, stdin, stdout};
+pub use time::{Civil, TIME_DAYS, TIME_MONTHS, civil, civil_secs};
+pub use usage::{usage_asked, usage_error};
 
 pub use koru_sys::{BufPool, BufSlot, Ring, SetupConfig};

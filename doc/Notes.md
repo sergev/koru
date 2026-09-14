@@ -3176,6 +3176,128 @@ Six perturbations, each applied and reverted.
 The reactor's own change is falsified by reverting it: the three count tests
 double, which is how it was found.
 
+## The program shell
+
+T32 is `opt.rs`, `usage.rs` and `time.rs`: Braam's `proc/opt.h`,
+`proc/usage.h` and `proc/time.h`, which together are what a program does before
+and around the work. Three files, no syscall in two of them, and the only new
+kernel dependency is the one `write_all` the usage helpers make. `Args` was
+already there from T21; it gained `skip`, which is what `OptParse::rest` hands
+back.
+
+### The parser borrows its `Args`, and that is what keeps it allocation-free
+
+Braam's `OptParse` holds `Args` by value because Braam's `Args` is a span: an
+`Opt`'s `value` points into argv and outlives the parser. koru's `Args` owns
+its strings behind an `Rc`, so a parser holding one by value could only lend a
+value for the duration of the `&mut self` borrow — which means a program could
+not keep `-n`'s value past the next `next()`.
+
+`OptParse<'a>` borrows `&'a Args` instead, and every `Opt<'a>` it yields views
+that. The loop reads exactly as Braam's does, the values live as long as the
+command line, and nothing is copied. This is the same answer `File::over`
+reached at T31 from the other direction: Rust says "outlives" with a borrow
+where the C++ header says it in a comment.
+
+### The letter at fault rides in the error, not an out-parameter
+
+Braam's `next(Opt &out)` names the bad letter by filling `out.name` before
+returning `Err`. Rust has no out-parameter, so `next` returns
+`Result<Option<Opt>, OptError>` and `OptError` carries `{name, error}`.
+`From<OptError> for Error` is what keeps `?` working in a program that only
+wants to exit, and `basename`'s "illegal option -- z" still has its letter.
+
+`Option` rather than Braam's `bool`: `Ok(None)` is "the operands begin", which
+is the distinction vocab.rs already settled Rust spells with `Option`.
+
+The name stays `next` even though it is not `Iterator::next` — an iterator has
+no room for the error, and the clippy lint that says so is allowed once, at the
+method.
+
+### A letter is a rune here, not a byte
+
+Braam indexes the word bytewise. In Rust `&w[in_..]` on a byte that is mid-UTF-8
+panics, and argv is attacker-supplied, so the cursor advances by
+`char::len_utf8` and the letter is a `char`. For ASCII — every flag any program
+declares — this is the same parser. For anything else it is a letter the program
+does not take, which is `Err(Invalid)` rather than a panic, and there is a test
+for it that Braam's vectors cannot express.
+
+### Braam's own vectors, plus the two they cannot catch
+
+`opt.rs`'s tests are `test_opt.cpp`'s, rendered string for string by the same
+`scan` helper: `l,R/x`, `n=5/f`, `v,n=12/f`, `!z/x`, `l,!z/x`. That is the done
+test the plan asks for, and porting the rendering rather than the assertions is
+what makes a drift in *any* of the letters, values, order and operands one
+failed comparison.
+
+Two gaps in those vectors showed up while perturbing:
+
+- **Every operand in Braam's vectors is one letter long.** So leaving the bundle
+  offset set after a valued letter took the *next* word — the `in_ = 0` that
+  ends the bundle — changes nothing: the parser resumes one byte into `"f"`,
+  finds nothing there and reports the operands anyway. Two vectors with a
+  four-letter operand were added, and then the perturbation panics.
+- **No vector carries on past an error.** Braam's own comment says the cursor is
+  advanced *before* the unknown-letter check "so a caller that carries on does
+  not loop on the letter", and nothing tested it — `scan` breaks out at the
+  first error. There is now a test that keeps calling `next`, and it asserts the
+  letters come out as `z, q, z` and the operands are reached.
+
+### The usage helpers write raw, and only a program can test them
+
+`usage_asked` is stdout and 0, `usage_error` is stderr and 2. Both go through
+`write_all` on the raw handle rather than the buffered `File`, as Braam's do and
+as `errln` does: the block is one write and nothing follows it.
+
+Which stream a helper wrote to, and what status the program exited with, are
+invisible to a library test: `rt::stdout()` is descriptor 1, and redirecting it
+in-process needs `dup2`, which this crate forbids. So the done test is an
+*example* — `examples/date.rs`, Braam's `src/cmd/date.cpp` ported — and
+`scripts/rust.sh` runs it with the redirections a shell can make. That is the
+same instrument T21 used for hello world, and the reason the examples exist.
+
+### The calendar's oracle is `date(1)`, not itself
+
+`civil` and `civil_secs` are Braam's era arithmetic, ported to `i64` throughout
+where Braam uses `u64`: a Rust subtraction below zero panics, and `civil_secs`
+is *required* to accept a day of 0 (the last of the month before), which is
+where a `u64` would go there. Braam's `test_time.cpp` vectors are ported too.
+
+A round trip proves only that two functions agree with each other, so there are
+two more tests: every six hours from 1900 to 2050 — 219 000 samples, asserting
+the round trip, the field ranges, and that the weekday advances by exactly one
+per day across the whole span — and about 250 dates compared against the host's
+`date -u -f -`, one process for the whole list. The span test alone catches a
+wrong century leap rule; the libc one catches a truncating division that a
+round trip is blind to, because `civil_secs(civil(s))` is still `s` when both
+halves lean the same way.
+
+### What was shown to fail
+
+Eleven perturbations, each applied and reverted.
+
+- **The bare `--` is not consumed.** One opt test.
+- **A valued letter does not end its bundle.** Two, one of them a panic.
+- **A missing argument reports `Invalid` rather than `NotFound`.** One — which
+  is the exact-errno rule this repo has had since T3, at the vocabulary level.
+- **The unknown-letter check comes before the advance.** Three, including the
+  carry-on test written for it.
+- **Every letter is refused.** Seven, which is what says the vectors have teeth
+  at all.
+- **`help_asked` accepts `-h` anywhere on the line.** One.
+- **The seconds-in-day remainder truncates rather than floors.** Three, none of
+  them a Braam vector after the epoch.
+- **The weekday takes a negative remainder.** Three.
+- **The century is a leap year.** Three.
+- **`civil_secs` does not carry January and February back a year.** Five.
+- **`usage_asked` writes to stderr**, and separately **`usage_error` exits 0**.
+  Three and two of the example's checks, in the guest.
+
+And one more against the example itself: **the zone is subtracted rather than
+added**, which fails the local comparison and not the `-u` one — the shape that
+says the two paths are really different.
+
 ## C++20 userspace binding
 
 The kernel side is **unchanged** — same device, same ioctls, same wire format,
@@ -3374,6 +3496,13 @@ arrive with their tasks.
 - `rust/runtime/src/file.rs` — the buffered `File`, the buffering modes, the
   scanners and the standard streams. *exists*
 - `rust/runtime/src/iter.rs` — `Input`, `LineReader` and `TreeWalk`. *exists*
+- `rust/runtime/src/opt.rs` — `Opts`, `Opt`, `OptParse` and `help_asked`, the
+  whole command line and no allocation. *exists*
+- `rust/runtime/src/usage.rs` — the two usage helpers, and the shell's
+  prototype-conformance declarations. *exists*
+- `rust/runtime/src/time.rs` — the calendar and the name tables, pure. *exists*
+- `rust/runtime/examples/date.rs` — Braam's `date`, which is what tests the
+  usage helpers' stream and status. *exists*
 - `rust/runtime/tests/file.rs` — the fast path measured, the sticky error, and
   the three iterators. *exists*
 - `cpp/include/koru_abi.h` — the C mirror of `koru_abi.rs`, kept in step by

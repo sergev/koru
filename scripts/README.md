@@ -153,11 +153,14 @@ order that varies; taking the wrong one runs no tests and exits 0.
 
 After the suites it runs the **examples**, listed in `EXAMPLES` and located the
 same way. They are the runtime entry's only test, because `#[koru::main]`
-replaces `main` and libtest cannot call one. Each runs three ways, and each way
-asserts something different: through a pipe, which koru can only write to after
-re-opening it; redirected to a regular file, which is three writes at three
-offsets; and with an argument, which is `Args`. A filtered run skips them,
-since a filter is a test-name filter, and an unfiltered run with none fails.
+replaces `main` and libtest cannot call one. `hello` runs three ways, and each
+way asserts something different: through a pipe, which koru can only write to
+after re-opening it; redirected to a regular file, which is three writes at
+three offsets; and with an argument, which is `Args`. `date` is T32's usage
+helpers, which no library test can see: a block on stdout and status 0, the
+same block on stderr and status 2, and the calendar against the host's own
+`date(1)` read either side of ours. A filtered run skips the examples, since a
+filter is a test-name filter, and an unfiltered run with none fails.
 
 **A koru program run straight onto the VM console prints nothing.** Its stdout
 is a virtio-serial port, which permits one open, so the runtime cannot re-open

@@ -5,7 +5,7 @@ code in this repository.
 
 ## State of the repository
 
-**T0–T31 are done.** The kernel surface was complete at T29 and grew once more
+**T0–T32 are done.** The kernel surface was complete at T29 and grew once more
 at T30, for `OPEN`'s creation flags. Braam's hello world runs through koru, and
 the ring can wait for a descriptor. The module registers `/dev/koru`, configures
 a ring with `SETUP`, and submits `NOP`, `DELAY_NS`, `CHECKSUM`, `OPEN`, `READ`,
@@ -191,6 +191,19 @@ per op** where the ABI provides one, and T30's `read_chunk` could not return a
 fixed; doc/Notes.md has the six perturbations, one of which passes 27 of 28
 tests.
 
+T32 added the program shell: `opt.rs`, `usage.rs` and `time.rs` — Braam's
+option parser, its two usage helpers and its calendar. No kernel work and one
+syscall in the whole of it. `OptParse` borrows its `Args` rather than holding
+one, because koru's owns its strings and a value must outlive the `next` that
+yielded it; the letter at fault rides in `OptError` where Braam uses an
+out-parameter; and a letter is a rune, not a byte, because argv is
+attacker-supplied and `&w[i..]` mid-sequence panics. Braam's own vectors are
+ported as the done test, and two of them had no teeth: every operand in them is
+one letter long, and none carries on past an error. The usage helpers cannot be
+tested from a library at all — which stream and which status is a program's
+question — so `examples/date.rs` is Braam's `date`, and `scripts/rust.sh` runs
+it with redirections. doc/Notes.md has the eleven perturbations.
+
 T14 made the two userspace ABI mirrors a diff rather than a promise.
 `cpp/include/koru_abi.h` and `cpp/include/koru_errno.h` are the C mirrors,
 shared with `test/`, and an `abi_dump` on each side emits a canonical record
@@ -214,8 +227,8 @@ its fastest gate: no VM, no device, no module.
   by name**: `rust/sys` is `koru-sys`, the raw binding; `rust/runtime` is
   `koru` itself, holding the futures, the executor and the Braam surface
   (`vocab.rs`, `rt.rs`, `ops.rs`, `args.rs`, `filebuf.rs`, `file.rs`, `iter.rs`,
-  and `tz.rs`, which exists only because `clock_now` has no opcode and no std
-  API); `rust/macros` is
+  `opt.rs`, `usage.rs`, `time.rs`, and `tz.rs`, which exists only because
+  `clock_now` has no opcode and no std API); `rust/macros` is
   `koru-macros`, `#[koru::main]` alone. Cargo names the package, so `-p
   koru-sys` and `use koru_sys::` are unaffected by the directory. The examples
   in `rust/runtime/examples/` are programs, so the guest runs them.
@@ -326,7 +339,7 @@ KORU_SEED=12345 scripts/run.sh    # replay a fuzz failure
 # under a second; the integration suite needs /dev/koru, so it runs in a VM.
 (cd rust && cargo fmt --all -- --check)
 (cd rust && cargo test -p koru-sys --lib)      # ABI, ioctl numbers, errnos
-(cd rust && cargo test -p koru --lib)          # cookie, slab, ops, vocab, tz
+(cd rust && cargo test -p koru --lib)          # cookie, slab, opt, time, vocab
 (cd rust && cargo test --workspace --no-run)   # build before the runner
 (cd rust && cargo build --examples)            # the programs the runner runs
 scripts/run-rust.sh                            # kernel, runtime and ops suites

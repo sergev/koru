@@ -49,9 +49,15 @@ impl Args {
 
     /// Everything but the first, sharing the same vector.
     pub fn tail(&self) -> Args {
+        self.skip(1)
+    }
+
+    /// Everything from `n` on, which is what `OptParse::rest` hands back.
+    /// Braam's is a `subspan`; this moves the start index instead.
+    pub fn skip(&self, n: usize) -> Args {
         Args {
             v: Rc::clone(&self.v),
-            start: (self.start + 1).min(self.v.len()),
+            start: self.start.saturating_add(n).min(self.v.len()),
         }
     }
 
@@ -113,5 +119,14 @@ mod tests {
         let a = args().tail().tail().tail().tail();
         assert!(a.is_empty());
         assert_eq!(a.name(), "");
+    }
+
+    #[test]
+    fn skip_is_tail_repeated_and_saturates() {
+        let a = args();
+        assert_eq!(a.skip(0).size(), 3);
+        assert_eq!(a.skip(2).name(), "world");
+        assert!(a.skip(3).is_empty());
+        assert!(a.skip(usize::MAX).is_empty());
     }
 }

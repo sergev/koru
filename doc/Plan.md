@@ -65,21 +65,6 @@ surface is built first and the C++ surface transcribes it, because the design
 will churn and churning it twice is the same mistake this plan avoids for the
 ABI.
 
-## Phase 8 — the Rust surface
-
-### T32 [M] — the program shell, Rust
-
-`Args` with `size`, indexing, `name` and `tail`. `Opts`, `Opt` and `OptParse`
-with its synchronous, allocation-free `next`, plus `help_asked`. `usage_asked`
-and `usage_error` with their fixed exit statuses of 0 and 2. `Civil` and the
-calendar conversions with their month and day name tables.
-
-Done test: `OptParse` against Braam's own option-parsing vectors — clustered
-flags, an attached value, a detached value, a bare separator, a missing
-argument; the calendar conversions round-tripped across a span of dates
-including leap years and the epoch; and the two usage helpers writing to the
-right stream with the right status.
-
 ## Phase 9 — the screen
 
 Braam programs always have a screen: a cell grid with no control characters,

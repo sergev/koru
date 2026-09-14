@@ -96,6 +96,54 @@ example_read_file() {
 	want_eq "read_file through a pipe" "$("$1" $DATA 2>$ERR | cat)" "$(cat $DATA)"
 }
 
+# T32's program shell. The usage helpers are the point: which stream the block
+# goes to and what the status is, neither of which a library test can see. The
+# calendar's oracle is the host's own date(1).
+example_date() {
+	"$1" -h >$OUT 2>$ERR
+	want_eq "date -h status" "$?" "0"
+	want_eq "date -h to stdout" "$(head -1 $OUT)" "Usage:"
+	want_eq "date -h says nothing on stderr" "$(cat $ERR)" ""
+	"$1" --help >$OUT 2>$ERR
+	want_eq "date --help status" "$?" "0"
+	want_eq "date --help to stdout" "$(head -1 $OUT)" "Usage:"
+
+	"$1" -x >$OUT 2>$ERR
+	want_eq "date -x status" "$?" "2"
+	want_eq "date -x to stderr" "$(head -1 $ERR)" "Usage:"
+	want_eq "date -x says nothing on stdout" "$(cat $OUT)" ""
+	"$1" a b >$OUT 2>$ERR
+	want_eq "date with two operands" "$?" "2"
+
+	before=$(date -u '+%a %b %d %H:%M')
+	got=$("$1" -u 2>$ERR)
+	after=$(date -u '+%a %b %d %H:%M')
+	date_agrees "date -u" "$before" "$got" "$after"
+	want_eq "date -u year" "${got##* }" "$(date -u +%Y)"
+	want_eq "date -u zone" "$(echo "$got" | awk '{print $(NF-1)}')" "+0000"
+
+	# The local zone, which is tz.rs reading the file date(1) reads.
+	before=$(date '+%a %b %d %H:%M')
+	loc=$("$1" 2>$ERR)
+	st=$?
+	after=$(date '+%a %b %d %H:%M')
+	want_eq "date status" "$st" "0"
+	date_agrees "date local" "$before" "$loc" "$after"
+	want_eq "date local zone" "$(echo "$loc" | awk '{print $(NF-1)}')" "$(date +%z)"
+}
+
+# Ours to the minute, against the host's read either side of it, so a second
+# boundary cannot make it flake.
+date_agrees() {
+	case "$3" in
+	"$2"* | "$4"*) echo "ok: $1 agrees with the host's" ;;
+	*)
+		echo "MISMATCH $1: got [$3] want [$2]"
+		fail=1
+		;;
+	esac
+}
+
 run_example() {
 	name=$1
 	bin=$2
@@ -109,6 +157,7 @@ run_example() {
 	case $name in
 	hello) example_hello "$bin" ;;
 	read_file) example_read_file "$bin" ;;
+	date) example_date "$bin" ;;
 	*)
 		echo "UNKNOWN EXAMPLE: $name"
 		fail=1

@@ -27,7 +27,7 @@ SUITES=${SUITES:-"koru-sys:kernel:112 koru:runtime:25 koru:ops:17 koru:file:28"}
 
 # The example programs, run in the guest by rust.sh. They are the entry's own
 # test: #[koru::main] replaces main, so libtest cannot call one.
-EXAMPLES=${EXAMPLES:-"hello read_file"}
+EXAMPLES=${EXAMPLES:-"hello read_file date"}
 
 # Race-loop knobs, forwarded into the guest. KORU_ITERS raises a loop's count
 # and KORU_SEED replays one; each test prints the values it used. The full
