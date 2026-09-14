@@ -72,6 +72,7 @@ enum koru_kind { KORU_KIND_TABLE(KORU_KIND_ENUMERATOR) };
     X(EPROTO, 71, Unsupported)     \
     X(EOVERFLOW, 75, Invalid)      \
     X(EOPNOTSUPP, 95, Unsupported) \
+    X(ECONNRESET, 104, Closed)     \
     X(ETIMEDOUT, 110, Io)          \
     X(EALREADY, 114, Again)        \
     X(ECANCELED, 125, Cancelled)

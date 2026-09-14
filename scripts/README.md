@@ -115,9 +115,11 @@ integration tests: one VM boot, one verdict line `KORU-RUST-PASS`, and the same
 insmod, kmemleak, taint and dmesg gates. `check.sh` is untouched, because it
 carries every pass condition for the kernel and is meant to stay small.
 
-Two suites run in that one boot, listed in `SUITES` at the top of
-`run-rust.sh` as `package:target:floor`: `koru-sys`'s `kernel`, which is the
-device matrix, and `koru`'s `runtime`, which is the futures and the executor.
+Five suites run in that one boot, listed in `SUITES` at the top of
+`run-rust.sh` as `package:target:floor`: `koru-sys`'s `kernel`, the device
+matrix, and `koru`'s `runtime`, `ops`, `file` and `screen` — the futures and
+the executor, the operation layer against libc, the buffered `File`, and the
+screen client against a fake daemon over a socketpair.
 
 ```sh
 (cd ../rust && cargo test --workspace --no-run)   # build first, as above

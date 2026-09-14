@@ -25,7 +25,7 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 CPP=$ROOT/build/abi_dump
 KS=$ROOT/build/ks_dump
 # Raise when a surface grows.
-WANT_RECORDS=${WANT_RECORDS:-202}
+WANT_RECORDS=${WANT_RECORDS:-203}
 WANT_KS_RECORDS=${WANT_KS_RECORDS:-177}
 
 while [ $# -gt 0 ]; do

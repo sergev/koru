@@ -27,7 +27,9 @@ mod ops;
 mod opt;
 mod reactor;
 pub mod rt;
+mod screen;
 mod slab;
+mod textbuf;
 mod time;
 mod tz;
 mod usage;
@@ -63,6 +65,12 @@ pub use ops::{
 };
 pub use opt::{Opt, OptError, OptParse, Opts, help_asked};
 pub use rt::{at_exit, block_on, install, spawn, stderr, stdin, stdout};
+pub use screen::{
+    KEY_BACKSPACE, KEY_DELETE, KEY_DOWN, KEY_END, KEY_ENTER, KEY_ESCAPE, KEY_HOME, KEY_INSERT,
+    KEY_LEFT, KEY_NAMED, KEY_PAGE_DOWN, KEY_PAGE_UP, KEY_RIGHT, KEY_TAB, KEY_UP, Key, Keys,
+    MOD_ALT, MOD_CTRL, MOD_META, MOD_SHIFT, Screen, sock_path,
+};
+pub use textbuf::{TextBuf, TextView};
 pub use time::{Civil, TIME_DAYS, TIME_MONTHS, civil, civil_secs};
 pub use usage::{usage_asked, usage_error};
 

@@ -3668,6 +3668,119 @@ set. libstdc++'s hardened `operator[]` caught it on the first connection. It
 matches on the descriptor now. The pure half could not have had this bug, which
 is the argument for the split stated as a fact rather than a preference.
 
+## The screen client, Rust
+
+T37 is `grid.rs`, `textbuf.rs` and `screen.rs`: Braam's `ui/` layer ported, and
+`ProcScreen` over a socket adopted into the ring. The transport is invisible
+above `screen.rs`, which is what makes this a compatible replacement rather
+than a lookalike.
+
+### Where Rust forced a different shape, and why each is honest
+
+**A `Pane` does not hold the grid.** Braam's holds a pointer, so a body pane and
+a status pane write through two aliases of one buffer — exactly what the borrow
+checker refuses. A `Pane` here is the rectangle, the style and the cursor, and
+every write takes the grid: `p.write(g, "x")`. The panes still cannot overlap,
+which was the point of the type.
+
+**The key reader and the painter are handles of their own.** Braam's coroutines
+interleave freely on one `ProcScreen`; Rust will not lend it twice, and a
+full-screen program waits for a key *while* it paints. So `screen.keys()` and
+`screen.painter()` hand out cheap clones that carry only the connection. The
+geometry a key reply reports is recorded there, and the screen takes it up at
+the next `grid`, `root` or `flush` — which is the one thing Braam does eagerly
+and this does lazily.
+
+**The grid is ordinary heap, never an arena slot.** A slot with an op in flight
+belongs to the kernel, so a grid living in one would be unpaintable for the
+length of every blit. The damage is packed into a slot instead: grid to slot,
+slot to the kernel's bounce buffer, bounce to the socket. **This is the first
+place in the project where the central invariant has a measurable price**, and
+every earlier op's was zero. It is bounded — an 80x24 full repaint is 15 KB —
+and it buys the same thing it always did: the kernel never dereferences a
+userspace address.
+
+### The single-writer rule, and what it took to prove
+
+`WRITE` is deferred to a workqueue and koru has no op linking, so two concurrent
+writes on one handle have no order. On a stream socket that braids two frames
+into permanent corruption. The connection holds exactly one write in flight and
+queues senders behind it.
+
+Demonstrating the braid took three attempts, and the first two *passed with the
+serialisation deleted*:
+
+- **Two small blits.** One `WRITE` of a whole frame is atomic on a stream
+  socket — the socket lock is held across the copy — so two concurrent
+  single-shot writes cannot interleave. A 1024-cell blit proves nothing.
+- **Two full repaints.** Better, but the banding loop waits for each band's
+  reply before sending the next, so one painter never has more than one frame
+  in flight and a 208 KiB socket buffer never fills.
+- **Eight painters against a stopped reader.** Now the buffer fills, every
+  writer gets a *short* write, and one frame's bytes are split around
+  another's. With the token deleted the fake's own length check fires
+  immediately: "a frame's length is a multiple of eight".
+
+The rule is real, but it is only reachable when a write goes out in pieces.
+That is worth knowing before someone deletes the token because "writes are
+atomic anyway".
+
+### The backpressure test was measuring the wrong wait
+
+The same discovery, from the other side. The first version stopped the fake's
+reader and asserted a bounded `ENTER` count through one painter — and passed
+with `POLL_ADD` replaced by an immediate retry, because with one band in flight
+the writer was waiting for *replies*, not for room. Eight painters fill the
+socket; then the spin costs 4224 `ENTER`s where the bound is 2240, and the
+polling version costs 268.
+
+A second discovery inside that one: the fake's reader checked its pause flag
+once per *frame*, so it drained the socket for as long as the client kept
+sending. It checks before every read now. A fake daemon is test code, and test
+code that is subtly cooperative is how an oracle stops measuring anything.
+
+### `ECONNRESET` joins the errno table
+
+The table is a closed set, and it was missing one: a `READ` or `WRITE` on a
+socket whose peer has gone returns `-ECONNRESET`, which koru can therefore
+produce. It is `Kind::Closed`, beside `EPIPE` and end of input, so a program
+sees one name for "the far end is gone" however it finds out.
+
+### What was shown to fail
+
+Five perturbations, each applied and reverted, each failing its own tests:
+
+- **The single-writer token never blocks.** The braid, as above.
+- **The damage is sent in one frame.** Three tests: the band exceeds the frame
+  cap and the fake refuses the length.
+- **A full socket is retried rather than polled.** The backpressure bound,
+  alone.
+- **A reply goes to whoever asked first.** The out-of-order test, alone — and
+  note that merely waking *every* waiter changes nothing, because each rechecks
+  its own `seq`. Demultiplexing is the map, not the wake.
+- **A dead connection does not wake its parked callers.** The failure test,
+  alone, and as an assertion rather than a hang because the test waits in a
+  bounded loop.
+
+### The fake daemon is two threads, and the test is asynchronous
+
+Two traps worth recording, because both looked like bugs in the client:
+
+**A blocking receive in the test deadlocks the client.** The runtime is single
+threaded: a test that blocks the thread waiting for a frame stops the task that
+owes it. Every wait in the suite goes through `sleep_for`, which lets the
+executor run.
+
+**A client call sends nothing until it is awaited.** An `async fn` is lazy, so
+"send the request, then wait for the frame" is exactly backwards: the frame
+arrives only once the call is polled. The suite collects frames in a task of
+its own and answers them from another, which is what lets a test await a call
+and inspect the frame it produced.
+
+**And the fake needs a thread for each direction.** One thread that both read
+and wrote blocked in its read while a reply waited behind it in the queue — the
+client waiting for that reply, the fake waiting for a frame, neither moving.
+
 ## C++20 userspace binding
 
 The kernel side is **unchanged** — same device, same ioctls, same wire format,
@@ -3866,6 +3979,15 @@ arrive with their tasks.
 - `rust/runtime/src/file.rs` — the buffered `File`, the buffering modes, the
   scanners and the standard streams. *exists*
 - `rust/runtime/src/iter.rs` — `Input`, `LineReader` and `TreeWalk`. *exists*
+- `rust/runtime/src/grid.rs` — Braam's `Grid` and `Pane`, pure. A pane is the
+  rectangle and the style; the grid is a parameter, because two panes cannot
+  hold one buffer in Rust. *exists*
+- `rust/runtime/src/textbuf.rs` — `TextBuf` and `TextView`, the pager's and the
+  editor's, pure. *exists*
+- `rust/runtime/src/screen.rs` — `ProcScreen` over the socket: the handshake,
+  the pump, the single-writer send path and the banding. *exists*
+- `rust/runtime/tests/screen.rs` — the client against a fake daemon the test
+  speaks itself, over a socketpair, on a real ring. *exists*
 - `rust/runtime/src/opt.rs` — `Opts`, `Opt`, `OptParse` and `help_asked`, the
   whole command line and no allocation. *exists*
 - `rust/runtime/src/usage.rs` — the two usage helpers, and the shell's

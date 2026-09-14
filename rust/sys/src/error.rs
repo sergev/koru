@@ -107,13 +107,15 @@ pub const EPROTO: Errno = Errno(71);
 pub const EOVERFLOW: Errno = Errno(75);
 pub const EOPNOTSUPP: Errno = Errno(95);
 pub const ETIMEDOUT: Errno = Errno(110);
+pub const ECONNRESET: Errno = Errno(104);
 pub const EALREADY: Errno = Errno(114);
 pub const ECANCELED: Errno = Errno(125);
 
 /// Braam's error vocabulary, with Braam's wire values.
 ///
-/// [`Kind::Closed`] reaches a program two ways: `EPIPE`, and end of file,
-/// which is `res == 0` and which T30's `read_chunk` turns into a name.
+/// [`Kind::Closed`] reaches a program three ways: `EPIPE`, `ECONNRESET` from a
+/// socket whose peer has gone, and end of file, which is `res == 0` and which
+/// T30's `read_chunk` turns into a name.
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 #[repr(u8)]
 pub enum Kind {
@@ -363,6 +365,12 @@ pub const KORU_ERRNOS: &[ErrnoDef] = &[
         name: "EOPNOTSUPP",
         kind: Kind::Unsupported,
         produced_by: "the filesystem, propagated verbatim",
+    },
+    ErrnoDef {
+        errno: ECONNRESET,
+        name: "ECONNRESET",
+        kind: Kind::Closed,
+        produced_by: "READ or WRITE on a socket whose peer has gone",
     },
     ErrnoDef {
         errno: ETIMEDOUT,

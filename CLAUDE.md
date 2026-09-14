@@ -5,7 +5,7 @@ code in this repository.
 
 ## State of the repository
 
-**T0–T36 are done.** The kernel surface was complete at T29 and grew once more
+**T0–T37 are done.** The kernel surface was complete at T29 and grew once more
 at T30, for `OPEN`'s creation flags. Braam's hello world runs through koru, and
 the ring can wait for a descriptor. The module registers `/dev/koru`, configures
 a ring with `SETUP`, and submits `NOP`, `DELAY_NS`, `CHECKSUM`, `OPEN`, `READ`,
@@ -247,6 +247,18 @@ screen back, which is **stronger than Braam's**: there is no process record to
 leak. doc/Notes.md has the eight perturbations, one of which is a
 heap-buffer-overflow under ASan and the plan's own prediction.
 
+T37 added the Rust screen client: `grid.rs` and `textbuf.rs` are Braam's `ui/`
+ported, `screen.rs` is `ProcScreen` over a socket adopted into the ring. A
+`Pane` does not hold the grid and the key reader is a handle of its own,
+because Rust will not lend one object twice. **The grid is ordinary heap, never
+an arena slot** — the first place in this project where the kernel-never-holds-
+a-pointer invariant has a measurable price. Proving the single-writer rule took
+three attempts: one `WRITE` of a whole frame is atomic on a socket, so the
+braid only exists when a write goes out in pieces, which takes eight painters
+against a stopped reader. The backpressure test had the same flaw from the
+other side. `ECONNRESET` joined the errno table as `Kind::Closed`. doc/Notes.md
+has the five perturbations and the three traps in the fake daemon.
+
 T14 made the two userspace ABI mirrors a diff rather than a promise.
 `cpp/include/koru_abi.h` and `cpp/include/koru_errno.h` are the C mirrors,
 shared with `test/`, and an `abi_dump` on each side emits a canonical record
@@ -419,7 +431,9 @@ suite comes at T39.
 `rust/sys/tests/kernel.rs`, which is T4–T11 plus the T3 matrices;
 `rust/runtime/tests/runtime.rs`, which is the futures and the executor; and
 `rust/runtime/tests/ops.rs`, which is Braam's prototypes and the operation layer
-against libc. None supersedes `koru_check`, which keeps the fuzz, the two
+against libc; `rust/runtime/tests/file.rs`, the buffered `File`; and
+`rust/runtime/tests/screen.rs`, the screen client against a fake daemon over a
+socketpair. None supersedes `koru_check`, which keeps the fuzz, the two
 `rmmod` races and the heavy-phase leak window. Two gates exist because `#[test]`
 can pass without
 proving anything: a filter matching nothing exits 0, so `rust.sh` asserts a

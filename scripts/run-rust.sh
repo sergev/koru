@@ -23,7 +23,7 @@ TIMEOUT=${TIMEOUT:-600}
 # package:test-target:minimum-passed, one per suite. The floor is per suite on
 # purpose: a single total would let one crate's growth mask a filter typo that
 # ran none of another's. Raise a floor when a test is added.
-SUITES=${SUITES:-"koru-sys:kernel:112 koru:runtime:25 koru:ops:17 koru:file:28"}
+SUITES=${SUITES:-"koru-sys:kernel:112 koru:runtime:25 koru:ops:17 koru:file:28 koru:screen:7"}
 
 # The example programs, run in the guest by rust.sh. They are the entry's own
 # test: #[koru::main] replaces main, so libtest cannot call one.

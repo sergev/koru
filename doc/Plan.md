@@ -112,52 +112,6 @@ restarted daemon, which a full-screen program would never notice, because the
 resize path already marks the whole grid damaged. Add them here as tasks when
 one of them is actually wanted.
 
-### T37 [R] — the screen client, Rust
-
-`ProcScreen`'s six methods unchanged over the ported pure library: `Grid`,
-`Pane`, `TextBuf`, `TextView`, plus `pack_blit`, which is pure and therefore
-testable with no socket. A synchronous POSIX preamble, then a pump coroutine
-reading into its own slot and demultiplexing by `seq`, a single-writer send
-path, and the banding loop. Stdout is the byte channel's handle.
-
-The grid is ordinary heap and **cannot** be an arena slot: a slot with an op in
-flight is exclusively owned by the kernel, so a grid living in one would be
-unpaintable for the duration of every blit. Pack the damage straight into a
-slot instead. Be honest in Notes about the cost — grid to slot, slot to kernel
-bounce, bounce to socket — where a plain `write(2)` would skip the first two.
-**This is the first place in the project where the central invariant has a
-measurable price**, and every earlier op's price was zero. It is bounded: an
-80x24 full repaint is 15 KB.
-
-A maximum blit does not fit a slot — 512x256 cells is exactly 1 MiB and the
-headers push it over — so `flush` bands the damage into as many frames as fit.
-Do not raise the cap: banding is provably unstuck, because a maximum-width row
-is 4096 bytes and `slot_size` is a multiple of `PAGE_SIZE`, so a row always
-fits a page.
-
-**The ordering hazard is the most likely bug here.** `WRITE` is deferred to a
-workqueue and koru has no op-linking, so two concurrent writes on one handle
-have no ordering, which on a stream socket braids two frames into permanent
-corruption. The connection enforces exactly one write in flight and queues
-senders behind it. That is a userspace serialisation the ABI does not provide
-and should not.
-
-Done test: against a fake daemon the test itself speaks, over a `socketpair`,
-one end `ADOPT_FD`'d by the real client on a real ring in the VM. Out-of-order
-replies: park a key read, blit, answer the blit first, and `flush()` must
-return while the key read is still parked. The single-writer rule: two
-coroutines blitting concurrently produce two whole frames in some order and
-never interleaved bytes — delete the serialisation and the test must see a
-frame whose `op` is not a known opcode. Banding: a full 512x256 repaint with a
-64 KiB slot produces frames whose rectangles tile the damage exactly once, no
-cell twice and none missed. Backpressure: the fake daemon stops reading until
-the socket buffer fills, and the client must make progress through `POLL_ADD`
-rather than spin, asserted as a bounded `ENTER` count — which is also the first
-exercise of T22's softirq wake path on a socket rather than a FIFO. Failure:
-close the fake end mid-frame; every parked `seq` completes `-ECONNRESET`, every
-later call returns it without touching the wire, and nothing hangs, so arm the
-alarm and keep stdout line-buffered.
-
 ### T38 [M] — auto-spawn, lifecycle and the end-to-end run
 
 Socket path from `KORU_SCREEN_SOCK`, else under `XDG_RUNTIME_DIR`, refusing a
