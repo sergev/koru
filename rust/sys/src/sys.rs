@@ -83,6 +83,10 @@ unsafe extern "C" {
 
     /// `mode_t umask(mode_t mask);` — `MKDIR`'s mode passes through it.
     pub fn umask(mask: ModeT) -> ModeT;
+
+    /// `int flock(int fd, int operation);` — what decides which of twenty
+    /// clients starts the screen daemon. There is no std API for it.
+    pub fn flock(fd: c_int, operation: c_int) -> c_int;
 }
 
 pub const PROT_READ: c_int = 0x1;
@@ -91,6 +95,10 @@ pub const MAP_SHARED: c_int = 0x01;
 pub const MAP_PRIVATE: c_int = 0x02;
 pub const MAP_FAILED: *mut c_void = usize::MAX as *mut c_void;
 pub const MADV_DOFORK: c_int = 11;
+
+pub const LOCK_EX: c_int = 2;
+pub const LOCK_UN: c_int = 8;
+pub const LOCK_NB: c_int = 4;
 
 pub const SIGINT: c_int = 2;
 pub const SIGKILL: c_int = 9;
@@ -184,6 +192,32 @@ pub unsafe fn ioctl_raw(fd: BorrowedFd<'_>, request: u32, arg: *mut c_void) -> i
         Err(io::Error::last_os_error())
     } else {
         Ok(r)
+    }
+}
+
+/// This process's effective user. Safe: it takes nothing and cannot fail.
+pub fn euid() -> u32 {
+    // SAFETY: no arguments, no pointers, no failure mode.
+    unsafe { geteuid() }
+}
+
+/// An exclusive, non-blocking `flock`. `Ok(false)` is "somebody else holds
+/// it", which is not an error: that is how the screen client learns it is not
+/// the one that starts the daemon.
+///
+/// Safe: the only argument is a descriptor the caller already holds.
+pub fn flock_try(fd: BorrowedFd<'_>) -> io::Result<bool> {
+    // SAFETY: `fd` is live for the call and takes no pointer.
+    let r = unsafe { flock(fd.as_raw_fd(), LOCK_EX | LOCK_NB) };
+    if r == 0 {
+        return Ok(true);
+    }
+    let e = io::Error::last_os_error();
+    // EWOULDBLOCK is EAGAIN, which is what a held lock answers.
+    if e.raw_os_error() == Some(11) {
+        Ok(false)
+    } else {
+        Err(e)
     }
 }
 

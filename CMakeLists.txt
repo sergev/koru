@@ -98,6 +98,13 @@ if(SDL3_FOUND)
   target_link_libraries(koru-screen PRIVATE SDL3::SDL3)
 endif()
 
+# Reads one of SDL's snapshots, so a shell script can assert about pixels.
+# No SDL: it parses the BMP itself, which is what lets it run where the window
+# is long gone.
+add_executable(ks_pixel screen/tools/ks_pixel.cpp)
+target_compile_options(ks_pixel PRIVATE ${KORU_WARNINGS} ${KORU_SAN_FLAGS})
+target_link_options(ks_pixel PRIVATE ${KORU_SAN_FLAGS})
+
 # A window over a terminal fed from stdin: the event pump and the resize path,
 # and how a human looks at the renderer.
 if(SDL3_FOUND)

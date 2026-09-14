@@ -10,6 +10,7 @@
 //   koru-screen                       the socket under $XDG_RUNTIME_DIR
 //   KORU_SCREEN_SOCK=/tmp/s koru-screen
 //   KORU_SCREEN_ONCE=1 koru-screen    serve one connection and exit, for tests
+//   KORU_SCREEN_SNAP=/tmp/x.bmp       write every frame there, for tests
 
 #include "proto.h"
 #include "window.h"
@@ -68,7 +69,11 @@ int listen_on(const std::string &path)
     mode_t was = umask(0077); // the socket is the user's own
     int rc     = bind(fd, reinterpret_cast<sockaddr *>(&a), sizeof(a));
     umask(was);
-    if (rc < 0 || listen(fd, 8) < 0) {
+    // A deep backlog: one window is shared by every koru program in the
+    // session, and twenty starting at once is the case T38 tests. A short
+    // queue answers the overflow with ECONNREFUSED, which a client cannot tell
+    // from a dead daemon.
+    if (rc < 0 || listen(fd, 128) < 0) {
         close(fd);
         unlink(tmp.c_str());
         return -1;
@@ -218,8 +223,13 @@ int main()
         }
 
         // One present per turn of the loop, and only what changed is drawn.
-        if (screen_damage(*t).w)
+        if (screen_damage(*t).w) {
             win_present(w, *t);
+            // The window is the only record of what a client painted, and a
+            // test has none: with this set, every frame is also a file.
+            if (const char *snap = getenv("KORU_SCREEN_SNAP"))
+                win_snapshot(w, snap);
+        }
         for (Client &c : clients)
             flush_out(c);
 

@@ -3781,6 +3781,107 @@ and inspect the frame it produced.
 and wrote blocked in its read while a reply waited behind it in the queue — the
 client waiting for that reply, the fake waiting for a frame, neither moving.
 
+## Auto-spawn, the lifecycle, and `less`
+
+T38 is the half of the screen that is not a protocol: where the socket lives,
+who starts the daemon, what happens when either end dies — and Braam's pager
+running on it. `scripts/run-e2e.sh` is the gate, and it needs all three things
+the other gates do not: the module, SDL's offscreen driver, and a runtime
+directory.
+
+### The spawn race is settled by a lock, and the lock is really about unlinking
+
+Connect; if nothing answers, take an exclusive `flock` on a file beside the
+socket; **connect again**, because the winner may have finished while we
+waited; only then unlink a socket nothing is listening on and spawn.
+
+The second connect is what keeps nineteen of twenty clients from starting
+nineteen daemons, and the plan's own falsification is exact: delete the lock
+and twenty clients produce **twenty daemons**.
+
+The rule the lock exists for is the unlink. A client that decided on its own
+that a socket was stale would remove a live daemon's socket the moment its
+first connect failed for any other reason — and the reason it fails is usually
+not death.
+
+### A refusal is not proof of death
+
+Twenty clients at once against a daemon whose `listen` backlog was 8 overflowed
+it, and an AF_UNIX socket with a full accept queue answers `ECONNREFUSED` —
+which is what a *dead* daemon answers too. Four of twenty clients concluded the
+socket was stale.
+
+Two changes: the backlog is 128, because one window is shared by every koru
+program in the session, and a refusal is retried for a fifth of a second before
+it counts as death. The retry is defensive now rather than load-bearing: with a
+128-deep backlog, twenty clients never reach it, and deleting it passes the
+suite. Recorded as a gap rather than pretended otherwise.
+
+### A stale socket is cleared three times over
+
+Deleting the client's unlink changes nothing, because the daemon binds a
+temporary name and renames it into place, and `rename` replaces whatever was
+there. Deleting the rename too changes nothing, because the daemon unlinks its
+temporary name first — and with the temporary name gone, that unlink clears the
+path itself. Only with all three broken does a stale socket stop a client, and
+then the case fails exactly as it should.
+
+This is T34's lesson again, and the third time this project has met it: **a
+rule guarded three times is falsifiable only by breaking all three guards.**
+The redundancy is real and worth keeping; what is not worth believing is a test
+that "passes" because two of the three still work.
+
+### What dying means at each end
+
+**The daemon dies.** Every parked caller in the client is completed, every
+later call answers from the connection without touching the wire, and the
+program leaves with a non-zero status rather than hanging. That is T37's sticky
+error, and the end-to-end check is that a client holding the screen through a
+`SIGKILL` exits 2 and says "closed".
+
+**A client dies.** The claims are members of its connection, so the kernel
+closing the socket is what gives the screen back — no timeout, no reaper, no
+process record. The next client is served, and the daemon logs nothing.
+
+### `less` paints, and the assertion is in pixels
+
+Braam's pager is 174 lines and names no socket, no daemon, no protocol and no
+window: `take_keys`, `take_screen`, panes, `flush`, `next_key`. The port is the
+same shape, with Rust's spellings and one addition — with no daemon and none to
+start, `Screen::connect` fails and `less` is `cat`, which is what Braam's
+`tty_of` decides.
+
+"It ran" and "it drew the right thing" stay two claims. The daemon writes every
+frame to a BMP when `KORU_SCREEN_SNAP` is set, and `ks_pixel` answers questions
+about a rectangle of it: the status line's modal colour must be the palette's
+cyan — which `less` paints and nothing else in the run does — and the first
+body row must have ink on it.
+
+### The byte channel is not built
+
+Phase 9's design has two connections per client: this framed protocol, and a
+raw ANSI byte stream that *is* stdout, so a non-painting program prints into
+the scrolling screen. None of T38's done tests need it, and it is not here: a
+koru program's stdout is still whatever it was started with. The protocol has
+room for it — a flag on `HELLO` names the connection's kind — and Plan.md
+carries it as a task.
+
+### What was shown to fail
+
+- **The spawn is not locked.** Twenty daemons, and three later cases fail with
+  them.
+- **Nothing clears a stale socket** — all three of the client's unlink, the
+  daemon's rename and the daemon's unlink deleted. The stale case fails and no
+  daemon starts. Each one alone passes.
+- **A refusal is proof of death.** Passes, for the reason above.
+
+And two harness bugs worth the same treatment, because both looked like
+product bugs first: `pgrep -f koru-screen` counted the shell whose environment
+carried the daemon's path, so every daemon count was one too many; and twenty
+clients appending to one file braided their lines, so the connected count came
+out short. The first was fixed with an exact match on the command line, the
+second with a file per client — **the single-writer rule, in the test harness.**
+
 ## C++20 userspace binding
 
 The kernel side is **unchanged** — same device, same ioctls, same wire format,
@@ -3988,6 +4089,13 @@ arrive with their tasks.
   the pump, the single-writer send path and the banding. *exists*
 - `rust/runtime/tests/screen.rs` — the client against a fake daemon the test
   speaks itself, over a socketpair, on a real ring. *exists*
+- `rust/runtime/examples/less.rs` — Braam's pager, Phase 9's deliverable, which
+  names no socket and no daemon. *exists*
+- `rust/runtime/examples/screen_probe.rs` — the lifecycle checks' client: it
+  connects, holds, or waits for a key, and can be killed at any of them.
+  *exists*
+- `screen/tools/ks_pixel.cpp` — reads one of SDL's snapshots so a shell script
+  can assert about pixels. *exists*
 - `rust/runtime/src/opt.rs` — `Opts`, `Opt`, `OptParse` and `help_asked`, the
   whole command line and no allocation. *exists*
 - `rust/runtime/src/usage.rs` — the two usage helpers, and the shell's

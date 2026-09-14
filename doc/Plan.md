@@ -112,38 +112,30 @@ restarted daemon, which a full-screen program would never notice, because the
 resize path already marks the whole grid damaged. Add them here as tasks when
 one of them is actually wanted.
 
-### T38 [M] — auto-spawn, lifecycle and the end-to-end run
+### T38b [M] — the byte channel
 
-Socket path from `KORU_SCREEN_SOCK`, else under `XDG_RUNTIME_DIR`, refusing a
-directory that is not ours and not `0700`. Spawn guarded by an exclusive
-`flock` beside the socket: connect, take the lock, connect again in case the
-winner finished while we waited, and **only the lock holder may unlink** a
-socket whose daemon is dead — which is what the lock is really for. The daemon
-binds a temporary name and renames it into place, so a half-initialised socket
-is never connectable. It persists after its last client: a window that vanishes
-between two commands is not a terminal.
+Phase 9's design has two connections per client: the framed protocol, and a raw
+ANSI byte stream whose far end is the daemon's parser, which **is** stdout — so
+`write_all` stays a plain `WRITE` to an adopted handle with no framing in the
+way, and the non-painting programs print into the scrolling screen. T38 built
+everything else and left this; the protocol has room for it, and nothing else
+in Phase 9 needed it.
 
-Claims are released on socket EOF, which is **better than Braam's**, because
-there is no process record to leak — the claim's lifetime is the socket's and
-the kernel guarantees the socket dies. It holds on `SIGKILL`, on `_exit`, on a
-panic. That is the strongest argument for a connected stream socket.
+A flag on `KS_OP_HELLO` names the connection's kind, so one listening socket
+still serves both: a client connects twice, says which is which, and the daemon
+feeds one into `screen_write` and answers nothing on it. The runtime adopts it
+as stdout in `install`, where the standard streams are already re-opened and
+adopted — which is the part that needs care, because that happens before any
+program has asked for a screen.
 
-Then the deliverable: Braam's `less`, 174 lines, compiled against koru with the
-include line as the only change.
-
-Done test: the spawn race, twenty processes started at once against no daemon —
-exactly one daemon exists afterwards, counted by both the listening inode and
-the process table, and all twenty connect; delete the `flock` and more than one
-must appear. A stale socket is unlinked and replaced, and a *live* daemon's
-socket is never unlinked, asserted by racing twenty clients against a running
-daemon and checking its pid is unchanged. Daemon death: `SIGKILL` it while a
-client holds the screen, and the client's next call returns `-ECONNRESET` and
-the program exits non-zero rather than hanging. Client death: `SIGKILL` a
-client mid-blit, and the daemon restores the saved screen, serves the next
-client, and logs no protocol error. Then `less` itself in the VM under the
-offscreen driver, painting a fixture file, taking `j`, `G` and `q`, and exiting
-— with T35's isolation and damage oracles asserting the painted result, so that
-"it ran" and "it drew the right thing" stay two separate claims.
+Done test: `hello` and `date` under the daemon put their output on the
+scrolling screen rather than on the terminal koru was started from, asserted
+with T35's ink oracle through a snapshot; a program whose stdout is redirected
+to a file is unaffected, which is the case that says the adoption is conditional
+rather than unconditional; and `less`'s `cat` path still writes to the file it
+was given. Then the ordering rule: a program that paints *and* prints must see
+its bytes appear in the scrolling screen it was writing to, not braided into a
+blit — which is T37's single-writer rule again, one connection over.
 
 ## Phase 10 — the C++ binding
 

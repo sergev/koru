@@ -203,6 +203,33 @@ The verdict is `KORU-SCREEN-PASS`, and it gates on more than the exit status:
 the suite's own "OK: 0 failure(s)" line and its section banners must appear, or
 a binary that ran nothing would pass.
 
+## The screen end to end
+
+`scripts/run-e2e.sh` boots the VM and runs `scripts/e2e.sh` in it: the spawn
+race, the lifecycle at both ends, and Braam's `less` painting a real window
+under SDL's offscreen driver. It is the only gate that needs all three of the
+module, SDL and a runtime directory, which is why it is its own.
+
+```sh
+cmake -B build && cmake --build build      # the daemon and ks_pixel
+(cd rust && cargo build --examples)        # less and screen_probe
+scripts/run-e2e.sh
+```
+
+The verdict is `KORU-E2E-PASS`. What it asserts, in order: twenty clients
+racing from nothing produce exactly one daemon and all twenty connect; twenty
+more against a live daemon leave its pid alone; a socket whose daemon was
+killed is replaced; a client whose daemon is killed exits non-zero saying the
+connection is closed; a client killed mid-blit gives the screen back and the
+next one is served; and `less` paints a status line whose modal colour is the
+palette's cyan, which is a pixel assertion rather than "it ran".
+
+Two rules the counting depends on, both learned the hard way. The daemon is
+counted by an **exact** command line, because this script's own environment
+carries the daemon's path and `pgrep -f` would match the shell. And each client
+writes to a **file of its own**, because twenty processes appending to one file
+braid their lines.
+
 ## The ABI conformance diff
 
 `scripts/abi.sh` compares two pairs of mirrors, C and Rust, by diffing a

@@ -419,15 +419,13 @@ pub struct Screen {
 }
 
 impl Screen {
-    /// Connects to the daemon and shakes hands. The connect is an ordinary
-    /// POSIX call — the bounded preamble the plan allows — and everything from
-    /// the `ADOPT_FD` on is koru.
+    /// Connects to the daemon, starting one if there is none, and shakes
+    /// hands.
+    ///
+    /// Everything up to the `ADOPT_FD` is ordinary POSIX — the bounded
+    /// preamble the plan allows, and where the spawn race has to live anyway.
     pub async fn connect() -> Result<Screen> {
-        let path = sock_path();
-        let sock = std::os::unix::net::UnixStream::connect(&path)?;
-        // koru admits a non-regular file only when it was opened non-blocking,
-        // and it never sets that bit on a descriptor it did not open.
-        sock.set_nonblocking(true)?;
+        let sock = connect_or_spawn(&sock_path())?;
         Screen::own(sock).await
     }
 
@@ -615,6 +613,132 @@ impl Screen {
         }
         Ok(())
     }
+}
+
+/// Connects, and starts a daemon if nothing answers.
+///
+/// The race is settled by an exclusive `flock` on a file beside the socket:
+///
+///   1. try to connect — the ordinary case, with a daemon already running;
+///   2. take the lock, waiting for whoever holds it;
+///   3. **try to connect again**, because the winner may have finished while
+///      we waited;
+///   4. only then, unlink a socket nothing is listening on and spawn.
+///
+/// Step 4 is what the lock is really for: **only the lock holder may unlink**.
+/// Without that rule, twenty clients racing a *live* daemon would each decide
+/// its socket was stale and remove it.
+fn connect_or_spawn(path: &str) -> Result<std::os::unix::net::UnixStream> {
+    if let Some(s) = try_connect(path) {
+        return ready_socket(s);
+    }
+
+    let lock = lock_file(path)?;
+    // Waiting for the lock is the whole of the queue: whoever holds it is
+    // either spawning or about to give up.
+    for _ in 0..2000 {
+        match koru_sys::sys::flock_try(std::os::fd::AsFd::as_fd(&lock)) {
+            Ok(true) => break,
+            Ok(false) => std::thread::sleep(std::time::Duration::from_millis(5)),
+            Err(e) => return Err(e.into()),
+        }
+    }
+
+    if let Some(s) = try_connect(path) {
+        return ready_socket(s); // the winner got there while we waited
+    }
+
+    // Nothing is listening. A socket that is still there is stale, and this
+    // process holds the lock, so it is the one allowed to say so.
+    let _ = std::fs::remove_file(path);
+    spawn_daemon(path)?;
+
+    // The daemon binds a temporary name and renames it into place, so a socket
+    // that exists is one that answers; there is nothing to do but wait for it.
+    for _ in 0..2000 {
+        if let Some(s) = try_connect(path) {
+            return ready_socket(s);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    Err(Error::from_errno(koru_sys::error::ETIMEDOUT))
+}
+
+/// One connect, retried briefly on a refusal.
+///
+/// **A refusal is not proof of a dead daemon.** A listening socket whose accept
+/// queue is full answers `ECONNREFUSED` too, and twenty clients starting at
+/// once are exactly that case: without this, some of them would decide a live
+/// daemon's socket was stale.
+fn try_connect(path: &str) -> Option<std::os::unix::net::UnixStream> {
+    for _ in 0..40 {
+        match std::os::unix::net::UnixStream::connect(path) {
+            Ok(s) => return Some(s),
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Err(_) => return None, // no socket at all: nothing to wait for
+        }
+    }
+    None
+}
+
+/// koru admits a non-regular file only when it was opened non-blocking, and it
+/// never sets that bit on a descriptor it did not open.
+fn ready_socket(s: std::os::unix::net::UnixStream) -> Result<std::os::unix::net::UnixStream> {
+    s.set_nonblocking(true)?;
+    Ok(s)
+}
+
+/// The lock file beside the socket. Its directory is checked here: a runtime
+/// directory that is not ours, or that anyone may write to, is not somewhere
+/// to put a socket other programs will trust.
+fn lock_file(path: &str) -> Result<std::fs::File> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+
+    let dir = std::path::Path::new(path)
+        .parent()
+        .ok_or_else(|| Error::from_errno(EINVAL))?;
+    let meta = std::fs::metadata(dir)?;
+    if !meta.is_dir() {
+        return Err(Error::from_errno(koru_sys::error::ENOTDIR));
+    }
+    // `/tmp` is the fallback and is 1777, so the check is on the *socket's*
+    // owner rather than the directory's mode there; under $XDG_RUNTIME_DIR it
+    // is both.
+    if meta.uid() != users_own_uid() {
+        return Err(Error::from_errno(koru_sys::error::EPERM));
+    }
+    if dir != std::path::Path::new("/tmp") && meta.permissions().mode() & 0o077 != 0 {
+        return Err(Error::from_errno(koru_sys::error::EPERM));
+    }
+
+    let lock = format!("{path}.lock");
+    Ok(std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(lock)?)
+}
+
+fn users_own_uid() -> u32 {
+    // SAFETY-free: `geteuid` takes nothing and cannot fail. koru-sys owns the
+    // declaration, because this crate forbids `unsafe`.
+    koru_sys::sys::euid()
+}
+
+/// Starts the daemon, detached: it outlives the client that started it, and a
+/// window that vanished between two commands would not be a terminal.
+fn spawn_daemon(path: &str) -> Result<()> {
+    let bin = std::env::var("KORU_SCREEN_BIN").unwrap_or_else(|_| "koru-screen".to_string());
+    std::process::Command::new(bin)
+        .env("KORU_SCREEN_SOCK", path)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .spawn()?;
+    Ok(())
 }
 
 /// Where the daemon's socket is. `$KORU_SCREEN_SOCK` names one outright;

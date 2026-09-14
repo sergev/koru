@@ -5,8 +5,9 @@ code in this repository.
 
 ## State of the repository
 
-**T0–T37 are done.** The kernel surface was complete at T29 and grew once more
-at T30, for `OPEN`'s creation flags. Braam's hello world runs through koru, and
+**T0–T38 are done**, except the byte channel, which is T38b. The kernel
+surface was complete at T29 and grew once more at T30, for `OPEN`'s creation
+flags. Braam's hello world runs through koru, and
 the ring can wait for a descriptor. The module registers `/dev/koru`, configures
 a ring with `SETUP`, and submits `NOP`, `DELAY_NS`, `CHECKSUM`, `OPEN`, `READ`,
 `WRITE`, `CLOSE`, `CANCEL`, `ADOPT_FD`, `POLL_ADD`, `STAT`, `TRUNCATE`,
@@ -258,6 +259,17 @@ braid only exists when a write goes out in pieces, which takes eight painters
 against a stopped reader. The backpressure test had the same flaw from the
 other side. `ECONNRESET` joined the errno table as `Kind::Closed`. doc/Notes.md
 has the five perturbations and the three traps in the fake daemon.
+
+T38 finished Phase 9: auto-spawn behind an exclusive `flock`, the lifecycle at
+both ends, and Braam's `less` painting a real window. Delete the lock and
+twenty clients make twenty daemons, which is the plan's own prediction. Two
+findings: a full `listen` backlog answers `ECONNREFUSED` exactly as a dead
+daemon does, so the backlog is 128 and a refusal is retried before it counts as
+death; and a stale socket is cleared three times over, so the case only fails
+when all three are broken. `scripts/run-e2e.sh` is the gate, and the `less`
+assertion is in pixels: the status line's modal colour is the palette's cyan.
+**The byte channel is not built** — a koru program's stdout is still whatever
+it was started with — and Plan.md carries it as T38b.
 
 T14 made the two userspace ABI mirrors a diff rather than a promise.
 `cpp/include/koru_abi.h` and `cpp/include/koru_errno.h` are the C mirrors,
