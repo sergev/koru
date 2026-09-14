@@ -67,50 +67,21 @@ ABI.
 
 ## Phase 9 — the screen
 
-Braam programs always have a screen: a cell grid with no control characters,
-where `^C` is `'c'` with `MOD_CTRL` and colours are struct fields. Braam's
-kernel owns the terminal; koru has no kernel terminal, so a daemon does.
+Built, except the byte channel below. `koru-screen` is a daemon owning an SDL3
+window and a full terminal emulator; clients reach it over a Unix socket they
+`ADOPT_FD` into the ring, so every blit and every key travels through `WRITE`,
+`READ` and `POLL_ADD`, and no kernel opcode was added. `ProcScreen` keeps its
+six methods and the transport is invisible above it. doc/Notes.md has the
+design and what each task taught.
 
-`koru-screen` owns an SDL3 window and is a full terminal emulator — the
-alternate grid, a scrolling screen, an ANSI parser, scrollback and scrolling
-regions. Clients reach it over a Unix socket they `ADOPT_FD` into the ring, so
-every blit and every key travels through `WRITE`, `READ` and `POLL_ADD`. **No
-new kernel opcodes.** The runtime spawns the daemon on first use if it is not
-already there, and one window is shared by every koru program in the session.
-
-The program-visible API does not change: `ProcScreen` keeps its six methods,
-and `Grid`, `Pane`, `TextBuf` and `TextView` are pure library that ports
-directly. The transport is invisible above `proc/screen.h`, which is what makes
-this a compatible replacement rather than a lookalike.
-
-Two connections per client, not one. **Control** carries the framed protocol;
-**bytes** is a raw ANSI stream whose far end is the parser, and it is what
-stdout is — so `write_all` stays a plain `WRITE` to an adopted handle with no
-framing in the way, and the non-painting programs print into the scrolling
-screen. The byte channel is deliberately pty-shaped: swapping it for a real pty
-slave later is invisible to the client. A pty *now* would force keys back into
-bytes through a line discipline, which is the premise the cell model exists to
-reject, and would drag in the job control this plan puts out of scope.
-
-The rule that keeps the client tidy: **the handshake is synchronous POSIX,
-everything after it is koru.** That confines ordinary syscalls to a bounded
-preamble, which is where the auto-spawn retry loop has to live anyway.
-
-Placement. The client needs `POLL_ADD`, because the socket is non-blocking and
-a read with no data gives `-EAGAIN`; it needs T30's operation layer, because
-the deliverable is `less` and `less` reads a file. The daemon tasks have **zero
-koru dependencies** and build and test on the host with no VM, so they can be
-started at any time in parallel — the linear numbering does not forbid it.
-
-Three extensions are deliberately deferred past this list, and the design above
-is shaped so each is additive rather than a rewrite. **Multiplexing** — several
-clients, foreground switching, and `attach` to a second window — is what the
-reserved `seq = 0` and the reserved `KS_OP_TERM_OPEN` leave room for. **A real
-pty** replacing the byte channel, which the client cannot distinguish, and
-which is what would let a shell run in the window. **Reconnecting** to a
-restarted daemon, which a full-screen program would never notice, because the
-resize path already marks the whole grid damaged. Add them here as tasks when
-one of them is actually wanted.
+Three extensions stay deferred, and the design is shaped so each is additive
+rather than a rewrite. **Multiplexing** — several clients, foreground
+switching, and `attach` to a second window — is what the reserved `seq = 0` and
+the reserved `KS_OP_TERM_OPEN` leave room for. **A real pty** replacing the
+byte channel, which the client cannot distinguish, and which is what would let
+a shell run in the window. **Reconnecting** to a restarted daemon, which a
+full-screen program would never notice, because the resize path already marks
+the whole grid damaged. Add them here as tasks when one of them is wanted.
 
 ### T38b [M] — the byte channel
 
