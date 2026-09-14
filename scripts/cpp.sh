@@ -14,7 +14,7 @@
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 KO=${KO:-$ROOT/kernel/koru.ko}
 CHECKBIN=${CHECKBIN:-$ROOT/build/koru_cpp_check}
-FLOOR=${FLOOR:-62}
+FLOOR=${FLOOR:-67}
 FILTERS="$*"
 
 fail=0
@@ -27,7 +27,7 @@ mount -t debugfs none /sys/kernel/debug 2>/dev/null
 fence "environment"
 if [ ! -x "$CHECKBIN" ]; then
 	echo "NOT BUILT: $CHECKBIN"
-	echo "run: cmake -B build && cmake --build build"
+	echo "run: scripts/run-cpp.sh, which builds it"
 	echo
 	echo "=== KORU-CPP-FAIL ==="
 	exit 1

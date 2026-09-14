@@ -89,16 +89,6 @@ The ABI is settled, and so is the surface design. This phase transcribes it,
 which is what makes the language-neutrality claim a test rather than an
 assertion.
 
-### T40 [R] — op slab and awaiter
-
-An `(index, generation)`-keyed slab of `op_state`, plus `await_ready`,
-`await_suspend` and `await_resume`. `~op_awaiter` marks the entry `Abandoned`,
-moves the `BufSlot` into it, and submits `CANCEL`.
-
-Done test: destroy a coroutine frame with an op in flight. Under ASan there is
-no resume of a freed handle, the slot is not recycled until the CQE lands, and a
-later op on that index does not get `-EBUSY`.
-
 ### T41 [R] — `task<T>`
 
 Lazy `initial_suspend`, **symmetric transfer** on `final_suspend`, move-only,

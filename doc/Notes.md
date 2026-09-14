@@ -4083,6 +4083,74 @@ op_awaiter {
 }
 ```
 
+### T40: the slab, the awaiter, and the use-after-free it exists to stop
+
+`slab.hpp` is the generational slab, `op.hpp` the state machine — `Queued`,
+`Live`, `Ready`, `Abandoned`, `Dead`, `CancelProbe` — and `reactor.hpp` the
+ring, the batch and `op_awaiter`. The state machine and the slab are pure and
+device-free, so `koru_cpp_unit` runs them on the host under `ctest`; only the
+drop-safety cases need a VM.
+
+**The slot lives in the slab, never in the coroutine frame.** The plan's sketch
+had `~op_awaiter` move the `BufSlot` out of the awaiter into the slab entry on
+the way past; putting it there at submission instead removes the move from the
+error path altogether, and with it the question of what happens when a frame
+dies between two of its own statements. What the destructor does is mark the
+entry and, for a live op, queue a `CANCEL`.
+
+**One `ENTER` per pump, carrying the batch and the reap together.** The ABI
+provides exactly that, and a submit call followed by a reap call is two
+syscalls per op — the bug T31 found in the Rust executor, which passes every
+behavioural test there is. `Reactor::enters()` counts them and a case asserts
+the count, because measuring is the only way to know.
+
+Resumption happens **after** the dispatch loop, never inside it: a resumed
+frame submits, abandons and pumps again, and none of that may happen while the
+slab is being walked.
+
+### ASan found the exact bug the phase was written around
+
+Deleting the body of `~op_awaiter` — the whole of the abandon path — and
+running the mid-flight case gives:
+
+```
+ERROR: AddressSanitizer: heap-use-after-free
+    #0 std::coroutine_handle<void>::done() const
+    #1 koru::Reactor::pump(unsigned int, unsigned long)
+  freed by thread T0 here:
+    #3 std::coroutine_handle<...>::destroy()
+```
+
+That is the C++-specific hazard from the design notes, reproduced on demand
+with a stack naming both ends. It is why `scripts/run-cpp.sh` builds its own
+sanitized directory rather than using `build/`, and why it asks the *binary*
+whether it is sanitized rather than trusting a cache that may be stale: without
+the sanitizer the claim "a destroyed frame is never resumed" has no instrument
+at all.
+
+### A destroyed frame that had already finished is not the hazard
+
+The first version of the 200-round loop asserted that no destroyed frame was
+ever resumed, and failed on round 32 — correctly. A `CHECKSUM` can complete
+inside the same `pump` that submitted it, and then the frame is resumed and
+finishes *before* the test destroys it, which is the ordinary path rather than
+a bug. The assertion is now that the resume count does not move **across** the
+destroy, and the case counts how many rounds reached the window: 199 of 200,
+reported rather than assumed, because a run where every frame had already
+finished would test the destructor and nothing else.
+
+### What was shown to fail
+
+- **`~op_awaiter` does nothing.** The ASan report above, plus three assertions
+  in the queued-drop case: the entry, the slot and the inflight count all stay
+  behind.
+- **The generation never moves on removal.** One unit case: a retired cookie
+  reaches the entry that reused its index, which is a late completion resuming
+  the wrong frame.
+- **A discarded completion leaves its entry in the slab.** The slot never
+  returns to the pool, the reused index is a different one, and the live count
+  never falls to zero.
+
 ### Where C++ is weaker, and what actually carries the safety
 
 Rust's move semantics make "the buffer is moved into the operation" a

@@ -293,6 +293,18 @@ device suite, the Rust file's T3-T11 sections case for case, and it passed on
 its first full run against an unchanged kernel. `scripts/run-cpp.sh` is the
 gate. doc/Notes.md has the three perturbations.
 
+T40 added the op slab, the state machine and the awaiter: `cpp/include/koru/`
+gains `slab.hpp`, `op.hpp` and `reactor.hpp`, and the device-free half of them
+runs on the host as `koru_cpp_unit` under `ctest`. **The `BufSlot` lives in the
+slab, never in the coroutine frame**, so a frame destroyed mid-flight takes
+nothing the kernel is using with it; `~op_awaiter` marks the entry and queues a
+`CANCEL`, and the completion is discarded when it lands. One `ENTER` per pump
+carries the batch and the reap together, and `Reactor::enters()` is counted and
+asserted rather than assumed. Deleting the destructor's body reproduces the
+heap-use-after-free the phase was written around, which is why the gate builds
+its own sanitized directory and asks the binary — not the cache — whether ASan
+is really in it.
+
 T14 made the two userspace ABI mirrors a diff rather than a promise.
 `cpp/include/koru_abi.h` and `cpp/include/koru_errno.h` are the C mirrors,
 shared with `test/`, and an `abi_dump` on each side emits a canonical record

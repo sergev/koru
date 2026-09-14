@@ -57,14 +57,23 @@ endif()
 # T39: libkoru, the synchronous core. RAII `Ring` and `Arena`, the buffer pool,
 # `result<T>` and the errno table, on the same unchanged ABI the Rust binding
 # uses. It builds anywhere; only its suite needs the device.
-add_library(koru STATIC cpp/src/error.cpp cpp/src/ring.cpp cpp/src/pool.cpp)
+add_library(koru STATIC cpp/src/error.cpp cpp/src/ring.cpp cpp/src/pool.cpp
+                        cpp/src/reactor.cpp)
 target_include_directories(koru PUBLIC cpp/include)
 target_compile_options(koru PRIVATE ${KORU_WARNINGS} ${KORU_SAN_FLAGS})
+
+# The device-free half: the slab, the op state machine and the vocabulary. It
+# needs no module, so ctest runs it on the host.
+add_executable(koru_cpp_unit cpp/tests/harness.cpp cpp/tests/unit.cpp)
+target_include_directories(koru_cpp_unit PRIVATE cpp/tests)
+target_link_libraries(koru_cpp_unit PRIVATE koru)
+target_compile_options(koru_cpp_unit PRIVATE ${KORU_WARNINGS} ${KORU_SAN_FLAGS})
+target_link_options(koru_cpp_unit PRIVATE ${KORU_SAN_FLAGS})
 
 # The device suite, mirroring rust/sys/tests/kernel.rs case for case. It needs
 # the module, so scripts/run-cpp.sh runs it in the VM.
 add_executable(koru_cpp_check cpp/tests/harness.cpp cpp/tests/common.cpp
-                              cpp/tests/kernel.cpp)
+                              cpp/tests/kernel.cpp cpp/tests/reactor.cpp)
 target_include_directories(koru_cpp_check PRIVATE cpp/tests)
 target_link_libraries(koru_cpp_check PRIVATE koru)
 target_compile_options(koru_cpp_check PRIVATE ${KORU_WARNINGS} ${KORU_SAN_FLAGS})
@@ -173,6 +182,9 @@ add_test(NAME abi_conformance
          COMMAND ${CMAKE_SOURCE_DIR}/scripts/abi.sh --cpp $<TARGET_FILE:abi_dump>
                                                     --ks $<TARGET_FILE:ks_dump>)
 set_tests_properties(abi_conformance PROPERTIES LABELS abi)
+
+add_test(NAME cpp_unit COMMAND koru_cpp_unit)
+set_tests_properties(cpp_unit PROPERTIES LABELS cpp)
 
 add_test(NAME screen_model COMMAND ks_model_test)
 set_tests_properties(screen_model PROPERTIES LABELS screen)
