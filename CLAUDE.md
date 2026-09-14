@@ -5,7 +5,7 @@ code in this repository.
 
 ## State of the repository
 
-**T0–T32 are done.** The kernel surface was complete at T29 and grew once more
+**T0–T34 are done.** The kernel surface was complete at T29 and grew once more
 at T30, for `OPEN`'s creation flags. Braam's hello world runs through koru, and
 the ring can wait for a descriptor. The module registers `/dev/koru`, configures
 a ring with `SETUP`, and submits `NOP`, `DELAY_NS`, `CHECKSUM`, `OPEN`, `READ`,
@@ -204,6 +204,27 @@ tested from a library at all — which stream and which status is a program's
 question — so `examples/date.rs` is Braam's `date`, and `scripts/rust.sh` runs
 it with redirections. doc/Notes.md has the eleven perturbations.
 
+T33 opened Phase 9 with `screen/ks_abi.h`, the screen protocol — canonical
+because the daemon is the server — mirrored by `rust/runtime/src/ks_abi.rs` and
+diffed by the same `scripts/abi.sh`, which now takes two pairs. The op table is
+Braam's terminal surface, one op per call, plus `HELLO`, which Braam has no need
+of because its kernel and its programs are one build. `seq` is not koru's
+`user_data` and the header says why. The dump diffs the *validation* as well as
+the layout: `opvec` evaluates the four length and flag helpers over every op
+number and one past the end. doc/Notes.md has the six perturbations and the
+banding assertion the plan asked for, which needed a correction.
+
+T34 ported Braam's terminal model into `screen/`: the grid, the damage
+rectangle, the scrollback ring, the view, the scrolling region and the ANSI
+parser, about 1,380 lines, with no SDL, no socket and no koru. Braam's own 722
+lines of cell-exact tests pass unchanged but for a shim. Four things differ and
+Notes says why each is forced; the cell **is** `ks_cell`, which is what makes
+T33's read-a-blit-in-place claim true. `scripts/screen.sh` is the gate: the
+suite and the parser's fuzz oracle, both under ASan and UBSan, in under a
+second. The oracle took three corrections before it could catch anything, and
+one rule — the scrolling region's — turns out to be guarded twice and so is
+falsifiable only by breaking both guards.
+
 T14 made the two userspace ABI mirrors a diff rather than a promise.
 `cpp/include/koru_abi.h` and `cpp/include/koru_errno.h` are the C mirrors,
 shared with `test/`, and an `abi_dump` on each side emits a canonical record
@@ -234,6 +255,12 @@ its fastest gate: no VM, no device, no module.
   in `rust/runtime/examples/` are programs, so the guest runs them.
 - `cpp/` — the C ABI mirrors and `abi_dump`, built by the top-level
   `CMakeLists.txt`. The binding itself arrives at T39.
+- `screen/` — the koru-screen daemon. `ks_abi.h` is the canonical screen
+  protocol, mirrored by `rust/runtime/src/ks_abi.rs`; `screen.cpp`, `ansi.cpp`
+  and `text.cpp` are the terminal model, Braam's ported; `tests/` is Braam's
+  own suite plus the parser's fuzz oracle; `tools/` holds the dump and the C11
+  probe. The daemon has **zero koru dependencies** and builds on the host with
+  no VM.
 - `scripts/` — the guest-side check and the host-side runner that boots the VM,
   plus the dev kernel's config fragment. It has its own README.
 

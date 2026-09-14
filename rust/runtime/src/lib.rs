@@ -16,6 +16,11 @@ mod file;
 mod filebuf;
 mod future;
 mod iter;
+
+// The screen protocol's mirror. Not Braam's surface: `ks_dump` and, from
+// T37, the client are all that name it.
+pub mod ks_abi;
+
 mod op;
 mod ops;
 mod opt;

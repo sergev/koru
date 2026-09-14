@@ -3298,6 +3298,184 @@ And one more against the example itself: **the zone is subtracted rather than
 added**, which fails the local comparison and not the `-u` one — the shape that
 says the two paths are really different.
 
+## The screen protocol
+
+T33 is `screen/ks_abi.h`, canonical because the daemon is the server and the
+server owns the protocol, mirrored by `rust/runtime/src/ks_abi.rs` and diffed by
+the same `scripts/abi.sh` that has diffed the koru ABI since T14. The script
+takes two pairs now, each with its own record floor; `cmake` builds `ks_dump`
+beside `abi_dump` and a C11 probe beside the C++ one, because the header must
+compile as both and nothing else ever compiles it as C.
+
+### One op per Braam terminal call
+
+The op table is not invented: it is Braam's terminal surface, one op per call of
+`proc/io.h`'s terminal half and `proc/screen.h`. `KEY_CLAIM`, `KEY_READ`,
+`SCREEN_CLAIM`, `BLIT`, `CURSOR`, `ECHO`, `STYLE`, `SCREEN_CLEAR` and `TTY`,
+plus `TERM_OPEN` reserved for the multiplexing this plan defers, answering
+`-ENOSYS` until then. An op at or above `KS_OP_MAX` is `-ENOSYS` too, never
+`-EINVAL`: an op this daemon does not know may be one a later daemon does.
+
+`HELLO` is koru's own and Braam has no equivalent, because Braam's kernel and
+its programs are one build. Here the daemon and the client are compiled
+separately and can be different versions, so the first frame carries `KS_MAGIC`
+and `KS_ABI_VERSION` and a mismatch is refused *before* anything is claimed.
+
+### `seq` is not `user_data`, and the header says so
+
+The plan predicted that conflating them is the first mistake a second
+implementer makes, so the header carries the reasoning rather than the rule
+alone: a koru cookie names the pump's `READ`, which completes when bytes
+arrive, and one such completion can carry three whole replies or half of one.
+`seq` names a request and the pump demultiplexes onto parked callers by it.
+`seq = 0` is reserved for unsolicited frames, which is the room multiplexing
+will need.
+
+### The dump diffs the validation, not only the layout
+
+T14's grammar gained two record kinds. `opvec` evaluates `ks_flags_all`,
+`ks_req_len`, `ks_rep_len` and `ks_err_len` over every op number **and one past
+the end**, and `style` evaluates the pack and its three accessors. That is the
+same trick T14's `handle` vectors play, extended: what is diffed is the
+arithmetic both sides validate with, so a daemon that accepts a frame length the
+client would never send is a diff rather than a hang. It also pins the one rule
+a client is allowed to assert — `-EINTR` on a parked `KEY_READ` is the only
+negative `res` that carries a payload, because a resize has to be answered
+rather than signalled.
+
+### The banding assertion needed a correction
+
+The plan asked for "a maximum-width row of cells fits a page", which is true of
+the cells and false of the frame: 512 cells is exactly 4096 bytes, and the
+16-byte header plus the 40-byte blit header push a one-row band to 4152. So the
+header asserts both — that a maximum-width row *is* a page, which fires if
+either number moves, and that a whole one-row band fits `KS_MIN_SLOT`, which is
+two pages. `slot_size` is a multiple of `PAGE_SIZE`, so 8192 is expressible
+exactly, and the real rule a screen client must obey is now stated as a number:
+its slot is at least two pages.
+
+`ks_blit` carries a padding word for the same family of reasons: the header is
+16 bytes and the blit header would be 36 without it, which would leave the cells
+4-aligned inside the frame. The assertion that fires when it is deleted is one
+of the three the plan asks for.
+
+### What was shown to fail
+
+Six perturbations, each applied and reverted. The three that are diffs: the C
+header swaps `seq` and `res`, a constant moves in the Rust mirror, and one op
+loses a flag in `ks_flags_all` — the last of which no layout dump would have
+caught. The three that are compile errors, each naming its own assertion: the
+blit loses its padding word, a cell grows past eight bytes, and `KS_MAX_COLS`
+stops being a page's worth. The Rust mirror's `const _` assertions were
+falsified the same way, by lowering `KS_MIN_SLOT` to one page.
+
+## The terminal model, headless
+
+T34 is `screen/screen.cpp`, `screen/ansi.cpp` and `screen/text.cpp`: Braam's
+`kernel/screen.cpp` and `kernel/ansi.cpp`, about 1,380 lines, with the grid, the
+damage rectangle, the scrollback ring, the view, the scrolling region and the
+parser. No SDL, no socket, no koru — `scripts/screen.sh` builds and runs it on
+the host in under a second.
+
+### What the port changed, and why each is forced
+
+Four things, and nothing else:
+
+**The browser-canvas descriptor does not port.** Braam hands the host a `Screen`
+record whose `cells` field is an address and whose `magic` is `BSCR`, because
+the renderer is JavaScript reading a `Uint32Array` out of wasm memory. The
+daemon owns its grid in the same address space, so `Screen` is the geometry
+alone and the cells are reached with `screen_cells()` and `screen_shown()`.
+That deleted three assertions from the ported suite and turned one — "the
+descriptor is a link-time constant, so its address never moves" — into a
+question with no meaning here.
+
+**There is no terminal registry.** Braam has `TERM_MAX` terminals in a constant
+initialised global array, reached by id. koru's `KS_OP_TERM_OPEN` answers
+`-ENOSYS` until multiplexing exists, so a `Term` is an object with
+`term_new`/`term_free` and the id is gone. When multiplexing arrives it is a
+map in the daemon, not a fixed array in the model.
+
+**`screen_flush` takes one terminal and returns its damage.** Braam's walks
+every terminal and calls `host_present`; there is no host here, and the renderer
+is the caller. The rectangle is the return value, which turned out to matter:
+see the oracle bug below.
+
+**The allocator is `new (std::nothrow)`.** Every "could not allocate" path in
+the original survives — the grid that stays whole when a resize cannot allocate,
+the scrollback that is simply absent, the view that stays put. `screen.cpp`
+counts the cell bytes it holds, because the one test that asserted `reset` gives
+all three blocks back was written against Braam's allocator statistics.
+
+One compiler difference: `a.nparam + 1 < ANSI_PARAMS` is `-Wsign-compare` under
+GCC, where Braam builds with clang. The fix is a cast, and it is the only change
+to the parser's logic-bearing lines.
+
+### The cell is the protocol's cell
+
+`screen.h` does `using Cell = ks_cell` and defines `COLOR_*`, `ATTR_*` and
+`SCREEN_MAX_*` as the `KS_*` values, so the ported code and the ported tests
+read as their originals. That is not a convenience: T33's claim that the daemon
+reads a blit's cells in place is only true if the grid's cell and the wire's
+cell are the same type, and an alias is how that is said once.
+
+### Braam's suite passes unchanged
+
+`screen/tests/test_screen.cpp` and `test_ansi.cpp` are Braam's 722 lines with
+the shim above and nothing else, and they passed on the first run against the
+port. Two perturbations, exactly the ones the plan named, and each fails only
+its own tests: deleting the scrollback push fails twelve assertions, all of them
+the view's; making the deferred wrap `> cols` rather than `>= cols` fails seven,
+all of them autowrap's. A third, deleting the `rune_safe` a blit applies to the
+cells it was handed, fails the two that exist for it.
+
+### The fuzz oracle had to be rebuilt three times
+
+The target is `screen/tests/fuzz_ansi.cpp`, with two drivers over one
+`LLVMFuzzerTestOneInput`: libFuzzer where clang's runtime is installed, and a
+PRNG driver that needs nothing, which is what the gate runs. Getting it to bite
+took three corrections, and each is a lesson about fuzzing a layered model.
+
+**A byte-level generator tests the state machine and nothing below it.** The
+first version drew bytes from an interesting set. `ESC [ 1 ; 9 9 r` is six
+specific bytes in order: at 1/43 each that is one in 10^10 positions, so
+*every* dispatch below the parser was untested. The generator emits whole
+tokens now — a CSI with parameters and a final, an escape, a string, a run of
+text — and one parameter in three is drawn from the geometry's own edges
+(`cols`, `cols + 1`, `rows`, `rows + 1`), which is where an off-by-one lives.
+
+**Checking a clamped accessor proves that `min` works.** The oracle asked
+`screen_region_bot(t) < rows`, which is true by construction: the accessor
+clamps. `screen_region_stored` was added for exactly this — the fuzz oracle has
+to see the state, not the guard over it.
+
+**A flush's damage is in its return, not in the terminal.** The oracle read
+`screen_damage(t)` after each flush, which is the *cleared* state, so the cursor
+fold — the one piece of damage a flush computes itself — was never checked at
+all. With `check_rect` on the returned rectangle, an off-by-one in that fold
+trips in four milliseconds.
+
+### A rule guarded twice is falsifiable only by breaking both guards
+
+The plan asked for "reintroduce an off-by-one in the region and it must trip in
+under a second". It does not — because the region is guarded in two places. The
+parser refuses `CSI r` with a bottom past the last row, and `screen_region`
+refuses the same margins again. Deleting *either* changes nothing observable;
+deleting both trips the oracle in 84 milliseconds. That is worth knowing before
+the next argument about a redundant check: the redundancy is real, and it makes
+each half individually untestable through the outside.
+
+Two off-by-ones that are guarded once do trip, both in under ten milliseconds:
+the cursor clamp in `screen_move`, and the cursor fold in `screen_flush`.
+
+### The sanitizers are GCC's here
+
+clang's ASan, UBSan and libFuzzer runtimes live in `libclang-rt-*-dev`, which is
+not installed on this machine, so `scripts/screen.sh` defaults to `g++`, whose
+`libasan` ships with the toolchain. `CXX=clang++` and `-DKORU_FUZZ=ON` build the
+libFuzzer target once that package is there. The everyday gate loses nothing by
+it: the oracle is the same function, and only the search strategy differs.
+
 ## C++20 userspace binding
 
 The kernel side is **unchanged** — same device, same ioctls, same wire format,
@@ -3505,6 +3683,14 @@ arrive with their tasks.
   usage helpers' stream and status. *exists*
 - `rust/runtime/tests/file.rs` — the fast path measured, the sticky error, and
   the three iterators. *exists*
+- `screen/ks_abi.h` — the screen protocol, canonical because the daemon is the
+  server. Mirrored by `rust/runtime/src/ks_abi.rs`, and the two `ks_dump`
+  emitters are diffed by the same script as T14's. *exists*
+- `screen/screen.cpp`, `screen/ansi.cpp`, `screen/text.cpp` — the terminal
+  model: the grid, the damage rectangle, the scrollback, the view, the region
+  and the parser. Zero koru dependencies. *exists*
+- `screen/tests/` — Braam's own cell-exact suite, ported, plus the parser's
+  fuzz oracle in its two drivers. *exists*
 - `cpp/include/koru_abi.h` — the C mirror of `koru_abi.rs`, kept in step by
   the T14 conformance diff. *exists*
 - `cpp/include/koru_errno.h` — the C mirror of `error.rs`'s vocabulary and

@@ -147,9 +147,10 @@ above: libtest orders tests by name, so neither suite can promise the
 heavy-first ordering that budget depends on. The kernel is unchanged, so leak
 coverage is still `koru_check`'s job.
 
-It picks each test binary out of `cargo`'s JSON by target **kind**. Since T14
-`koru-sys` also has an `abi_dump` bin, which the same command emits, in an
-order that varies; taking the wrong one runs no tests and exits 0.
+It picks each test binary out of `cargo`'s JSON by target **kind**. Both
+packages carry a dump bin the same command emits — `koru-sys`'s `abi_dump`
+since T14, `koru`'s `ks_dump` since T33 — in an order that varies; taking the
+wrong one runs no tests and exits 0.
 
 After the suites it runs the **examples**, listed in `EXAMPLES` and located the
 same way. They are the runtime entry's only test, because `#[koru::main]`
@@ -167,12 +168,40 @@ is a virtio-serial port, which permits one open, so the runtime cannot re-open
 it non-blocking and the kernel refuses the write. Redirect or pipe it — which
 is what the gate does, and what doc/Notes.md explains.
 
+## The screen gate
+
+`scripts/screen.sh` builds `build-asan/` with ASan and UBSan on and runs two
+things: the terminal model's suite, which is Braam's own cell-exact assertions
+ported, and the ANSI parser's fuzz oracle. Neither needs a VM, a device, a
+module or SDL — the model has zero koru dependencies, which is the whole reason
+it can be checked here. About a second.
+
+```sh
+scripts/screen.sh
+KS_SEED=12345 scripts/screen.sh     # replay a fuzz failure
+KS_ITERS=500000 scripts/screen.sh   # a longer fuzz run
+CXX=clang++ scripts/screen.sh       # once libclang-rt-*-dev is installed
+```
+
+It defaults to GCC because clang's sanitizer runtimes are a separate Debian
+package. The coverage-guided libFuzzer target is opt-in for the same reason:
+`cmake -B build-fuzz -DCMAKE_CXX_COMPILER=clang++ -DKORU_FUZZ=ON`, then
+`./build-fuzz/ks_ansi_fuzz -max_total_time=30`. Both drivers call the same
+`LLVMFuzzerTestOneInput`, so they share one oracle and differ only in how they
+pick inputs.
+
+The verdict is `KORU-SCREEN-PASS`, and it gates on more than the exit status:
+the suite's own "OK: 0 failure(s)" line and its section banners must appear, or
+a binary that ran nothing would pass.
+
 ## The ABI conformance diff
 
-`scripts/abi.sh` compares the two userspace ABI mirrors, C and Rust, by
-diffing a canonical record dump emitted from each. It needs no VM, no
-`/dev/koru` and no module, so it is the fastest gate here — run it whenever a
-mirror changes.
+`scripts/abi.sh` compares two pairs of mirrors, C and Rust, by diffing a
+canonical record dump emitted from each: the koru ABI (`cpp/include/koru_abi.h`
+against `rust/sys/src/abi.rs`) and, since T33, the screen protocol
+(`screen/ks_abi.h` against `rust/runtime/src/ks_abi.rs`). Each pair has its own
+record floor. It needs no VM, no `/dev/koru` and no module, so it is the fastest
+gate here — run it whenever a mirror changes.
 
 ```sh
 cmake -B build && cmake --build build   # once, and after a mirror changes

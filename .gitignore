@@ -25,4 +25,4 @@ test/*
 rust/target/
 
 # The cmake build tree.
-/build/
+/build*/

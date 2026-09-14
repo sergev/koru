@@ -112,51 +112,6 @@ restarted daemon, which a full-screen program would never notice, because the
 resize path already marks the whole grid damaged. Add them here as tasks when
 one of them is actually wanted.
 
-### T33 [M] — the screen protocol ABI
-
-`screen/ks_abi.h`, canonical because the daemon is the server and the
-server owns the protocol. A 16-byte header of `len`, `op`, `flags`, `seq` and
-`res`, the op table, per-op flag masks, and the payload structs. Mirrored by a
-Rust module, with a dump on each side sharing T14's runner. koru's discipline
-throughout: no padding, reserved fields must be zero, unknown flag bits
-rejected, exact errnos.
-
-`len` is the whole frame and must be a multiple of 8. That costs nothing and
-makes a blit's cells 8-aligned, so the daemon reads them in place rather than
-copying to align them.
-
-`seq` is client-chosen and echoed, and it is **a different space from koru's
-`user_data`** — conflating them is the first mistake a second implementer will
-make. koru's cookie names the pump's `READ`, which completes when bytes arrive;
-one such completion can carry three whole replies or half of one. Say so in the
-header. `seq = 0` is reserved for unsolicited frames, which is what keeps the
-deferred multiplexing additive. `KS_OP_TERM_OPEN` is defined and answers
-`-ENOSYS` until then.
-
-Done test: the `diff` of the two dumps is empty and perturbing one field in
-either makes it fail — verify that, or the test proves nothing. Then three
-assertions that are not about size: a cell is 8 bytes, keeping Braam's
-assertion text; the header plus the blit header is a multiple of 8, which must
-fire if the padding word is removed; and a maximum-width row of cells fits a
-page, which is what proves T37's banding can never get stuck.
-
-### T34 [R] — the terminal model, headless
-
-Port Braam's `screen.cpp` and `ansi.cpp`, about 1,380 lines: the grid, the
-damage rectangle, scrollback, the view, the scrolling region and the parser.
-The browser-canvas descriptor and its magic number do not port — the daemon
-owns its grid directly and there is no descriptor to hand anybody. No SDL, no
-socket, no koru; this builds and runs on the host with nothing installed.
-
-Done test: Braam's own `test_screen.cpp` and `test_ansi.cpp`, 722 lines of
-cell-exact assertions, compiled against the port and passing unchanged but for
-a harness shim, under ASan and UBSan. Then falsifiability: break the scrollback
-push and only the view tests fail; break the deferred wrap, where the cursor
-column may equal the width, and only the autowrap tests fail. Then a libFuzzer
-target on the parser whose oracle is that after every write the cursor, the
-damage rectangle and the region margins are all inside the grid — reintroduce
-an off-by-one in the region and it must trip in under a second.
-
 ### T35 [R] — the renderer, the window and the pixel oracle
 
 SDL3 window, an embedded bitmap font, cells drawn from the grid with only the
