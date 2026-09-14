@@ -47,8 +47,12 @@ task<int64_t> write_all(Reactor &r, int64_t handle, const std::string &text)
         if (n > slot.size())
             n = slot.size();
         memcpy(slot.bytes().data(), text.data() + at, n);
+        // The index before the move: the order in which a call's arguments are
+        // evaluated is unspecified, so reading it from the moved-from slot in
+        // the same expression is a hazard C++ will not warn about.
+        uint32_t index = slot.index();
         Completion c = co_await r.submit(
-            sqe::write(0, uint32_t(handle), slot.index(), at, uint32_t(n)), std::move(slot));
+            sqe::write(0, uint32_t(handle), index, at, uint32_t(n)), std::move(slot));
         if (c.res <= 0)
             co_return c.res;
         at += size_t(c.res);
@@ -80,8 +84,9 @@ task<int> demo(Executor &ex, const char *path, std::vector<uint64_t> *order)
         memcpy(b.data(), path, strlen(path));
     }
     uint32_t plen = uint32_t(strlen(path));
+    uint32_t index = slot.index();
     Completion o =
-        co_await r.submit(sqe::open(0, slot.index(), 0, plen, KORU_O_RDONLY), std::move(slot));
+        co_await r.submit(sqe::open(0, index, 0, plen, KORU_O_RDONLY), std::move(slot));
     if (o.res <= 0) {
         fprintf(stderr, "read_file: %s: %s\n", path, Errno(int(-o.res)).message());
         co_return 1;
@@ -90,8 +95,9 @@ task<int> demo(Executor &ex, const char *path, std::vector<uint64_t> *order)
 
     BufSlot into = std::move(o.slot);
     uint32_t len = uint32_t(into.size());
+    index = into.index();
     Completion rd =
-        co_await r.submit(sqe::read(0, uint32_t(h), into.index(), 0, len), std::move(into));
+        co_await r.submit(sqe::read(0, uint32_t(h), index, 0, len), std::move(into));
     if (rd.res < 0) {
         fprintf(stderr, "read_file: read: %s\n", Errno(int(-rd.res)).message());
         co_return 1;

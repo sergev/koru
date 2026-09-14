@@ -15,7 +15,7 @@
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 KO=${KO:-$ROOT/kernel/koru.ko}
 CHECKBIN=${CHECKBIN:-$ROOT/build/koru_cpp_check}
-FLOOR=${FLOOR:-71}
+FLOOR=${FLOOR:-72}
 DEMO=${DEMO:-}
 RUSTDEMO=${RUSTDEMO:-}
 FILTERS="$*"

@@ -106,6 +106,13 @@ public:
     /// behavioural test there is.
     uint64_t enters() const { return enters_; }
 
+    /// SQEs the kernel consumed, CQEs reaped, and `CANCEL`s the drop path
+    /// sent. The first two are C1 end to end: they must be equal once the ring
+    /// is quiet, and an op whose completion never arrived breaks that.
+    uint64_t sqes_submitted() const { return sqes_; }
+    uint64_t cqes_reaped() const { return cqes_; }
+    uint64_t cancels_submitted() const { return cancels_; }
+
     // ------------------------------------------------------------ internals
 
     /// The awaiter's three calls, kept here because the state lives here.
@@ -123,8 +130,11 @@ private:
     std::vector<koru_sqe> pending_;
     std::vector<koru_cqe> cq_;
     std::vector<std::coroutine_handle<>> woken_;
-    size_t inflight_ = 0;
-    uint64_t enters_ = 0;
+    size_t inflight_  = 0;
+    uint64_t enters_  = 0;
+    uint64_t sqes_    = 0;
+    uint64_t cqes_    = 0;
+    uint64_t cancels_ = 0;
 };
 
 } // namespace koru

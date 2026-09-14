@@ -83,17 +83,6 @@ a shell run in the window. **Reconnecting** to a restarted daemon, which a
 full-screen program would never notice, because the resize path already marks
 the whole grid damaged. Add them here as tasks when one of them is wanted.
 
-## Phase 10 — the C++ binding
-
-The ABI is settled, and so is the surface design. This phase transcribes it,
-which is what makes the language-neutrality claim a test rather than an
-assertion.
-
-### T43 [R] — C++ drop safety
-
-Done test: a mirror of T16 — race a read against a timer, destroy the frame
-mid-flight, 100k iterations under ASan and UBSan.
-
 ## Phase 11 — the C++ surface
 
 ### T44 [M] — the vocabulary and runtime entry, C++

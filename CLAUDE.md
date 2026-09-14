@@ -322,6 +322,15 @@ with it T15's demo in C++. **The two demos are run in the same guest and
 two runtimes that share no code over one unchanged kernel. `adopt_stream`
 re-opens through `/proc/self/fd` before `ADOPT_FD`, as the Rust runtime does.
 
+T43 finished Phase 10 with the C++ drop-safety loop, T16's mirror: a whole-slot
+`READ` racing a timer, the loser's frame destroyed mid-flight, a hundred
+thousand times under ASan and UBSan — 97,342 read wins and 2,658 caught in
+flight, against the Rust side's 2.8% window. Two things it taught: **the
+timer's work item has to queue ahead of the read's** or the race is never
+reached at all (0 of 500), and **an argument list is not a sequence point** —
+`submit(sqe::read(.., slot.index(), ..), std::move(slot))` reads a moved-from
+slot in unspecified order and works only by luck.
+
 T14 made the two userspace ABI mirrors a diff rather than a promise.
 `cpp/include/koru_abi.h` and `cpp/include/koru_errno.h` are the C mirrors,
 shared with `test/`, and an `abi_dump` on each side emits a canonical record

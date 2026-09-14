@@ -98,6 +98,7 @@ void Reactor::abandon(Cookie c)
         Cookie probe = slab_.insert(Op<BufSlot>::probe());
         s.user_data  = probe.value;
         pending_.push_back(s);
+        cancels_++;
         break;
     }
     case Abandon::Remove:
@@ -150,12 +151,14 @@ uint32_t Reactor::pump(uint32_t min_complete, uint64_t timeout_ns)
         if (i < consumed) {
             op->on_submitted();
             inflight_++;
+            sqes_++;
         } else {
             pending_.push_back(go[i]); // admission control stopped short
         }
     }
 
     uint32_t n = r.value().progress.completed;
+    cqes_ += n;
     woken_.clear();
     for (uint32_t i = 0; i < n; i++) {
         Cookie c(cq_[i].user_data);

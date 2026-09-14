@@ -72,7 +72,8 @@ struct Outcome {
 
 Frame read_into_slot(Reactor &r, BufSlot slot, uint32_t handle, uint32_t len, Outcome *out)
 {
-    Completion c = co_await r.submit(sqe::read(0, handle, slot.index(), 0, len), std::move(slot));
+    uint32_t at = slot.index();
+    Completion c = co_await r.submit(sqe::read(0, handle, at, 0, len), std::move(slot));
     out->resumed++;
     out->res = c.res;
     // The slot comes back with the result and goes to the pool here.
@@ -80,7 +81,8 @@ Frame read_into_slot(Reactor &r, BufSlot slot, uint32_t handle, uint32_t len, Ou
 
 Frame checksum_slot(Reactor &r, BufSlot slot, uint32_t len, Outcome *out)
 {
-    Completion c = co_await r.submit(sqe::checksum(0, slot.index(), 0, len), std::move(slot));
+    uint32_t at = slot.index();
+    Completion c = co_await r.submit(sqe::checksum(0, at, 0, len), std::move(slot));
     out->resumed++;
     out->res = c.res;
 }
@@ -194,8 +196,9 @@ CASE(reactor_a_frame_destroyed_mid_flight_is_never_resumed)
     }
     Outcome o_open;
     Frame fo = [](Reactor &rr, BufSlot p, uint32_t len, Outcome *out) -> Frame {
+        uint32_t at = p.index();
         Completion c =
-            co_await rr.submit(sqe::open(0, p.index(), 0, len, KORU_O_RDONLY), std::move(p));
+            co_await rr.submit(sqe::open(0, at, 0, len, KORU_O_RDONLY), std::move(p));
         out->resumed++;
         out->res = c.res;
     }(r, std::move(path), plen, &o_open);

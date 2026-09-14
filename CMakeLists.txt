@@ -81,7 +81,8 @@ target_link_options(koru_cpp_unit PRIVATE ${KORU_SAN_FLAGS})
 # The device suite, mirroring rust/sys/tests/kernel.rs case for case. It needs
 # the module, so scripts/run-cpp.sh runs it in the VM.
 add_executable(koru_cpp_check cpp/tests/harness.cpp cpp/tests/common.cpp
-                              cpp/tests/kernel.cpp cpp/tests/reactor.cpp)
+                              cpp/tests/kernel.cpp cpp/tests/reactor.cpp
+                              cpp/tests/drop.cpp)
 target_include_directories(koru_cpp_check PRIVATE cpp/tests)
 target_link_libraries(koru_cpp_check PRIVATE koru)
 target_compile_options(koru_cpp_check PRIVATE ${KORU_WARNINGS} ${KORU_SAN_FLAGS})

@@ -29,7 +29,7 @@ TIMEOUT=${TIMEOUT:-900}
 # The number of cases an unfiltered run must reach. It is the whole of the
 # T4-T11 matrix plus the T3 matrices, and it equals the Rust suite's count for
 # the same sections: raise it when a case is added.
-FLOOR=${FLOOR:-71}
+FLOOR=${FLOOR:-72}
 
 if [ ! -d "$KDIR" ]; then
 	echo "no kernel tree at $KDIR; set KDIR" >&2

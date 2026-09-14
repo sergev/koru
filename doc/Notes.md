@@ -4264,6 +4264,59 @@ does. That re-open is the bounded POSIX preamble, and T44 will inherit it.
   its timers are never armed, so the executor first says nothing can arrive and
   then the 60-second `timeout` around the demo in `scripts/cpp.sh` ends it.
 
+### T43: drop safety, and what the loop had to be told
+
+`cpp/tests/drop.cpp` is T16 in C++: a whole-slot `READ` races a timer, and the
+frame of whichever loses is destroyed with its op possibly still in flight.
+Under ASan and UBSan, at the plan's hundred thousand iterations:
+
+```
+read won 97342, cancelled 2658, already done 0
+```
+
+2.66% of rounds caught the read live, against the Rust side's 2.8% — the same
+window, reached by a different runtime. Nothing was reported by either
+sanitizer, every slot came back, and `cqes_reaped == sqes_submitted` at the
+end, which is C1 end to end.
+
+**Submission order is the whole of the race.** The first version submitted the
+read and then the timer, and the read won 500 times out of 500: the in-flight
+drop path was never reached at all. The timer's work item has to queue *ahead*
+of the read's, which is what the Rust test's one-line comment says and what
+this one had to discover by measuring. The floor on `cancelled` is what turns
+that from a silent pass into a failure.
+
+### A counter nothing incremented
+
+The loop keys its two branches on `cancels_submitted()`, and the increment for
+it never made it into `abandon` — an edit that did not match. Every round took
+the "already complete" branch and then asserted the slot was back, which it was
+not. The case failed, loudly, on the *other* assertion: the free list was not
+LIFO. **A branch keyed on an instrument has to be reachable in both
+directions**, or a dead instrument reads as one arm being unreachable.
+
+### An argument list is not a sequence point
+
+```cpp
+r.submit(sqe::read(0, h, slot.index(), 0, len), std::move(slot))
+```
+
+The order in which a call's arguments are evaluated is *unspecified*, so this
+may read `slot.index()` from a slot already moved into the parameter. It works
+today only because `BufSlot`'s move leaves `index_` alone and clears the pool
+pointer instead — `held()` would be false, `bytes()` empty, and `index()`
+happens to be right. Every such call now hoists the index into a local first.
+Rust's borrow checker makes the shape unwritable; C++ gives no diagnostic at
+any warning level.
+
+### What was shown to fail
+
+- **The slot goes back at abandon time** rather than when the CQE lands: round
+  2 of 500 fails with "the slot came back before the read's completion", which
+  is the assertion the whole task is named for.
+- **The read submitted before the timer**: 0 of 500 rounds reach the window,
+  and the floor on `cancelled` is what says so.
+
 ### Where C++ is weaker, and what actually carries the safety
 
 Rust's move semantics make "the buffer is moved into the operation" a
