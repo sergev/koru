@@ -174,8 +174,9 @@ is what the gate does, and what doc/Notes.md explains.
 terminal model's suite — Braam's own cell-exact assertions, ported — the five
 pixel oracles, the protocol server's rejection matrix, and two fuzz oracles,
 one over the ANSI parser and one over the protocol's `feed()`. None of it needs
-a VM, a device or a module; the pixel oracles need SDL3 and run under its offscreen
-video driver, which the test sets for itself, so no display is needed either.
+a VM, a device or a module; the pixel oracles need SDL3 and run under its
+offscreen video driver, which the test sets for itself, so no display is needed
+either.
 About a second.
 
 ```sh
