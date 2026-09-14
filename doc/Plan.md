@@ -89,16 +89,6 @@ The ABI is settled, and so is the surface design. This phase transcribes it,
 which is what makes the language-neutrality claim a test rather than an
 assertion.
 
-### T39 [M] — `libkoru` synchronous core
-
-RAII `Ring` covering open, `SETUP`, `mmap` and close. `BufPool`, move-only
-`BufSlot` with deleted copy operations, raw `submit()` and `reap()`, and
-`result<T>` carrying both the Braam `Error` and the raw errno. No coroutines.
-
-Done test: the T4–T11 matrix re-expressed in C++, mirroring the test list in
-`rust/sys/tests/kernel.rs` case for case. Any divergence is an ABI
-ambiguity worth fixing before coroutines hide it.
-
 ### T40 [R] — op slab and awaiter
 
 An `(index, generation)`-keyed slab of `op_state`, plus `await_ready`,

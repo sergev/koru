@@ -3993,6 +3993,75 @@ implementation in an unrelated language is the strongest available evidence that
 this is a language-neutral ABI rather than a Rust idiom with a device node
 bolted on.
 
+### T39: the synchronous core, and what transcribing the matrix found
+
+`cpp/include/koru/` and `cpp/src/` are `libkoru`: `Ring` and `Arena` with a
+destructor each, `BufPool` and a move-only `BufSlot`, `result<T, E>`, and the
+errno table. `cpp/tests/kernel.cpp` is the device suite — the T4-T11 sections
+of `rust/sys/tests/kernel.rs` plus its T3 matrices, **case for case**, 59 of
+them, which is exactly what the Rust file has for those sections. Three more
+cover what only the C++ half has: the pool, and `result<T>`.
+
+The headline is that there was nothing to report. The suite passed on its first
+full run against an unchanged kernel, which is the strongest form the
+language-neutrality claim can take: not two demos printing the same bytes, but
+the same rejection matrix, the same exact errnos, and the same race loops.
+
+### The errno table is not written twice, and C++ can check what Rust cannot
+
+`koru_errno.h`'s X-macros already hold the fifteen names and every errno koru
+can produce, so `Kind` and the table are *generated* from the mirror rather
+than transcribed beside it. And because C++ has libc headers, one
+`static_assert` per row checks the mirror's asm-generic number against this
+host's `<cerrno>`. The Rust binding hardcodes those numbers with no way to
+notice a host that disagrees; this one cannot build on such a host.
+
+**There are no errno constants in `namespace koru`.** `EINVAL` is a macro, so
+`koru::EINVAL` would expand to `koru::22`. The spelling is `Errno(EINVAL)`, and
+the header says so where a second implementer will look.
+
+### `result<T, E>` and the two error types
+
+C++20 has no `std::expected`. `result<T, E = Error>` is a tagged union with
+placement new, move-only friendly, and reading the wrong side aborts: nothing
+here throws, because an exception cannot cross the ABI boundary and a detached
+coroutine has nowhere to send one.
+
+The default argument has to name `Error`, which lives in a header that includes
+this one, so `result.hpp` forward-declares it. `ENTER` keeps Rust's two-error
+shape — `result<Entered, EnterError>` — because the writeback is valid on the
+failure path and an `EINTR` that lost `submitted` would be a resubmission bug.
+
+One deliberate divergence from the Rust wrapper, and it is in the binding
+rather than the ABI: Rust's `enter` takes `Option<Duration>` and has to refuse
+`Some(ZERO)`, because `timeout_ns == 0` means *no cap* on the wire. The C++ one
+takes the wire's `uint64_t` directly, so the ambiguity cannot arise.
+
+### The suite is a registry, not a list of functions
+
+`cargo test` gives filters, per-test isolation and a count for free. A C++
+binary gives none of it, so `cpp/tests/harness.cpp` provides the three that the
+gate depends on: named cases registered by a `CASE()` macro, substring filters
+from argv, and a printed count — because **a binary that ran nothing exits 0
+too**, which is the same hole `scripts/rust.sh`'s per-suite floor closes.
+`scripts/cpp.sh` gates on the floor, on the suite's own verdict line, on a
+`KORU-CPP-SKIP` marker, and then on rmmod, kmemleak, taint and the dmesg scan,
+as the other guest scripts do.
+
+Cases run one at a time in one process: several fork, and several read
+process-global counters like `/proc/sys/fs/file-nr`.
+
+### What was shown to fail
+
+- **`Arena::slot` strides by `slot_count`** rather than `slot_size` — the
+  transcription slip. Four `checksum` assertions and both slot-exclusivity
+  cases fail, and the failures name the checksums that disagree.
+- **A moved-from `BufSlot` keeps its claim.** Both pool cases fail: the pool
+  hands one index to two owners, and its free count goes wrong.
+- **`SETUP` encoded read-only** — `_IOR` where `_IOWR` belongs, which is the
+  likeliest defect in a hand-written ioctl number. Every case that needs a ring
+  dies at the first one, which is the loudest failure in the suite.
+
 ### C++20 coroutines fit this ABI better than Rust futures do
 
 Rust futures are *poll*-based: the executor asks "are you ready?" and must

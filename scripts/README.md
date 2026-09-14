@@ -239,6 +239,23 @@ carries the daemon's path and `pgrep -f` would match the shell. And each client
 writes to a **file of its own**, because twenty processes appending to one file
 braid their lines.
 
+## The C++ binding's device suite
+
+`scripts/run-cpp.sh` boots the VM and runs `scripts/cpp.sh` in it, which drives
+`build/koru_cpp_check` — the T4-T11 matrix and the T3 matrices in C++, case for
+case with `rust/sys/tests/kernel.rs`.
+
+```sh
+cmake -B build && cmake --build build
+scripts/run-cpp.sh
+scripts/run-cpp.sh cancel read   # only cases whose name matches
+```
+
+The verdict is `KORU-CPP-PASS`, and it gates on the same things the Rust runner
+does: the suite's own "OK: 0 failure(s)" line, a floor on the number of cases
+an unfiltered run reached (a filter matching nothing runs none and exits 0), a
+`KORU-CPP-SKIP` marker, and then rmmod, kmemleak, taint and the dmesg scan.
+
 ## The ABI conformance diff
 
 `scripts/abi.sh` compares two pairs of mirrors, C and Rust, by diffing a

@@ -282,6 +282,17 @@ socket is not a character device, so `is_console` has to ask the runtime or a
 buffered stream waits for the at-exit flush. doc/Notes.md has the nine
 perturbations and the one rule nothing checks.
 
+T39 opened Phase 10 with `libkoru`, the C++ binding's synchronous core:
+`cpp/include/koru/` and `cpp/src/` hold RAII `Ring` and `Arena`, `BufPool` and
+a move-only `BufSlot`, `result<T, E>` and the errno table — which is
+*generated* from `koru_errno.h`'s X-macros rather than transcribed, with a
+`static_assert` per row checking the mirror's asm-generic numbers against this
+host's `<cerrno>`. There are **no errno constants in `namespace koru`**:
+`EINVAL` is a macro, so `koru::EINVAL` would be `koru::22`. `cpp/tests/` is the
+device suite, the Rust file's T3-T11 sections case for case, and it passed on
+its first full run against an unchanged kernel. `scripts/run-cpp.sh` is the
+gate. doc/Notes.md has the three perturbations.
+
 T14 made the two userspace ABI mirrors a diff rather than a promise.
 `cpp/include/koru_abi.h` and `cpp/include/koru_errno.h` are the C mirrors,
 shared with `test/`, and an `abi_dump` on each side emits a canonical record
@@ -310,8 +321,10 @@ its fastest gate: no VM, no device, no module.
   `koru-macros`, `#[koru::main]` alone. Cargo names the package, so `-p
   koru-sys` and `use koru_sys::` are unaffected by the directory. The examples
   in `rust/runtime/examples/` are programs, so the guest runs them.
-- `cpp/` — the C ABI mirrors and `abi_dump`, built by the top-level
-  `CMakeLists.txt`. The binding itself arrives at T39.
+- `cpp/` — the C++ binding. `include/koru_abi.h` and `include/koru_errno.h`
+  are the C mirrors, shared with `test/`, and `tools/abi_dump.cpp` dumps them;
+  `include/koru/` and `src/` are `libkoru` itself, and `tests/` is its device
+  suite. Built by the top-level `CMakeLists.txt`.
 - `screen/` — the koru-screen daemon. `ks_abi.h` is the canonical screen
   protocol, mirrored by `rust/runtime/src/ks_abi.rs`; `screen.cpp`, `ansi.cpp`
   and `text.cpp` are the terminal model, Braam's ported; `render.cpp` and

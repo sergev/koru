@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 #
-# The C++ half: the two ABI dumps, and from T34 the screen daemon. The koru
-# binding itself, its tests and the examples arrive at T39 and after.
+# The C++ half: the two ABI dumps, the screen daemon from T34, and from T39
+# libkoru and its device suite. The examples arrive with the surface.
 
 cmake_minimum_required(VERSION 3.20)
 project(koru CXX C)
@@ -53,6 +53,22 @@ set(KORU_SAN_FLAGS)
 if(KORU_SANITIZE)
   set(KORU_SAN_FLAGS -fsanitize=address,undefined -fno-omit-frame-pointer -g)
 endif()
+
+# T39: libkoru, the synchronous core. RAII `Ring` and `Arena`, the buffer pool,
+# `result<T>` and the errno table, on the same unchanged ABI the Rust binding
+# uses. It builds anywhere; only its suite needs the device.
+add_library(koru STATIC cpp/src/error.cpp cpp/src/ring.cpp cpp/src/pool.cpp)
+target_include_directories(koru PUBLIC cpp/include)
+target_compile_options(koru PRIVATE ${KORU_WARNINGS} ${KORU_SAN_FLAGS})
+
+# The device suite, mirroring rust/sys/tests/kernel.rs case for case. It needs
+# the module, so scripts/run-cpp.sh runs it in the VM.
+add_executable(koru_cpp_check cpp/tests/harness.cpp cpp/tests/common.cpp
+                              cpp/tests/kernel.cpp)
+target_include_directories(koru_cpp_check PRIVATE cpp/tests)
+target_link_libraries(koru_cpp_check PRIVATE koru)
+target_compile_options(koru_cpp_check PRIVATE ${KORU_WARNINGS} ${KORU_SAN_FLAGS})
+target_link_options(koru_cpp_check PRIVATE ${KORU_SAN_FLAGS})
 
 # SDL3 is the renderer's, and only the renderer's: the model and the protocol
 # build without it, which is what lets most of this gate run anywhere.
