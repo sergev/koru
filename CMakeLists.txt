@@ -51,7 +51,11 @@ option(KORU_SANITIZE "build the screen targets with ASan and UBSan" OFF)
 option(KORU_FUZZ "build the libFuzzer targets (clang plus its runtime)" OFF)
 set(KORU_SAN_FLAGS)
 if(KORU_SANITIZE)
-  set(KORU_SAN_FLAGS -fsanitize=address,undefined -fno-omit-frame-pointer -g)
+  # -O2 is not decoration. The sanitizers are documented as wanting
+  # optimization on, and GCC performs a coroutine's symmetric transfer only
+  # with it: at -O0 and -O1 a hundred thousand nested awaits cost a stack
+  # frame each. doc/Notes.md has the measurements.
+  set(KORU_SAN_FLAGS -fsanitize=address,undefined -fno-omit-frame-pointer -g -O2)
 endif()
 
 # T39: libkoru, the synchronous core. RAII `Ring` and `Arena`, the buffer pool,
@@ -64,10 +68,14 @@ target_compile_options(koru PRIVATE ${KORU_WARNINGS} ${KORU_SAN_FLAGS})
 
 # The device-free half: the slab, the op state machine and the vocabulary. It
 # needs no module, so ctest runs it on the host.
-add_executable(koru_cpp_unit cpp/tests/harness.cpp cpp/tests/unit.cpp)
+add_executable(koru_cpp_unit cpp/tests/harness.cpp cpp/tests/unit.cpp
+                             cpp/tests/task.cpp)
 target_include_directories(koru_cpp_unit PRIVATE cpp/tests)
 target_link_libraries(koru_cpp_unit PRIVATE koru)
-target_compile_options(koru_cpp_unit PRIVATE ${KORU_WARNINGS} ${KORU_SAN_FLAGS})
+# -O2 even in the plain build: GCC performs a coroutine's symmetric transfer
+# only with optimization on, and the task cases measure exactly that. Without
+# it this target is testing the compiler's debug codegen instead.
+target_compile_options(koru_cpp_unit PRIVATE ${KORU_WARNINGS} -O2 ${KORU_SAN_FLAGS})
 target_link_options(koru_cpp_unit PRIVATE ${KORU_SAN_FLAGS})
 
 # The device suite, mirroring rust/sys/tests/kernel.rs case for case. It needs

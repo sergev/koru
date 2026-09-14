@@ -89,19 +89,6 @@ The ABI is settled, and so is the surface design. This phase transcribes it,
 which is what makes the language-neutrality claim a test rather than an
 assertion.
 
-### T41 [R] — `task<T>`
-
-Lazy `initial_suspend`, **symmetric transfer** on `final_suspend`, move-only,
-`unhandled_exception` going to `std::terminate`. Plus `sync_wait(task<T>)`, and
-`get_return_object_on_allocation_failure` so a frame-allocation failure yields a
-null `task` rather than undefined behaviour — one static member function, and
-what makes Braam's pervasive `if (task<T> t = ...)` idiom compile.
-
-Done test: 100,000 nested `co_await`s complete with stack usage *measured* flat,
-not assumed. This is the symmetric-transfer regression test and it silently
-passes if you write it wrong and only try ten levels. A task destroyed without
-being awaited must leak nothing under LSan.
-
 ### T42 [R] — C++ executor
 
 Ready queue, a `run()` whose park is `ENTER(min_complete=1, timeout)`, and a CQE

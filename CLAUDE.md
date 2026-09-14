@@ -305,6 +305,16 @@ heap-use-after-free the phase was written around, which is why the gate builds
 its own sanitized directory and asks the binary — not the cache — whether ASan
 is really in it.
 
+T41 added `task<T>`: lazy, move-only, symmetric-transferring at both ends, and
+null rather than undefined when a frame will not allocate. Its done test — a
+hundred thousand nested awaits with the stack measured — found a fact about the
+toolchain rather than the code: **GCC performs the tail call only at -O2**
+(at -O1 it costs 64 bytes a level; at -O0 the chain overflows the stack), and
+**GCC's ASan defeats it at every level with no flag to recover it**. So the
+C++ binding is built with optimization on, the depth case measures in the plain
+build and runs shallow under a sanitizer while saying so, and doc/Notes.md has
+every number.
+
 T14 made the two userspace ABI mirrors a diff rather than a promise.
 `cpp/include/koru_abi.h` and `cpp/include/koru_errno.h` are the C mirrors,
 shared with `test/`, and an `abi_dump` on each side emits a canonical record
@@ -409,7 +419,8 @@ Verified toolchain: rustc and cargo 1.98.1 from **rustup**, with the `rust-src`
 component, plus bindgen 0.72.1, clang and lld 21 from Debian testing, and
 `make LLVM=1`. `make LLVM=1 rustavailable` passes. Floors from the design were
 rustc 1.85.0 and bindgen 0.71.1. For C++: GCC ≥ 11 or Clang ≥ 14, `-std=c++20`,
-built with `-fsanitize=address,undefined`.
+built with `-fsanitize=address,undefined` **and with optimization on** — GCC
+performs a coroutine's symmetric transfer only at -O2, which T41 measured.
 
 T13 moved the whole project off Debian's rustc 1.95.0 onto rustup's 1.98.1;
 `~/.cargo/env` puts it ahead of `/usr/bin`. Kernel Rust needs `rust-src`, so

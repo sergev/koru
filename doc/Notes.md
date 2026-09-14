@@ -4151,6 +4151,68 @@ finished would test the destructor and nothing else.
   returns to the pool, the reused index is a different one, and the live count
   never falls to zero.
 
+### T41: `task<T>`, and the compiler's part in symmetric transfer
+
+`task.hpp` is lazy (`initial_suspend` is `suspend_always`), move-only,
+terminating on an exception, and transferring symmetrically at both ends:
+`task::await_suspend` returns the *callee's* handle and `final_suspend`'s
+awaiter returns the *continuation's*, or `noop_coroutine()` where there is
+none. `sync_wait` drives the task and nothing else — a task that suspends on
+the reactor needs the executor, and saying so beats blocking for ever on a ring
+nobody is pumping.
+
+`get_return_object_on_allocation_failure` makes a frame that would not allocate
+a **null task** rather than undefined behaviour, which is what Braam's
+pervasive `if (task<T> t = ...)` idiom needs to mean anything. Declaring it is
+what makes the compiler use the nothrow `operator new`; the promise supplies
+one, routed through `detail::fail_frame_allocations` so the one test that has
+to reach that path can.
+
+### The done test found something about the toolchain, not the code
+
+A hundred thousand nested awaits, with the stack measured at every level on the
+way down *and* on the way back up, because the two transfers fail
+independently. What it measured:
+
+- clang, -O0: 368 bytes. clang, -O2: 49 bytes.
+- **g++, -O0: stack overflow.** g++, -O1: 6,400,064 bytes — 64 a level.
+  g++, -O2: 56 bytes.
+
+The standard says the continuation is resumed *as if by a tail call*. Clang
+does it at every optimization level; **GCC does it only at -O2**. So the C++
+binding must be built with optimization on GCC, `koru_cpp_unit` carries `-O2`
+of its own, and the sanitized flags carry it too.
+
+### GCC's AddressSanitizer defeats symmetric transfer outright
+
+And there is no flag that brings it back. A sanitized frame cannot be
+tail-called out of, and `--param asan-use-after-return=0`,
+`-fno-sanitize-address-use-after-scope` and the runtime
+`detect_stack_use_after_return=0` all leave the hundred-thousand chain dying of
+a stack overflow at -O2. (`-fno-sanitize-address-use-after-return` is clang's
+spelling and GCC rejects it.)
+
+Clang's sanitizer runtime is a separate Debian package that is not installed
+here — the same reason `scripts/screen.sh` defaults to GCC — so the sanitized
+build is GCC's and cannot measure this. The depth case therefore runs shallow
+under `__SANITIZE_ADDRESS__`, still asserts its result, and **says in its own
+output that it is not a measurement**. The measurement is the plain build's,
+which `ctest` runs on the host with no VM.
+
+This is the same shape as the note about HALO elision one section down: a
+coroutine guarantee that is real in the standard and conditional in practice.
+Do not design around either.
+
+### What was shown to fail
+
+- **The transfer into the callee calls `.resume()`** instead of returning the
+  handle: 4,800,049 bytes of stack over the chain, named by the assertion.
+- **The transfer out resumes the continuation** instead of returning it: the
+  same number, from the other direction.
+- **`~task` leaks the frame** rather than destroying it: LeakSanitizer reports
+  the coroutine frames at exit, which is the whole of the "destroyed without
+  being awaited must leak nothing" claim.
+
 ### Where C++ is weaker, and what actually carries the safety
 
 Rust's move semantics make "the buffer is moved into the operation" a
