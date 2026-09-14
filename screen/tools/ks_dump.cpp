@@ -99,6 +99,7 @@ int main()
     konst("KS_F_TAKE", "u16", KS_F_TAKE);
     konst("KS_F_SET", "u16", KS_F_SET);
     konst("KS_F_STALE", "u16", KS_F_STALE);
+    konst("KS_F_BYTES", "u16", KS_F_BYTES);
     konst("KS_F_ECHO_SHOW", "u16", KS_F_ECHO_SHOW);
     konst("KS_F_ECHO_FRESH", "u16", KS_F_ECHO_FRESH);
     konst("KS_F_ECHO_END", "u16", KS_F_ECHO_END);

@@ -73,6 +73,10 @@ pub const KS_F_SET: u16 = 1;
 /// A `BLIT` reply's: the geometry moved, so nothing was drawn.
 pub const KS_F_STALE: u16 = 1;
 
+/// `HELLO`: this connection is the byte channel. The handshake is the last
+/// frame on it; everything after is ANSI bytes, and the daemon answers nothing.
+pub const KS_F_BYTES: u16 = 1;
+
 pub const KS_F_ECHO_SHOW: u16 = 1;
 pub const KS_F_ECHO_FRESH: u16 = 2;
 pub const KS_F_ECHO_END: u16 = 4;
@@ -80,6 +84,7 @@ pub const KS_F_ECHO_END: u16 = 4;
 /// Every flag this op accepts on a *request*. [`KS_F_STALE`] is a reply's.
 pub const fn ks_flags_all(op: u32) -> u16 {
     match op {
+        KS_OP_HELLO => KS_F_BYTES,
         KS_OP_KEY_CLAIM | KS_OP_SCREEN_CLAIM => KS_F_TAKE,
         KS_OP_CURSOR => KS_F_SET,
         KS_OP_ECHO => KS_F_ECHO_SHOW | KS_F_ECHO_FRESH | KS_F_ECHO_END,
@@ -473,6 +478,7 @@ mod tests {
     /// on an op that never reads it.
     #[test]
     fn only_the_ops_that_read_a_flag_accept_one() {
+        assert_eq!(ks_flags_all(KS_OP_HELLO), KS_F_BYTES);
         assert_eq!(ks_flags_all(KS_OP_KEY_CLAIM), KS_F_TAKE);
         assert_eq!(ks_flags_all(KS_OP_SCREEN_CLAIM), KS_F_TAKE);
         assert_eq!(ks_flags_all(KS_OP_CURSOR), KS_F_SET);
@@ -481,7 +487,6 @@ mod tests {
             KS_F_ECHO_SHOW | KS_F_ECHO_FRESH | KS_F_ECHO_END
         );
         for op in [
-            KS_OP_HELLO,
             KS_OP_KEY_READ,
             KS_OP_BLIT,
             KS_OP_STYLE,

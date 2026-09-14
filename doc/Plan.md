@@ -67,12 +67,12 @@ ABI.
 
 ## Phase 9 — the screen
 
-Built, except the byte channel below. `koru-screen` is a daemon owning an SDL3
-window and a full terminal emulator; clients reach it over a Unix socket they
-`ADOPT_FD` into the ring, so every blit and every key travels through `WRITE`,
-`READ` and `POLL_ADD`, and no kernel opcode was added. `ProcScreen` keeps its
-six methods and the transport is invisible above it. doc/Notes.md has the
-design and what each task taught.
+Built. `koru-screen` is a daemon owning an SDL3 window and a full terminal
+emulator; clients reach it over a Unix socket they `ADOPT_FD` into the ring, so
+every blit, every key and every printed byte travels through `WRITE`, `READ`
+and `POLL_ADD`, and no kernel opcode was added. `ProcScreen` keeps its six
+methods and the transport is invisible above it. doc/Notes.md has the design
+and what each task taught.
 
 Three extensions stay deferred, and the design is shaped so each is additive
 rather than a rewrite. **Multiplexing** — several clients, foreground
@@ -82,31 +82,6 @@ byte channel, which the client cannot distinguish, and which is what would let
 a shell run in the window. **Reconnecting** to a restarted daemon, which a
 full-screen program would never notice, because the resize path already marks
 the whole grid damaged. Add them here as tasks when one of them is wanted.
-
-### T38b [M] — the byte channel
-
-Phase 9's design has two connections per client: the framed protocol, and a raw
-ANSI byte stream whose far end is the daemon's parser, which **is** stdout — so
-`write_all` stays a plain `WRITE` to an adopted handle with no framing in the
-way, and the non-painting programs print into the scrolling screen. T38 built
-everything else and left this; the protocol has room for it, and nothing else
-in Phase 9 needed it.
-
-A flag on `KS_OP_HELLO` names the connection's kind, so one listening socket
-still serves both: a client connects twice, says which is which, and the daemon
-feeds one into `screen_write` and answers nothing on it. The runtime adopts it
-as stdout in `install`, where the standard streams are already re-opened and
-adopted — which is the part that needs care, because that happens before any
-program has asked for a screen.
-
-Done test: `hello` and `date` under the daemon put their output on the
-scrolling screen rather than on the terminal koru was started from, asserted
-with T35's ink oracle through a snapshot; a program whose stdout is redirected
-to a file is unaffected, which is the case that says the adoption is conditional
-rather than unconditional; and `less`'s `cat` path still writes to the file it
-was given. Then the ordering rule: a program that paints *and* prints must see
-its bytes appear in the scrolling screen it was writing to, not braided into a
-blit — which is T37's single-writer rule again, one connection over.
 
 ## Phase 10 — the C++ binding
 

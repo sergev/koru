@@ -102,6 +102,7 @@ fn main() {
     konst(&mut out, "KS_F_TAKE", "u16", KS_F_TAKE as u64);
     konst(&mut out, "KS_F_SET", "u16", KS_F_SET as u64);
     konst(&mut out, "KS_F_STALE", "u16", KS_F_STALE as u64);
+    konst(&mut out, "KS_F_BYTES", "u16", KS_F_BYTES as u64);
     konst(&mut out, "KS_F_ECHO_SHOW", "u16", KS_F_ECHO_SHOW as u64);
     konst(&mut out, "KS_F_ECHO_FRESH", "u16", KS_F_ECHO_FRESH as u64);
     konst(&mut out, "KS_F_ECHO_END", "u16", KS_F_ECHO_END as u64);

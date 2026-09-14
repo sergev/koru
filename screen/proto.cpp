@@ -34,7 +34,15 @@ struct Server {
     Conn *keys     = nullptr; // who holds the raw keys
     Conn *screen   = nullptr; // who holds the alternate screen
     std::vector<Conn *> conns;
+    // Byte-channel writes that arrived while the alternate screen was up. They
+    // belong to the scrolling screen, which is not on show, so they wait for it
+    // rather than landing in somebody's blit.
+    std::vector<uint8_t> deferred;
 };
+
+// The most of it that is kept. Beyond this the oldest goes, as a scrolling
+// screen's own history does.
+constexpr size_t DEFER_MAX = 256 * 1024;
 
 struct Conn {
     Server *s = nullptr;
@@ -45,6 +53,7 @@ struct Conn {
 
     bool hello  = false;
     bool closed = false;
+    bool bytes  = false; // the byte channel: no frames after the handshake
 
     bool parked   = false; // a KEY_READ waiting for a key
     uint32_t park_seq = 0;
@@ -131,6 +140,31 @@ void screen_save(Conn &c)
     screen_clear(t);
 }
 
+// The byte channel's bytes. They are the scrolling screen's, so while the
+// alternate screen is up they wait: a print must not be braided into a blit.
+void bytes_in(Conn &c, const uint8_t *data, size_t n)
+{
+    Server &s = *c.s;
+    if (!s.screen) {
+        screen_write(*s.t, Str(reinterpret_cast<const char *>(data), n));
+        return;
+    }
+    s.deferred.insert(s.deferred.end(), data, data + n);
+    if (s.deferred.size() > DEFER_MAX)
+        s.deferred.erase(s.deferred.begin(),
+                         s.deferred.begin() + long(s.deferred.size() - DEFER_MAX));
+}
+
+// Everything held while the screen was claimed, now that it is back.
+void bytes_flush(Server &s)
+{
+    if (s.deferred.empty())
+        return;
+    std::vector<uint8_t> held;
+    held.swap(s.deferred);
+    screen_write(*s.t, Str(reinterpret_cast<const char *>(held.data()), held.size()));
+}
+
 void screen_restore(Conn &c)
 {
     if (!c.saved.held)
@@ -153,6 +187,7 @@ void screen_restore(Conn &c)
     screen_move(t, c.saved.cursor_x, c.saved.cursor_y);
     screen_cursor(t, c.saved.cursor_on != 0);
     c.saved.cells.clear();
+    bytes_flush(*c.s);
 }
 
 // ---------------------------------------------------------------------------
@@ -420,7 +455,8 @@ void do_style(Conn &c, const ks_head &h, const uint8_t *body, size_t n)
 
 void do_hello(Conn &c, const ks_head &h, const uint8_t *body, size_t n)
 {
-    if (n != sizeof(ks_hello)) {
+    // HELLO is answered before dispatch's flag check, so it makes its own.
+    if (n != sizeof(ks_hello) || (h.flags & ~ks_flags_all(KS_OP_HELLO))) {
         reply_err(c, h.op, h.seq, KS_EINVAL);
         return;
     }
@@ -433,6 +469,7 @@ void do_hello(Conn &c, const ks_head &h, const uint8_t *body, size_t n)
         return;
     }
     c.hello = true;
+    c.bytes = (h.flags & KS_F_BYTES) != 0;
 
     ks_hello_rep r{};
     r.magic     = KS_MAGIC;
@@ -612,6 +649,12 @@ bool feed(Conn &c, const uint8_t *data, size_t n)
 {
     if (c.closed)
         return false;
+    // Past its handshake a byte channel carries no frames at all, so nothing
+    // below it ever runs again and C1 is over the one frame it did send.
+    if (c.bytes) {
+        bytes_in(c, data, n);
+        return true;
+    }
     c.in.insert(c.in.end(), data, data + n);
 
     for (;;) {
@@ -638,6 +681,15 @@ bool feed(Conn &c, const uint8_t *data, size_t n)
         c.in.erase(c.in.begin(), c.in.begin() + h.len);
         if (c.closed)
             return false;
+        if (c.bytes) {
+            // That frame was the byte channel's handshake, and it can share a
+            // read with the bytes behind it.
+            std::vector<uint8_t> rest;
+            rest.swap(c.in);
+            if (!rest.empty())
+                bytes_in(c, rest.data(), rest.size());
+            return true;
+        }
     }
     return true;
 }
@@ -665,6 +717,16 @@ bool conn_closed(const Conn &c)
 const ConnStats &conn_stats(const Conn &c)
 {
     return c.stats;
+}
+
+bool conn_is_bytes(const Conn &c)
+{
+    return c.bytes;
+}
+
+size_t server_deferred(const Server &s)
+{
+    return s.deferred.size();
 }
 
 bool conn_has_keys(const Conn &c)

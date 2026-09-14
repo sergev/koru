@@ -517,6 +517,93 @@ void test_proto()
         CHECK_EQ(cell_at(0, 0), was);
     }
 
+    // --------------------------------------------------------- the byte channel
+    //
+    // T38b: the second connection, whose far end is the parser. Its handshake
+    // is its last frame; the bytes after it are not frames and are answered
+    // with nothing at all.
+    fresh(16, 3);
+    {
+        Conn *ctrl = cn;
+        ks_hello hi{ KS_MAGIC, KS_ABI_VERSION };
+
+        cn = conn_new(*srv);
+        CHECK(cn != nullptr);
+        send(frame(KS_OP_HELLO, 1, KS_F_BYTES, &hi, sizeof(hi)));
+        {
+            std::vector<ks_head> r = replies();
+            CHECK_EQ(r.size(), 1u);
+            CHECK_EQ(at(r, 0).res, 0);
+        }
+        CHECK(conn_is_bytes(*cn));
+
+        // Bytes, not a frame: they paint, and nothing is written back.
+        feed(*cn, reinterpret_cast<const uint8_t *>("hi"), 2);
+        CHECK_EQ(cell_at(0, 0), 'h');
+        CHECK_EQ(cell_at(1, 0), 'i');
+        CHECK_EQ(replies().size(), 0u);
+        CHECK_EQ(conn_stats(*cn).frames, 1u);
+        CHECK_EQ(conn_stats(*cn).replies, 1u);
+        CHECK(!conn_closed(*cn));
+
+        // A frame it would have answered before its handshake is text now.
+        std::vector<uint8_t> f = frame(KS_OP_TTY, 2, 0, nullptr, 0);
+        feed(*cn, f.data(), f.size());
+        CHECK_EQ(replies().size(), 0u);
+        CHECK_EQ(conn_stats(*cn).frames, 1u);
+        conn_free(cn);
+
+        // The handshake and the bytes behind it can share one read.
+        screen_clear(t0());
+        cn                     = conn_new(*srv);
+        std::vector<uint8_t> h = frame(KS_OP_HELLO, 1, KS_F_BYTES, &hi, sizeof(hi));
+        h.insert(h.end(), { 'a', 'b' });
+        feed(*cn, h.data(), h.size());
+        CHECK_EQ(replies().size(), 1u);
+        CHECK_EQ(cell_at(0, 0), 'a');
+        CHECK_EQ(cell_at(1, 0), 'b');
+        conn_free(cn);
+
+        // A flag on HELLO that names nothing is content, not a kind.
+        cn = conn_new(*srv);
+        refused(frame(KS_OP_HELLO, 1, 0x8000, &hi, sizeof(hi)), KS_EINVAL,
+                "a hello flag this daemon does not know");
+        CHECK(!conn_is_bytes(*cn));
+        conn_free(cn);
+
+        // The ordering rule: while somebody holds the alternate screen the
+        // bytes are the *scrolling* screen's, so they wait for it rather than
+        // landing in the middle of a blit.
+        cn = ctrl;
+        screen_clear(t0());
+        take_screen();
+        Conn *bytes = conn_new(*srv);
+        feed(*bytes, h.data(), sizeof(ks_head) + sizeof(hi)); // its handshake alone
+        feed(*bytes, reinterpret_cast<const uint8_t *>("held"), 4);
+        CHECK_EQ(cell_at(0, 0), 0u); // the alternate screen is untouched
+        CHECK_EQ(server_deferred(*srv), 4u);
+
+        send(frame(KS_OP_SCREEN_CLAIM, 80, 0, nullptr, 0)); // give it back
+        replies();
+        CHECK(!conn_has_screen(*cn));
+        CHECK_EQ(server_deferred(*srv), 0u);
+        CHECK_EQ(cell_at(0, 0), 'h');
+        CHECK_EQ(cell_at(3, 0), 'd');
+
+        // What is held is bounded, and it is the tail that is kept: a program
+        // printing into a claimed screen must not grow the daemon without end.
+        take_screen();
+        std::vector<uint8_t> flood(1u << 20, ' ');
+        feed(*bytes, flood.data(), flood.size());
+        CHECK(server_deferred(*srv) < flood.size());
+        feed(*bytes, reinterpret_cast<const uint8_t *>("\rEND"), 4);
+        send(frame(KS_OP_SCREEN_CLAIM, 81, 0, nullptr, 0));
+        replies();
+        CHECK_EQ(server_deferred(*srv), 0u);
+        CHECK_EQ(cell_at(0, 2), 'E'); // the tail, on the row the flood left
+        conn_free(bytes);
+    }
+
     // Every case above asserted its own replies; this is the invariant over
     // all of them, which is what C1 transposed actually says — with the one
     // term for a parked read, whose reply is owed and not yet written.

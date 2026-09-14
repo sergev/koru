@@ -376,9 +376,14 @@ pub async fn stat_fd(fd: Handle) -> Result<FileInfo> {
     Ok(out)
 }
 
-/// Whether `fd` names a character device, which is the closest koru can get to
-/// "the console" before the screen protocol lands. `Buffering::Auto` asks.
+/// Whether `fd` is the console: the screen's byte channel, or a character
+/// device. `Buffering::Auto` asks.
 pub(crate) async fn is_console(fd: Handle) -> bool {
+    // The byte channel is a socket, so `STAT` cannot answer for it: only the
+    // runtime knows which socket is the terminal.
+    if rt::is_screen(fd) {
+        return true;
+    }
     let rt = rt::current();
     let Some(slot) = rt.acquire() else {
         return false;

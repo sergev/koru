@@ -130,6 +130,10 @@ KS_STATIC_ASSERT(sizeof(struct ks_head) % KS_ALIGN == 0, "the header is 8-aligne
 #define KS_F_SET   1u // CURSOR: set it, else only ask
 #define KS_F_STALE 1u // BLIT reply: the geometry moved, so nothing was drawn
 
+// HELLO: this connection is the byte channel. The handshake is the last frame
+// on it; everything after is ANSI bytes, and the daemon answers nothing.
+#define KS_F_BYTES 1u
+
 // ECHO's three, Braam's SYS_ECHO_*.
 #define KS_F_ECHO_SHOW  1u // leave the cursor on
 #define KS_F_ECHO_FRESH 2u // start from a fresh line
@@ -140,6 +144,8 @@ KS_STATIC_ASSERT(sizeof(struct ks_head) % KS_ALIGN == 0, "the header is 8-aligne
 static inline uint16_t ks_flags_all(uint32_t op)
 {
     switch (op) {
+    case KS_OP_HELLO:
+        return (uint16_t)KS_F_BYTES;
     case KS_OP_KEY_CLAIM:
     case KS_OP_SCREEN_CLAIM:
         return (uint16_t)KS_F_TAKE;

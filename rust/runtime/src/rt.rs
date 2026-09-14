@@ -41,6 +41,8 @@ type Hook = Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = ()>>>>;
 struct Ambient {
     rt: Runtime,
     std: [Handle; 3],
+    /// The screen's byte channel, where stdout is one. `Handle(0)` otherwise.
+    screen: Handle,
     pos: HashMap<u32, Pos>,
 }
 
@@ -73,11 +75,29 @@ pub fn install(rt: Runtime) {
         *c.borrow_mut() = Some(Ambient {
             rt: rt.clone(),
             std: [Handle(0); 3],
+            screen: Handle(0),
             pos: HashMap::new(),
         })
     });
     for fd in 0..3i32 {
-        let (h, seekable) = adopt_std(&rt, fd);
+        // stdout is the screen's byte channel where there is one to have, so
+        // the terminal koru was started from is never adopted in its place.
+        let screen = if fd == 1 {
+            crate::screen::adopt_byte_channel(&rt)
+        } else {
+            None
+        };
+        let (h, seekable) = match screen {
+            Some(h) => (h, false),
+            None => adopt_std(&rt, fd),
+        };
+        if screen.is_some() {
+            AMBIENT.with(|c| {
+                if let Some(a) = c.borrow_mut().as_mut() {
+                    a.screen = h;
+                }
+            });
+        }
         if h.0 != 0 {
             // No path: nothing here was opened by name, so `truncate_fd`
             // refuses a standard stream as Braam's `seek_fd` refuses one.
@@ -110,6 +130,12 @@ pub fn stdout() -> Handle {
 
 pub fn stderr() -> Handle {
     std_handle(2)
+}
+
+/// True where `h` is the screen's byte channel. It is a socket, so nothing
+/// about the handle itself says it is a console; only this does.
+pub(crate) fn is_screen(h: Handle) -> bool {
+    h.0 != 0 && AMBIENT.with(|c| c.borrow().as_ref().is_some_and(|a| a.screen == h))
 }
 
 /// `Handle(0)` where the descriptor could not be adopted — never a valid

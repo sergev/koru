@@ -206,13 +206,13 @@ a binary that ran nothing would pass.
 ## The screen end to end
 
 `scripts/run-e2e.sh` boots the VM and runs `scripts/e2e.sh` in it: the spawn
-race, the lifecycle at both ends, and Braam's `less` painting a real window
-under SDL's offscreen driver. It is the only gate that needs all three of the
-module, SDL and a runtime directory, which is why it is its own.
+race, the lifecycle at both ends, the byte channel, and Braam's `less` painting
+a real window under SDL's offscreen driver. It is the only gate that needs all
+three of the module, SDL and a runtime directory, which is why it is its own.
 
 ```sh
 cmake -B build && cmake --build build      # the daemon and ks_pixel
-(cd rust && cargo build --examples)        # less and screen_probe
+(cd rust && cargo build --examples)        # less, hello, date and screen_probe
 scripts/run-e2e.sh
 ```
 
@@ -221,8 +221,17 @@ racing from nothing produce exactly one daemon and all twenty connect; twenty
 more against a live daemon leave its pid alone; a socket whose daemon was
 killed is replaced; a client whose daemon is killed exits non-zero saying the
 connection is closed; a client killed mid-blit gives the screen back and the
-next one is served; and `less` paints a status line whose modal colour is the
-palette's cyan, which is a pixel assertion rather than "it ran".
+next one is served; `hello` and `date` print on the window rather than on the
+terminal they were started from, while a redirected stdout is untouched; and
+`less` paints a status line whose modal colour is the palette's cyan, which is
+a pixel assertion rather than "it ran".
+
+The byte channel's cases need a terminal to be started from, which `script`
+supplies: the child's stdout is a pty, so what the pty saw is exactly what
+would have been printed where koru was started, and an empty capture is the
+assertion. Every row is measured from its **second** cell, because the first is
+where the block cursor sits and 320 pixels of cursor would make a blank row
+look written on.
 
 Two rules the counting depends on, both learned the hard way. The daemon is
 counted by an **exact** command line, because this script's own environment

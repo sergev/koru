@@ -3857,15 +3857,6 @@ about a rectangle of it: the status line's modal colour must be the palette's
 cyan — which `less` paints and nothing else in the run does — and the first
 body row must have ink on it.
 
-### The byte channel is not built
-
-Phase 9's design has two connections per client: this framed protocol, and a
-raw ANSI byte stream that *is* stdout, so a non-painting program prints into
-the scrolling screen. None of T38's done tests need it, and it is not here: a
-koru program's stdout is still whatever it was started with. The protocol has
-room for it — a flag on `HELLO` names the connection's kind — and Plan.md
-carries it as a task.
-
 ### What was shown to fail
 
 - **The spawn is not locked.** Twenty daemons, and three later cases fail with
@@ -3881,6 +3872,118 @@ carried the daemon's path, so every daemon count was one too many; and twenty
 clients appending to one file braided their lines, so the connected count came
 out short. The first was fixed with an exact match on the command line, the
 second with a file per client — **the single-writer rule, in the test harness.**
+
+## The byte channel
+
+T38b is the second connection Phase 9's design always had: a raw ANSI byte
+stream whose far end is the daemon's parser, which **is** stdout. `write_all`
+stays a plain `WRITE` to an adopted handle with no framing in the way, and a
+program that only prints puts its output on the scrolling screen.
+
+### One flag, and the version did not move
+
+`KS_F_BYTES` on `HELLO` names the connection's kind, so one listening socket
+serves both and a client simply connects twice. The change to the wire is that
+constant and `ks_flags_all(KS_OP_HELLO)`, which `ks_dump` evaluates over every
+op number — so the diff sees it, and deleting it from one mirror fails
+`scripts/abi.sh` on the `opvec` line for op 1.
+
+`KS_ABI_VERSION` stays 1 because the addition is compatible in both directions:
+a daemon that does not know the flag rejects the handshake with `-EINVAL` and
+the client keeps the stdout it was given, and a client that does not send it
+gets what it always got.
+
+**`HELLO` is answered before `dispatch`'s flag check**, so it has to make its
+own. That hole has been there since T33 and meant nothing while no flag on
+`HELLO` meant anything; it is one line, and deleting it fails exactly one case.
+
+### The adoption is conditional, and both halves are load-bearing
+
+`install` takes the byte channel as stdout only when the program's stdout is
+the terminal koru was started from *and* a daemon is already listening.
+A redirected stdout is the user's own instruction and stays where it points —
+which is what makes `less`'s `cat` path, and every test that captures output,
+work unchanged. And **this never spawns a daemon**: `install` runs before any
+program has asked for a screen, and a window nobody wanted is worse than no
+window. `Screen::connect` spawns; this connects.
+
+The handshake is synchronous POSIX, as `connect_or_spawn`'s preamble is. There
+is nothing to read on this connection ever again, so a pump task and a `seq`
+map would be machinery for one round trip.
+
+### A print belongs to the scrolling screen, so it waits for it
+
+The ordering rule. While somebody holds the alternate screen, byte-channel
+writes are held on the server and replayed into the scrolling screen when the
+claim goes back. A pager's display is not corrupted by a stray print, and the
+print is not lost: it appears where it would have gone. What is held is bounded
+and it is the **tail** that survives, as a scrolling screen's own history is.
+
+This is stronger than a terminal emulator, which paints the bytes into the
+alternate screen and leaves the pager to redraw, and it is what the plan asked
+for: the bytes appear in the scrolling screen they were written to, not braided
+into a blit.
+
+It also dissolves most of the two-connection ordering hazard on its own.
+Everything a print and a claim can do to the scrolling screen is re-serialised
+through one buffer, so the two orders are indistinguishable in the result. What
+is left is `STYLE`, `CURSOR` and `ECHO` racing bytes while *no* claim is held —
+the line-editor surface, which no client calls yet.
+
+### The event loop drains byte channels first, and nothing checks it
+
+A client that waits for its write to complete before sending a frame has its
+bytes in the daemon's socket buffer already, so taking them first is what makes
+the daemon honour the client's own order. It is two passes over one client
+list.
+
+**Nothing tests it.** The deferral above hides it from every case there is, and
+the case that would show it needs a client that sends `STYLE` or `CURSOR` —
+which arrives with the C++ surface, not before. `ks_daemon.cpp` is the socket
+loop and has no test but the end-to-end run, so this is recorded rather than
+demonstrated.
+
+### A socket is not a character device
+
+`Buffering::Auto` asks `is_console`, which is `STAT` saying `S_IFCHR`. The byte
+channel is a Unix socket and *is* the console, and nothing about the handle
+says so: only the runtime knows. So `is_console` consults the runtime first.
+Without it a buffered line waits for the at-exit flush, which is what the probe
+that writes one and then sleeps demonstrates.
+
+### `script` is how a shell script gets a terminal to be started from
+
+The done test's whole point is *where* the bytes did not go, and that needs a
+terminal for them not to go to. `script -qec CMD /dev/null` gives the child a
+pty and copies what the pty saw to its own stdout, so an empty capture is the
+assertion. It works in the virtme-ng guest with both.
+
+### The block cursor is 320 pixels of ink
+
+The first pixel assertion — "the row the print will land on is blank" — failed
+against a blank row, and it was right: the daemon draws a block cursor, one
+cell is 16x20, and `ks_pixel ink` counted it. Worse, the assertion *after* the
+print would have passed on the cursor alone. Every row is now measured from its
+second cell, which is where no cursor in these cases ever sits. **An ink oracle
+over a rectangle the cursor can be in tests the cursor.**
+
+### What was shown to fail
+
+- **The adoption is unconditional** — the `is_terminal` guard deleted. The
+  redirected `hello` writes an empty file and its text turns up on the screen.
+- **There is no byte channel** — the connect refused. `hello` prints on the
+  terminal koru was started from, and no snapshot exists at all.
+- **Nothing is deferred** — the bytes go to whatever is on show. Four model
+  cases fail, and the banner the pager painted is black where the print landed.
+- **What was held is dropped** rather than replayed. Three model cases fail.
+- **The handshake's flag is ignored.** Eleven cases: a byte channel that is
+  still a framed connection answers frames and paints nothing.
+- **`HELLO`'s flags are not masked.** Exactly one case.
+- **The handshake cannot share a read with the bytes behind it.** Two cases.
+- **Nothing bounds what is held.** One case, and it is the only one that would
+  have been a memory leak in a daemon that never exits.
+- **`is_console` does not know the byte channel.** The buffered line waits for
+  the at-exit flush and the row is blank while the program is still running.
 
 ## C++20 userspace binding
 
@@ -4086,7 +4189,8 @@ arrive with their tasks.
 - `rust/runtime/src/textbuf.rs` — `TextBuf` and `TextView`, the pager's and the
   editor's, pure. *exists*
 - `rust/runtime/src/screen.rs` — `ProcScreen` over the socket: the handshake,
-  the pump, the single-writer send path and the banding. *exists*
+  the pump, the single-writer send path, the banding, and the byte channel
+  `install` adopts as stdout. *exists*
 - `rust/runtime/tests/screen.rs` — the client against a fake daemon the test
   speaks itself, over a socketpair, on a real ring. *exists*
 - `rust/runtime/examples/less.rs` — Braam's pager, Phase 9's deliverable, which
@@ -4120,9 +4224,10 @@ arrive with their tasks.
   event pump, the resize path and the snapshot. *exists*
 - `screen/proto.cpp` — the protocol server, pure: frames in, replies out, no
   I/O. The claims are a connection's members, so a client that is killed gives
-  the screen back. *exists*
+  the screen back, and a byte channel's bytes go to the terminal or wait for
+  it. *exists*
 - `screen/ks_daemon.cpp` — the socket, bind-then-rename, and the event loop
-  that does recv, feed and flush. *exists*
+  that does recv, feed and flush, byte channels first. *exists*
 - `screen/tests/` — Braam's own cell-exact suite, ported, the five pixel
   oracles, the protocol's rejection matrix, and two fuzz oracles in their two
   drivers each. *exists*

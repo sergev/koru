@@ -10,7 +10,9 @@
 //!   screen_probe connect        connect and leave, claiming nothing
 //!   screen_probe hold <ms>      keep the screen, painting, for that long
 //!   screen_probe keys           take the keys and report the first one
+//!   screen_probe print <ms>     paint a banner, print, hold, then give it back
 
+use koru::ks_abi::{KS_COLOR_BLACK, KS_COLOR_MAGENTA};
 use koru::{Args, Kind, Screen};
 
 #[koru::main]
@@ -43,6 +45,25 @@ async fn main(args: Args) -> i32 {
         };
     }
 
+    // A buffered stream, never flushed by hand. The byte channel is a socket
+    // and is the console, so this is line-buffered and the line is out before
+    // the sleep; fully buffered, nothing appears until the at-exit flush.
+    if mode == "buffered" {
+        let ms: u32 = if args.size() > 2 {
+            args[2].parse().unwrap_or(1000)
+        } else {
+            1000
+        };
+        if koru::File::stdout().write("buffered line\n").await.is_err() {
+            return 1;
+        }
+        eprintln!("connected {}", std::process::id());
+        if koru::sleep_for(ms).await.is_err() {
+            return 130;
+        }
+        return 0;
+    }
+
     if mode == "connect" {
         // Claims nothing: the screen is exclusive, so twenty clients that all
         // took it would be nineteen refusals and no information about the
@@ -54,6 +75,36 @@ async fn main(args: Args) -> i32 {
     if let Err(e) = screen.take_screen().await {
         koru::errln("screen_probe", "screen", e).await;
         return 1;
+    }
+
+    // Paints *and* prints. The banner is a whole row of magenta, which nothing
+    // else in the run paints, and the print goes to the byte channel: the two
+    // must not meet. The claim goes back when this returns, and the bytes
+    // arrive on the scrolling screen then.
+    if mode == "print" {
+        let ms: u32 = if args.size() > 2 {
+            args[2].parse().unwrap_or(1000)
+        } else {
+            1000
+        };
+        let mut p = screen.root().top(1);
+        p.style(KS_COLOR_BLACK, KS_COLOR_MAGENTA, 0);
+        p.move_to(0, 0);
+        let grid = screen.grid();
+        p.write(grid, "banner");
+        p.fill_row(grid);
+        if let Err(e) = screen.flush().await {
+            koru::errln("screen_probe", "flush", e).await;
+            return 1;
+        }
+        eprintln!("connected {}", std::process::id());
+        if koru::write_all(koru::stdout(), "PRINTED\n").await.is_err() {
+            return 1;
+        }
+        if koru::sleep_for(ms).await.is_err() {
+            return 130;
+        }
+        return 0;
     }
 
     let mut p = screen.root();

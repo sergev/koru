@@ -9,7 +9,8 @@
 //   C1, transposed: every accepted request frame produces exactly one reply.
 //   Without it a client's `seq` map leaks a coroutine that never resumes. The
 //   one exception is a parked KEY_READ, whose reply is owed and not yet
-//   written, so the invariant is `replies + parked == frames`.
+//   written, so the invariant is `replies + parked == frames`. A byte channel
+//   sends exactly one frame, its handshake; the bytes after it are not frames.
 //
 //   E1 splits. A frame that parses and is then rejected on *content* gets an
 //   exact errno and the connection carries on. A frame that does not parse has
@@ -66,6 +67,14 @@ void conn_drain(Conn &c, size_t n);
 
 bool conn_closed(const Conn &c);
 const ConnStats &conn_stats(const Conn &c);
+
+// The byte channel: its handshake said KS_F_BYTES, so everything after it is
+// ANSI bytes rather than frames. The daemon drains these before the framed
+// connections, which is what keeps a client's own write order.
+bool conn_is_bytes(const Conn &c);
+
+// Bytes held back because the alternate screen is up. For the tests.
+size_t server_deferred(const Server &s);
 
 // A key from the window. It answers a parked KEY_READ if there is one, and is
 // dropped if nobody holds the keys — a keystroke with no reader is not queued

@@ -9,12 +9,15 @@
 # clients are koru programs), SDL's offscreen driver (the daemon owns a window)
 # and a writable runtime directory (the socket).
 #
-# PROBE, LESS and DAEMON are absolute paths, passed in by scripts/run-e2e.sh.
+# PROBE, LESS, HELLO, DATE and DAEMON are absolute paths, passed in by
+# scripts/run-e2e.sh.
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 KO=${KO:-$ROOT/kernel/koru.ko}
 PROBE=${PROBE:-}
 LESS=${LESS:-}
+HELLO=${HELLO:-}
+DATE=${DATE:-}
 DAEMON=${DAEMON:-$ROOT/build/koru-screen}
 PIXEL=${PIXEL:-$ROOT/build/ks_pixel}
 RUN=/tmp/koru-e2e
@@ -69,7 +72,7 @@ echo "=== koru screen end to end ==="
 uname -r
 
 fence "environment"
-for f in "$PROBE" "$LESS" "$DAEMON"; do
+for f in "$PROBE" "$LESS" "$HELLO" "$DATE" "$DAEMON"; do
 	if [ ! -x "$f" ]; then
 		echo "NOT BUILT: $f"
 		fail=1
@@ -175,6 +178,88 @@ sleep 0.3
 want "the next client was served" $?
 want_eq "the daemon is still there" "$(daemons)" "1"
 want_eq "and it logged nothing" "$(cat $RUN/daemon.log 2>/dev/null | wc -l)" "0"
+
+# ---------------------------------------------------------- the byte channel
+#
+# T38b. A koru program's stdout is the daemon's parser when — and only when —
+# stdout is the terminal koru was started from and a daemon is already there.
+# `script` supplies that terminal, so what the pty saw is exactly what would
+# have been printed where koru was started.
+fence "the byte channel"
+reset_run
+export KORU_SCREEN_SNAP=$RUN/bc.bmp
+# The daemon first, and by a program that asked for a screen: `install`
+# connects and never spawns, so a program that wanted no window gets none.
+"$PROBE" connect >/dev/null 2>$RUN/bc0.err
+want_eq "a daemon to print on" "$(daemons)" "1"
+
+script -qec "$HELLO" /dev/null >$RUN/hello.tty 2>&1
+sleep 0.3
+want_eq "hello printed nothing where koru was started" "$(wc -c <$RUN/hello.tty)" "0"
+
+if [ -f "$RUN/bc.bmp" ] && [ -x "$PIXEL" ]; then
+	size=$("$PIXEL" $RUN/bc.bmp size)
+	cols=${size%x*}
+	# The cell is 16x20, as the pager's case works it out. Every row is
+	# measured from its second cell, because the first is where the cursor
+	# sits: a block cursor is 320 pixels of ink and would make a blank row
+	# look written on.
+	row_ink() {
+		"$PIXEL" $RUN/bc.bmp ink 16 $(($1 * 20)) $((cols - 16)) 20
+	}
+	want_ink() {
+		if [ "$(row_ink "$2")" -gt 0 ]; then
+			echo "ok: $1"
+		else
+			echo "FAILED: $1"
+			fail=1
+		fi
+	}
+
+	want_ink "it printed on the scrolling screen instead" 0
+
+	script -qec "$DATE" /dev/null >$RUN/date.tty 2>&1
+	sleep 0.3
+	want_eq "date printed nothing there either" "$(wc -c <$RUN/date.tty)" "0"
+	want_ink "and its line is the screen's second" 1
+
+	# The conditional half. A redirected stdout is the user's own instruction:
+	# it stays where it points, and the screen does not move.
+	"$HELLO" >$RUN/hello.file 2>$RUN/hello.file.err
+	sleep 0.3
+	want_eq "a redirected stdout is unaffected" "$(cat $RUN/hello.file)" "Hello, world!"
+	want_eq "and nothing of it reached the screen" "$(row_ink 2)" "0"
+
+	# The ordering rule. A program that paints *and* prints: its bytes belong
+	# to the scrolling screen it was writing to, so they must not appear in
+	# the blit, and they must appear when the claim goes back.
+	script -qec "$PROBE print 1500" /dev/null >$RUN/print.tty 2>&1 &
+	printer=$!
+	sleep 0.8
+	cp $RUN/bc.bmp $RUN/held.bmp
+	# Eight cells of the banner. A braided print would land at the alternate
+	# screen's home, which is exactly there, and paint them black.
+	want_eq "the banner is whole while the screen is held" \
+		"$("$PIXEL" $RUN/held.bmp modal 0 0 128 20)" "cd00cd"
+	want_eq "the print did not go to the terminal either" \
+		"$(grep -c PRINTED $RUN/print.tty)" "0"
+	wait $printer
+	sleep 0.5
+	want_ink "the print arrived when the screen came back" 2
+
+	# The byte channel is a socket, and a socket is not a character device:
+	# only the runtime knows it is the console. Without that, a buffered
+	# stream is fully buffered and this line waits for the at-exit flush.
+	script -qec "$PROBE buffered 2000" /dev/null >$RUN/buf.tty 2>&1 &
+	buffered=$!
+	sleep 0.8
+	want_ink "a buffered line is out before the program is" 3
+	wait $buffered
+else
+	echo "FAILED: no snapshot from the daemon"
+	fail=1
+fi
+unset KORU_SCREEN_SNAP
 
 # ----------------------------------------------------------------- less
 #

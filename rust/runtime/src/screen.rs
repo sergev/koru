@@ -19,6 +19,9 @@
 //!     a workqueue and koru has no op linking, so two concurrent writes on one
 //!     handle have no order, and on a stream socket that braids two frames into
 //!     permanent corruption. Senders queue behind the one in flight.
+//!
+//! The byte channel at the end is the other connection: no frames past its
+//! handshake, and `install` adopts it as stdout.
 
 use crate::future::Handle;
 use crate::grid::{Grid, Pane, Rect};
@@ -613,6 +616,67 @@ impl Screen {
         }
         Ok(())
     }
+}
+
+// ---------------------------------------------------------------------------
+// The byte channel
+// ---------------------------------------------------------------------------
+
+/// The daemon's other connection: the one whose far end is the terminal's
+/// parser rather than the protocol server. It *is* stdout, so `write_all` stays
+/// a plain `WRITE` with no framing in the way.
+///
+/// `None` unless both halves of the question say yes: this program's stdout is
+/// the terminal koru was started from, and a daemon is already listening.
+/// Neither is negotiable. A redirected stdout is the user's own instruction and
+/// stays where it points; and **this never spawns a daemon**, because `install`
+/// runs before any program has asked for a screen and a window nobody wanted is
+/// worse than no window.
+///
+/// The handshake is synchronous POSIX, as [`Screen::connect`]'s preamble is:
+/// there is nothing to read on this connection afterwards, so a pump task and
+/// a `seq` map would be machinery for one round trip.
+pub(crate) fn adopt_byte_channel(rt: &crate::Runtime) -> Option<Handle> {
+    use std::io::{IsTerminal, Read, Write};
+
+    if !std::io::stdout().is_terminal() {
+        return None;
+    }
+    let mut s = std::os::unix::net::UnixStream::connect(sock_path()).ok()?;
+    let wait = std::time::Duration::from_secs(2);
+    s.set_read_timeout(Some(wait)).ok()?;
+    s.set_write_timeout(Some(wait)).ok()?;
+
+    // The lengths are the protocol's own arithmetic, never a number spelled
+    // here: a payload that grows must not have to be found by hand.
+    let mut frame = Vec::with_capacity(ks_req_len(KS_OP_HELLO) as usize);
+    frame.extend_from_slice(&ks_req_len(KS_OP_HELLO).to_le_bytes());
+    frame.extend_from_slice(&(KS_OP_HELLO as u16).to_le_bytes());
+    frame.extend_from_slice(&KS_F_BYTES.to_le_bytes());
+    frame.extend_from_slice(&1u32.to_le_bytes()); // seq, and the only one
+    frame.extend_from_slice(&0i32.to_le_bytes());
+    frame.extend_from_slice(&KS_MAGIC.to_le_bytes());
+    frame.extend_from_slice(&KS_ABI_VERSION.to_le_bytes());
+    s.write_all(&frame).ok()?;
+
+    // A daemon that does not know this flag answers -EINVAL, and one that does
+    // not know the version closes: either way the program keeps the stdout it
+    // was given.
+    let len = ks_rep_len(KS_OP_HELLO) as usize;
+    let mut rep = vec![0u8; len];
+    s.read_exact(&mut rep).ok()?;
+    let word = |i: usize| u32::from_le_bytes(rep[i..i + 4].try_into().unwrap());
+    if word(0) as usize != len || i32::from_le_bytes(rep[12..16].try_into().unwrap()) != 0 {
+        return None;
+    }
+    if word(16) != KS_MAGIC || word(20) != KS_ABI_VERSION {
+        return None;
+    }
+
+    // koru admits a non-regular file only when it was opened non-blocking, and
+    // ADOPT_FD takes a reference of its own: ours goes on the way out.
+    s.set_nonblocking(true).ok()?;
+    rt.block_on(rt.adopt(s.as_raw_fd())).ok()
 }
 
 /// Connects, and starts a daemon if nothing answers.

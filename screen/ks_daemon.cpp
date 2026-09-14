@@ -31,8 +31,9 @@
 namespace {
 
 struct Client {
-    int fd   = -1;
-    Conn *cn = nullptr;
+    int fd    = -1;
+    Conn *cn  = nullptr;
+    bool gone = false; // the peer went, noticed in the read pass
 };
 
 std::string sock_path()
@@ -170,20 +171,29 @@ int main()
             return 0;
         };
 
-        for (size_t i = 0; i < clients.size();) {
-            Client &c   = clients[i];
-            short events = revents_of(c.fd);
-            bool gone   = (events & (POLLHUP | POLLERR)) != 0;
-            if (events & POLLIN) {
+        // Byte channels first, framed connections second. A client that waits
+        // for its write to complete before sending a frame has put its bytes
+        // in our socket buffer already, and this is what makes us take them in
+        // that order: otherwise a print and the blit after it race.
+        for (int pass = 0; pass < 2; pass++)
+            for (Client &c : clients) {
+                if (conn_is_bytes(*c.cn) != (pass == 0))
+                    continue;
+                if (!(revents_of(c.fd) & POLLIN))
+                    continue;
                 uint8_t buf[4096];
                 ssize_t n = recv(c.fd, buf, sizeof(buf), 0);
                 if (n > 0)
                     feed(*c.cn, buf, size_t(n));
                 else if (n == 0)
-                    gone = true;
+                    c.gone = true;
                 else if (errno != EAGAIN && errno != EINTR)
-                    gone = true;
+                    c.gone = true;
             }
+
+        for (size_t i = 0; i < clients.size();) {
+            Client &c = clients[i];
+            bool gone = c.gone || (revents_of(c.fd) & (POLLHUP | POLLERR)) != 0;
             flush_out(c);
             if (gone || conn_closed(*c.cn)) {
                 // The claims go back here — on EOF, on a kill, on a panic,

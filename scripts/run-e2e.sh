@@ -50,11 +50,14 @@ find_example() {
 
 PROBE=$(find_example screen_probe) || exit 1
 LESS=$(find_example less) || exit 1
+HELLO=$(find_example hello) || exit 1
+DATE=$(find_example date) || exit 1
 
 cd "$ROOT" || exit 1
 
 out=$(timeout "$TIMEOUT" vng --run "$KDIR" --user root --memory "$MEMORY" --cpus "$CPUS" \
-	--exec "PROBE='$PROBE' LESS='$LESS' DAEMON='$ROOT/build/koru-screen' \
+	--exec "PROBE='$PROBE' LESS='$LESS' HELLO='$HELLO' DATE='$DATE' \
+		DAEMON='$ROOT/build/koru-screen' \
 		PIXEL='$ROOT/build/ks_pixel' sh scripts/e2e.sh" 2>&1)
 
 verdict=$(echo "$out" | grep -oE 'KORU-E2E-(PASS|FAIL)' | tail -1)

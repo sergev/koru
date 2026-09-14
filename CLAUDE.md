@@ -5,18 +5,18 @@ code in this repository.
 
 ## State of the repository
 
-**T0–T38 are done**, except the byte channel, which is T38b. The kernel
-surface was complete at T29 and grew once more at T30, for `OPEN`'s creation
-flags. Braam's hello world runs through koru, and
-the ring can wait for a descriptor. The module registers `/dev/koru`, configures
-a ring with `SETUP`, and submits `NOP`, `DELAY_NS`, `CHECKSUM`, `OPEN`, `READ`,
-`WRITE`, `CLOSE`, `CANCEL`, `ADOPT_FD`, `POLL_ADD`, `STAT`, `TRUNCATE`,
-`UTIMES`, `READLINK`, `STATX_AT`, `MKDIR`, `SYMLINK`, `UNLINK`, `RMDIR`,
-`RENAME` and `READDIR` through `ENTER`, which blocks for completions. The arena
-is mmap'd, with slot exclusivity enforced by the kernel. Open files live in a
-generational handle table. A queued op can be genuinely dequeued, and
-`close(fd)` cancels whatever is still queued. The whole validation surface has
-been fuzzed under KASAN, lockdep and kmemleak.
+**T0–T38b are done**, and Phase 9 with them. The kernel surface was complete
+at T29 and grew once more at T30, for `OPEN`'s creation flags. Braam's hello
+world runs through koru, on a window koru owns, and the ring can wait for a
+descriptor. The module registers `/dev/koru`, configures a ring with `SETUP`,
+and submits `NOP`, `DELAY_NS`, `CHECKSUM`, `OPEN`, `READ`, `WRITE`, `CLOSE`,
+`CANCEL`, `ADOPT_FD`, `POLL_ADD`, `STAT`, `TRUNCATE`, `UTIMES`, `READLINK`,
+`STATX_AT`, `MKDIR`, `SYMLINK`, `UNLINK`, `RMDIR`, `RENAME` and `READDIR`
+through `ENTER`, which blocks for completions. The arena is mmap'd, with slot
+exclusivity enforced by the kernel. Open files live in a generational handle
+table. A queued op can be genuinely dequeued, and `close(fd)` cancels whatever
+is still queued. The whole validation surface has been fuzzed under KASAN,
+lockdep and kmemleak.
 
 T13 added `rust/sys`: the ABI mirror, the ioctl wrappers, `Ring`, `Arena`,
 `BufPool` and the errno table, with the T4–T11 matrix re-expressed as Rust
@@ -268,8 +268,19 @@ daemon does, so the backlog is 128 and a refusal is retried before it counts as
 death; and a stale socket is cleared three times over, so the case only fails
 when all three are broken. `scripts/run-e2e.sh` is the gate, and the `less`
 assertion is in pixels: the status line's modal colour is the palette's cyan.
-**The byte channel is not built** — a koru program's stdout is still whatever
-it was started with — and Plan.md carries it as T38b.
+
+T38b added the byte channel, the second connection per client: `KS_F_BYTES` on
+`HELLO` names the kind, the daemon feeds that one to the parser and answers
+nothing on it, and `install` adopts it as stdout — but **only** when stdout is
+the terminal koru was started from and a daemon is already listening, and it
+never spawns one. A print belongs to the scrolling screen, so while somebody
+holds the alternate screen the bytes are held and replayed when the claim goes
+back, bounded and tail-first: that is the ordering rule, and it is stronger
+than a terminal emulator's. Two things it taught: an ink oracle over a
+rectangle the block cursor can sit in tests the cursor, not the text; and a
+socket is not a character device, so `is_console` has to ask the runtime or a
+buffered stream waits for the at-exit flush. doc/Notes.md has the nine
+perturbations and the one rule nothing checks.
 
 T14 made the two userspace ABI mirrors a diff rather than a promise.
 `cpp/include/koru_abi.h` and `cpp/include/koru_errno.h` are the C mirrors,

@@ -29,6 +29,7 @@ namespace {
 
 Term *term;
 Server *srv;
+unsigned long byte_channels; // inputs whose handshake asked for one
 
 void die(const char *what)
 {
@@ -139,6 +140,8 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
     count_replies(*c);
     check(*c, *term);
 
+    if (conn_is_bytes(*c))
+        byte_channels++;
     conn_eof(*c);
     conn_free(c); // the claims go back here, which the next input then sees
     return 0;
@@ -268,6 +271,9 @@ int main()
             h.len = uint32_t(sizeof(h) + sizeof(hello));
             h.op  = KS_OP_HELLO;
             h.seq = 1;
+            // Sometimes the byte channel, so the frames generated after it
+            // arrive as ANSI text instead and the transition is exercised.
+            h.flags = pick(6) ? 0 : KS_F_BYTES;
             put(b, &h, sizeof(h));
             put(b, &hello, sizeof(hello));
         }
@@ -280,6 +286,11 @@ int main()
     srv = nullptr;
     term_free(term);
     term = nullptr;
+    // A generator that never asks for the byte channel tests the framed half
+    // twice and the other half not at all.
+    printf("ks_proto_rand: %lu byte channels\n", byte_channels);
+    if (!byte_channels)
+        die("no input reached the byte channel");
     printf("ks_proto_rand: OK\n");
     return 0;
 }
