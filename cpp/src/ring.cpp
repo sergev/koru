@@ -360,6 +360,15 @@ koru_sqe cancel(uint64_t user_data, uint64_t target)
     return s;
 }
 
+koru_sqe adopt_fd(uint64_t user_data, int fd)
+{
+    koru_sqe s = {};
+    s.opcode = KORU_OP_ADOPT_FD;
+    s.off = uint64_t(fd);
+    s.user_data = user_data;
+    return s;
+}
+
 } // namespace sqe
 
 uint64_t arg_offset(uint64_t off, uint32_t len)

@@ -8,16 +8,44 @@
 # Prints exactly one KORU-CPP-PASS or KORU-CPP-FAIL marker, which
 # scripts/run-cpp.sh greps for. Every check below gates that marker.
 #
-# CHECKBIN is the suite binary and FLOOR the number of cases it must run,
-# both passed in by the runner.
+# CHECKBIN is the suite binary and FLOOR the number of cases it must run;
+# DEMO and RUSTDEMO are T15's demo in each language, which must print the same
+# bytes. All four are passed in by the runner.
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 KO=${KO:-$ROOT/kernel/koru.ko}
 CHECKBIN=${CHECKBIN:-$ROOT/build/koru_cpp_check}
-FLOOR=${FLOOR:-67}
+FLOOR=${FLOOR:-71}
+DEMO=${DEMO:-}
+RUSTDEMO=${RUSTDEMO:-}
 FILTERS="$*"
+OUT=/tmp/koru-cpp-out
+ERR=/tmp/koru-cpp-err
+ROUT=/tmp/koru-rs-out
+RERR=/tmp/koru-rs-err
+DATA=/tmp/koru-cpp-data
 
 fail=0
+
+want_eq() {
+	if [ "$2" = "$3" ]; then
+		echo "ok: $1"
+	else
+		echo "MISMATCH $1: got [$2] want [$3]"
+		fail=1
+	fi
+}
+
+same_file() {
+	if cmp -s "$2" "$3"; then
+		echo "ok: $1"
+	else
+		echo "MISMATCH $1:"
+		cmp "$2" "$3" | head -3
+		fail=1
+	fi
+}
+
 fence() { echo "koru-check: $1" > /dev/kmsg 2>/dev/null; echo; echo "=== $1 ==="; }
 
 echo "=== koru c++ suite ==="
@@ -63,6 +91,36 @@ fi
 # A skip is not a pass.
 skips=$(echo "$out" | grep 'KORU-CPP-SKIP')
 [ -z "$skips" ] || { echo "SKIPPED, which is not a pass:"; echo "$skips"; fail=1; }
+
+# T42's done test. Two runtimes that share no code, on one unchanged ABI,
+# printing the same bytes: this is the language-neutrality claim at its
+# sharpest, and a filtered run skips it because it is not a case.
+if [ -z "$FILTERS" ]; then
+	fence "the demo"
+	printf 'one\ntwo\nthree\n' >$DATA
+	if [ ! -x "$DEMO" ]; then
+		echo "NOT BUILT: $DEMO"
+		fail=1
+	else
+		timeout 60 "$DEMO" $DATA >$OUT 2>$ERR
+		want_eq "the C++ demo exited 0" "$?" "0"
+		same_file "it wrote the file and nothing else" "$OUT" "$DATA"
+		want_eq "and the timers completed out of order" "$(cat $ERR)" "10 20 30"
+		# Through a pipe as well: koru refuses a blocking non-regular file, so
+		# this is the re-open before the adopt, not a second write path.
+		want_eq "the same through a pipe" "$(timeout 60 "$DEMO" $DATA 2>/dev/null | cat)" \
+			"$(cat $DATA)"
+	fi
+	if [ ! -x "$RUSTDEMO" ]; then
+		echo "NOT BUILT: $RUSTDEMO"
+		fail=1
+	else
+		timeout 60 "$RUSTDEMO" $DATA >$ROUT 2>$RERR
+		want_eq "the Rust demo exited 0" "$?" "0"
+		same_file "the two demos agree on stdout" "$OUT" "$ROUT"
+		same_file "and on stderr" "$ERR" "$RERR"
+	fi
+fi
 
 fence "rmmod"
 rmmod koru || { echo "RMMOD FAILED"; fail=1; }

@@ -251,6 +251,9 @@ scripts/run-cpp.sh
 scripts/run-cpp.sh cancel read   # only cases whose name matches
 ```
 
+It also runs T15's demo in both languages and compares the bytes on both
+streams, which is why it needs `cargo build --examples` as well as the module.
+
 The verdict is `KORU-CPP-PASS`, and it gates on the same things the Rust runner
 does: the suite's own "OK: 0 failure(s)" line, a floor on the number of cases
 an unfiltered run reached (a filter matching nothing runs none and exits 0), a

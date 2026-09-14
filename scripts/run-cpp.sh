@@ -11,8 +11,9 @@
 # It builds its own directory, because the suite wants ASan and UBSan and
 # `build/` is the plain one the ABI diff uses: T40's claim is that a destroyed
 # frame is never resumed, and without a sanitizer that claim has no instrument.
-# The module is not built here:
+# The module and the Rust demo are not built here:
 #   make -C ../kernel-dev/linux-source-7.1 M=$PWD/kernel LLVM=1
+#   (cd rust && cargo build --examples)
 #
 # Exits non-zero unless everything passed, so it is usable as a gate.
 
@@ -28,7 +29,7 @@ TIMEOUT=${TIMEOUT:-900}
 # The number of cases an unfiltered run must reach. It is the whole of the
 # T4-T11 matrix plus the T3 matrices, and it equals the Rust suite's count for
 # the same sections: raise it when a case is added.
-FLOOR=${FLOOR:-67}
+FLOOR=${FLOOR:-71}
 
 if [ ! -d "$KDIR" ]; then
 	echo "no kernel tree at $KDIR; set KDIR" >&2
@@ -42,8 +43,8 @@ fi
 # CMakeLists.txt records.
 cmake -B "$BUILD" -S "$ROOT" -DCMAKE_CXX_COMPILER="$CXX" -DCMAKE_C_COMPILER="$CC" \
 	-DKORU_SANITIZE=ON >/dev/null || exit 1
-cmake --build "$BUILD" --target koru_cpp_check koru_cpp_unit >/dev/null || {
-	cmake --build "$BUILD" --target koru_cpp_check koru_cpp_unit
+cmake --build "$BUILD" --target koru_cpp_check koru_cpp_unit cpp_read_file >/dev/null || {
+	cmake --build "$BUILD" --target koru_cpp_check koru_cpp_unit cpp_read_file
 	exit 1
 }
 
@@ -63,15 +64,30 @@ fi
 	exit 1
 }
 
+# T42's demo has to be compared against the Rust one, so ask cargo where that
+# is rather than globbing target/debug, where a stale binary would outlive a
+# failed build and pass.
+RUSTDEMO=$(cd "$ROOT/rust" && cargo build -p koru --example read_file \
+	--message-format=json 2>/dev/null |
+	grep -F '"kind":["example"]' |
+	tr ',' '\n' |
+	sed -n 's/.*"executable":"\([^"]*\)".*/\1/p' | tail -1)
+if [ -z "$RUSTDEMO" ] || [ ! -x "$RUSTDEMO" ]; then
+	echo "no Rust read_file example to compare against" >&2
+	echo "run: (cd rust && cargo build --examples)" >&2
+	exit 1
+fi
+
 cd "$ROOT" || exit 1
 
 out=$(timeout "$TIMEOUT" vng --run "$KDIR" --user root --memory "$MEMORY" --cpus "$CPUS" \
-	--exec "CHECKBIN='$BUILD/koru_cpp_check' FLOOR='$FLOOR' sh scripts/cpp.sh $*" 2>&1)
+	--exec "CHECKBIN='$BUILD/koru_cpp_check' FLOOR='$FLOOR' \
+		DEMO='$BUILD/cpp_read_file' RUSTDEMO='$RUSTDEMO' sh scripts/cpp.sh $*" 2>&1)
 
 verdict=$(echo "$out" | grep -oE 'KORU-CPP-(PASS|FAIL)' | tail -1)
 case "$verdict" in
 KORU-CPP-PASS)
-	echo "$out" | grep -E '^(=== |cases: |cases run: |OK: )'
+	echo "$out" | grep -E '^(=== |cases: |cases run: |OK: |ok: )'
 	echo "KORU-CPP-PASS"
 	exit 0
 	;;

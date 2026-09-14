@@ -89,15 +89,6 @@ The ABI is settled, and so is the surface design. This phase transcribes it,
 which is what makes the language-neutrality claim a test rather than an
 assertion.
 
-### T42 [R] — C++ executor
-
-Ready queue, a `run()` whose park is `ENTER(min_complete=1, timeout)`, and a CQE
-path of slab lookup then resume or discard. Close the same empty-ring deadlock
-foot-gun as the Rust side.
-
-Done test: T15's demo in C++, concurrent with delays completing out of order.
-Output byte-identical to the Rust demo.
-
 ### T43 [R] — C++ drop safety
 
 Done test: a mirror of T16 — race a read against a timer, destroy the frame

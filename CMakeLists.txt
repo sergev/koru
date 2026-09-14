@@ -62,7 +62,7 @@ endif()
 # `result<T>` and the errno table, on the same unchanged ABI the Rust binding
 # uses. It builds anywhere; only its suite needs the device.
 add_library(koru STATIC cpp/src/error.cpp cpp/src/ring.cpp cpp/src/pool.cpp
-                        cpp/src/reactor.cpp)
+                        cpp/src/reactor.cpp cpp/src/exec.cpp)
 target_include_directories(koru PUBLIC cpp/include)
 target_compile_options(koru PRIVATE ${KORU_WARNINGS} ${KORU_SAN_FLAGS})
 
@@ -86,6 +86,14 @@ target_include_directories(koru_cpp_check PRIVATE cpp/tests)
 target_link_libraries(koru_cpp_check PRIVATE koru)
 target_compile_options(koru_cpp_check PRIVATE ${KORU_WARNINGS} ${KORU_SAN_FLAGS})
 target_link_options(koru_cpp_check PRIVATE ${KORU_SAN_FLAGS})
+
+# T42's demo: T15's, in C++, and the only thing in this build that is a
+# program rather than a test. scripts/cpp.sh runs it beside the Rust one and
+# compares the bytes.
+add_executable(cpp_read_file cpp/examples/read_file.cpp)
+target_link_libraries(cpp_read_file PRIVATE koru)
+target_compile_options(cpp_read_file PRIVATE ${KORU_WARNINGS} -O2 ${KORU_SAN_FLAGS})
+target_link_options(cpp_read_file PRIVATE ${KORU_SAN_FLAGS})
 
 # SDL3 is the renderer's, and only the renderer's: the model and the protocol
 # build without it, which is what lets most of this gate run anywhere.

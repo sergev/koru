@@ -315,6 +315,13 @@ C++ binding is built with optimization on, the depth case measures in the plain
 build and runs shallow under a sanitizer while saying so, and doc/Notes.md has
 every number.
 
+T42 added the executor — a `run()` whose park is one `ENTER`, a `spawn` that
+starts the task at once, and a refusal to park where nothing can arrive — and
+with it T15's demo in C++. **The two demos are run in the same guest and
+`cmp`'d on both streams**: the file on stdout and `10 20 30` on stderr, from
+two runtimes that share no code over one unchanged kernel. `adopt_stream`
+re-opens through `/proc/self/fd` before `ADOPT_FD`, as the Rust runtime does.
+
 T14 made the two userspace ABI mirrors a diff rather than a promise.
 `cpp/include/koru_abi.h` and `cpp/include/koru_errno.h` are the C mirrors,
 shared with `test/`, and an `abi_dump` on each side emits a canonical record

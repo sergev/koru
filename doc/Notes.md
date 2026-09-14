@@ -4213,6 +4213,57 @@ Do not design around either.
   the coroutine frames at exit, which is the whole of the "destroyed without
   being awaited must leak nothing" claim.
 
+### T42: the executor, and two runtimes that print the same bytes
+
+`exec.hpp` is a reactor, the frames it owns and a `run()` whose park is one
+`ENTER(min_complete=1, timeout)`. The ready queue is the reactor's — a frame
+becomes ready when its CQE lands and `pump` resumes it after the dispatch loop
+— so what the executor adds is ownership and the decision of when to park.
+
+`spawn` **starts the task**, running it to its first suspension point before
+returning, which is Braam's `proc_spawn`. A spawn that only queued would leave
+the ring empty until the next turn, and a program that spawns three timers and
+then waits for them would deadlock on its own work. A case asserts the body ran
+and its op is queued.
+
+The empty-ring foot-gun is closed the way the kernel closes its own: with
+nothing in flight, nothing queued and nothing ready, `ENTER` returns at once
+rather than sleeping, so a loop around it spins for ever. `Executor::turn`
+refuses, loudly. The case that proves it forks, because the refusal is an
+`abort` — a thing a test can only observe from outside.
+
+### The done test is two demos and `cmp`
+
+T15's demo is now written twice — `rust/runtime/examples/read_file.rs` and
+`cpp/examples/read_file.cpp` — by two runtimes that share no line of code, over
+one unchanged kernel. `scripts/cpp.sh` runs both in the guest and compares the
+bytes on *both* streams: the file on stdout, and `10 20 30` on stderr from
+timers armed longest-first. They agreed on the first run.
+
+That comparison is the strongest form the language-neutrality claim has taken
+so far. Two demos printing similar text would prove nothing; `cmp` on both
+streams, with the timers deliberately completing out of submission order,
+proves the ordering and the buffering as well as the bytes.
+
+The C++ demo also runs with its stdout on a pipe, because koru refuses a
+blocking non-regular file: `adopt_stream` re-opens through `/proc/self/fd` with
+`O_NONBLOCK` before the `ADOPT_FD`, exactly as the Rust runtime's `install`
+does. That re-open is the bounded POSIX preamble, and T44 will inherit it.
+
+### What was shown to fail
+
+- **The stall guard deleted.** The executor spins on a ring where nothing can
+  arrive. The first version of the case then *hung the whole gate*: the spin is
+  in a forked child, and the parent's alarm killed only the parent, leaving an
+  orphan holding the pipe open until an outer `timeout` ended the VM. The child
+  arms its own watchdog now, and its exit status 99 is what a spin looks like
+  from the parent — three assertions rather than a run that never finishes.
+  **A watchdog in the parent does not cover a child that outlives it.**
+- **`spawn` does not start the task.** Two assertions in the spawn case — the
+  body never ran and no op was queued — and the demo never produces its output:
+  its timers are never armed, so the executor first says nothing can arrive and
+  then the 60-second `timeout` around the demo in `scripts/cpp.sh` ends it.
+
 ### Where C++ is weaker, and what actually carries the safety
 
 Rust's move semantics make "the buffer is moved into the operation" a

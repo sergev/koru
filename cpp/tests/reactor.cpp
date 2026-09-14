@@ -20,11 +20,16 @@
 
 #include "common.hpp"
 
+#include <koru/exec.hpp>
 #include <koru/reactor.hpp>
+#include <koru/task.hpp>
 
 #include <cerrno>
 #include <coroutine>
+#include <csignal>
 #include <cstring>
+#include <sys/wait.h>
+#include <unistd.h>
 #include <utility>
 
 using namespace koru;
@@ -289,4 +294,130 @@ CASE(reactor_two_hundred_frames_destroyed_mid_flight)
     test_note("destroyed while in flight: %d of 200", mid_flight);
     if (mid_flight < 50)
         FAILF("only %d of 200 rounds reached the window", mid_flight);
+}
+
+// ---------------------------------------------------------------------------
+// T42 - the executor
+// ---------------------------------------------------------------------------
+
+namespace {
+
+/// An awaiter that never completes and that nothing can complete: the shape a
+/// program has when it waits for something that does not exist.
+struct never {
+    bool await_ready() const noexcept { return false; }
+    void await_suspend(std::coroutine_handle<>) const noexcept {}
+    void await_resume() const noexcept {}
+};
+
+task<void> wait_for_nothing()
+{
+    co_await never{};
+}
+
+task<int> count_timers(Executor &ex, int n, int *done)
+{
+    for (int i = 0; i < n; i++) {
+        // Armed longest first, so submission order and completion order differ.
+        uint64_t ms = uint64_t(n - i);
+        ex.spawn([](Reactor &r, uint64_t d, int *c) -> task<void> {
+            co_await r.submit(sqe::delay_ns(0, d * 1000000));
+            (*c)++;
+        }(ex.reactor(), ms, done));
+    }
+    // Nothing of ours is in flight, so this is the executor's own wait: the
+    // spawned tasks are what keeps the ring from going quiet.
+    while (*done < n)
+        co_await ex.reactor().submit(sqe::delay_ns(0, 1000000));
+    co_return *done;
+}
+
+Executor make_executor()
+{
+    Mapped m = Mapped::shared();
+    return Executor(std::move(m.ring), std::move(m.arena));
+}
+
+} // namespace
+
+CASE(exec_spawned_tasks_run_and_are_reaped)
+{
+    Executor ex = make_executor();
+    int done    = 0;
+    CHECK_EQ(ex.run(count_timers(ex, 4, &done)), 4);
+    CHECK_EQ(done, 4);
+    ex.drain();
+    CHECK_EQ(ex.spawned(), 0); // every frame the executor owned is gone
+    CHECK_EQ(ex.reactor().live(), 0);
+}
+
+CASE(exec_a_spawn_starts_the_task_at_once)
+{
+    // Braam's `proc_spawn` runs it; a spawn that only queued would leave the
+    // ring empty until the next turn, and a program that spawns and then waits
+    // would deadlock on its own timers.
+    Executor ex = make_executor();
+    int ran     = 0;
+    ex.spawn([](Reactor &r, int *c) -> task<void> {
+        (*c)++;
+        co_await r.submit(sqe::delay_ns(0, 1000000));
+        (*c)++;
+    }(ex.reactor(), &ran));
+    CHECK_EQ(ran, 1);                   // the body ran up to its first await
+    CHECK_EQ(ex.reactor().queued(), 1); // and its op is queued
+    ex.drain();
+    CHECK_EQ(ran, 2);
+    CHECK_EQ(ex.spawned(), 0);
+}
+
+CASE(exec_waiting_for_what_cannot_arrive_is_not_a_spin)
+{
+    // The same foot-gun `ENTER` closes on the kernel side: with nothing in
+    // flight, nothing queued and nothing ready, a park returns at once and a
+    // loop around it spins for ever. The executor says so and stops.
+    arm_alarm(60);
+    pid_t pid = fork();
+    REQUIRE(pid >= 0);
+    if (pid == 0) {
+        // The child arms its own watchdog. Without it an executor that spins
+        // instead of refusing leaves an orphan running for ever, and the whole
+        // gate hangs rather than failing — which is what the first version of
+        // this case did when the guard was deleted to check it.
+        arm_alarm(20);
+        Executor ex = make_executor();
+        ex.run(wait_for_nothing()); // must not return
+        _exit(7);                   // and must not reach this
+    }
+    int status = 0;
+    waitpid(pid, &status, 0);
+    disarm_alarm();
+    if (WIFEXITED(status) && WEXITSTATUS(status) == 7)
+        FAILF("run() returned from a task that cannot complete");
+    // abort() from the executor, which is SIGABRT rather than a hang. The
+    // watchdog's own exit status, 99, is what a spin looks like from here.
+    if (WIFEXITED(status) && WEXITSTATUS(status) == 99)
+        FAILF("the executor spun instead of refusing");
+    CHECK(WIFSIGNALED(status));
+    CHECK_EQ(WTERMSIG(status), SIGABRT);
+}
+
+CASE(exec_destroying_the_executor_takes_its_spawned_frames)
+{
+    // A spawned task suspended on an op still owns a frame. The executor owns
+    // that frame, so its destructor is what frees it — and the op's slab entry
+    // and slot outlive both, until the CQE lands.
+    size_t free_before = 0;
+    {
+        Executor ex = make_executor();
+        free_before = ex.pool().free_count();
+        ex.spawn([](Reactor &r) -> task<void> {
+            BufSlot s = r.pool().acquire();
+            co_await r.submit(sqe::delay_ns(0, 2000 * 1000000ull), std::move(s));
+        }(ex.reactor()));
+        CHECK_EQ(ex.spawned(), 1);
+        CHECK_EQ(ex.pool().free_count(), free_before - 1);
+        // Destroyed here, with a two-second delay still in flight. Under ASan
+        // a frame left behind is a leak and a frame resumed is worse.
+    }
+    CHECK(free_before > 0);
 }

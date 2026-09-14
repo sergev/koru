@@ -208,6 +208,8 @@ koru_sqe read(uint64_t user_data, uint32_t handle, uint32_t slot, uint64_t off, 
 koru_sqe write(uint64_t user_data, uint32_t handle, uint32_t slot, uint64_t off, uint32_t len);
 /// `off` is the target's `user_data`, not an offset.
 koru_sqe cancel(uint64_t user_data, uint64_t target);
+/// `off` is the descriptor to adopt. It grants no authority the caller lacks.
+koru_sqe adopt_fd(uint64_t user_data, int fd);
 
 } // namespace sqe
 
