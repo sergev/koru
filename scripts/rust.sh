@@ -42,11 +42,17 @@ run_suite() {
 	echo "$name exit: $rc"
 	[ "$rc" -eq 0 ] || fail=1
 
-	# A filter matching nothing exits 0.
+	# A filter matching nothing exits 0. The floor is the answer to that, and
+	# it only means anything on an unfiltered run: a filter is expected to
+	# match one suite's tests and none of another's.
 	passed=$(echo "$out" | sed -n 's/^test result: ok\. \([0-9]*\) passed.*/\1/p' | tail -1)
 	passed=${passed:-0}
-	echo "$name passed: $passed (want at least $floor)"
-	[ "$passed" -ge "$floor" ] || { echo "TOO FEW TESTS RAN"; fail=1; }
+	if [ -z "$FILTERS" ]; then
+		echo "$name passed: $passed (want at least $floor)"
+		[ "$passed" -ge "$floor" ] || { echo "TOO FEW TESTS RAN"; fail=1; }
+	else
+		echo "$name passed: $passed (filtered; no floor)"
+	fi
 
 	# A skip is indistinguishable from a pass. Not anchored: --nocapture makes
 	# libtest prefix the line with the test name.

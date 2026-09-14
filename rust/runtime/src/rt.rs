@@ -68,6 +68,7 @@ struct Pos {
 /// Make `rt` this thread's ring and adopt the standard streams into it.
 /// Replaces any previous one, which is what lets a test install its own.
 pub fn install(rt: Runtime) {
+    crate::file::reset_std();
     AMBIENT.with(|c| {
         *c.borrow_mut() = Some(Ambient {
             rt: rt.clone(),

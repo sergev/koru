@@ -29,9 +29,11 @@ async fn braam_prototypes(fd: Handle, path: Str<'_>, flags: u32, why: Error) {
     // Task<Result<void>> write_all(u32 fd, Str s);
     let _: Result<()> = koru::write_all(fd, path).await;
     // Task<Result<String>> read_chunk(u32 fd);
-    let _: Result<String> = koru::read_chunk(fd).await;
+    // Bytes here: Braam's String is unvalidated and a chunk boundary may fall
+    // inside a UTF-8 sequence. T31's File is what needs the fragment.
+    let _: Result<Vec<u8>> = koru::read_chunk(fd).await;
     // Task<Result<String>> read_some(u32 fd, u32 max);
-    let _: Result<String> = koru::read_some(fd, 0u32).await;
+    let _: Result<Vec<u8>> = koru::read_some(fd, 0u32).await;
     // Task<Result<i32>> open_at(Str path, u32 flags);
     let _: Result<Handle> = koru::open_at(path, flags).await;
     // Task<Result<i32>> open_read(Str path);
@@ -162,21 +164,21 @@ fn a_file_reads_through_the_ring_exactly_as_libc_reads_it() {
 
         // read_chunk stops at the end of input with Closed, never an empty Ok.
         let fd = koru::open_read(&path).await.unwrap();
-        let mut got = String::new();
+        let mut got = Vec::new();
         loop {
             match koru::read_chunk(fd).await {
-                Ok(s) => got.push_str(&s),
+                Ok(s) => got.extend_from_slice(&s),
                 Err(e) if e.is(Kind::Closed) => break,
                 Err(e) => panic!("read_chunk: {e}"),
             }
         }
         koru::close_fd(fd).await;
-        assert_eq!(got, text);
+        assert_eq!(got, text.as_bytes());
 
         // read_some leaves the rest on the descriptor for the next read.
         let fd = koru::open_read(&path).await.unwrap();
-        assert_eq!(koru::read_some(fd, 4).await.unwrap(), "one\n");
-        assert_eq!(koru::read_some(fd, 4).await.unwrap(), "two\n");
+        assert_eq!(koru::read_some(fd, 4).await.unwrap(), b"one\n");
+        assert_eq!(koru::read_some(fd, 4).await.unwrap(), b"two\n");
         koru::close_fd(fd).await;
 
         assert!(
@@ -236,13 +238,13 @@ fn a_second_name_shares_the_one_offset_and_the_last_close_shuts_it() {
         let b = koru::dup_fd(a).await.unwrap();
 
         // One handle behind both, so the offset is shared.
-        assert_eq!(koru::read_some(a, 2).await.unwrap(), "ab");
-        assert_eq!(koru::read_some(b, 2).await.unwrap(), "cd");
+        assert_eq!(koru::read_some(a, 2).await.unwrap(), b"ab");
+        assert_eq!(koru::read_some(b, 2).await.unwrap(), b"cd");
         assert_eq!(koru::seek_fd(a, 0, SEEK_CUR).await.unwrap(), 4);
 
         // Closing one shuts nothing.
         koru::close_fd(a).await;
-        assert_eq!(koru::read_some(b, 2).await.unwrap(), "ef");
+        assert_eq!(koru::read_some(b, 2).await.unwrap(), b"ef");
         koru::close_fd(b).await;
         // Now it is gone, and the kernel says so rather than this guessing.
         assert!(koru::read_some(b, 2).await.is_err());
@@ -258,9 +260,9 @@ fn a_seek_lands_where_lseek_would_have_landed() {
     run(|| async move {
         let fd = koru::open_read(&path).await.unwrap();
         assert_eq!(koru::seek_fd(fd, 4, SEEK_SET).await.unwrap(), 4);
-        assert_eq!(koru::read_some(fd, 2).await.unwrap(), "45");
+        assert_eq!(koru::read_some(fd, 2).await.unwrap(), b"45");
         assert_eq!(koru::seek_fd(fd, 1, SEEK_CUR).await.unwrap(), 7);
-        assert_eq!(koru::read_some(fd, 1).await.unwrap(), "7");
+        assert_eq!(koru::read_some(fd, 1).await.unwrap(), b"7");
         assert_eq!(koru::seek_fd(fd, 0, SEEK_END).await.unwrap(), 10);
         assert_eq!(koru::seek_fd(fd, -3, SEEK_END).await.unwrap(), 7);
         assert_eq!(koru::seek_fd(fd, -2, SEEK_CUR).await.unwrap(), 5);

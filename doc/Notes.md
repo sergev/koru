@@ -3063,6 +3063,119 @@ mode. The listing one fails four tests rather than one, because a `.` entry
 breaks the recursive removal and the tree copy as well — which is a better
 result than one, since it says those two are reading the listing for real.
 
+## The buffered `File`, and the syscall the executor was wasting
+
+T31 is `filebuf.rs`, `file.rs` and `iter.rs`: Braam's `File`, its `FileBuf`, and
+the three iterators programs read through. The split is Braam's own — `FileBuf`
+performs no syscall and is the whole fast path, `File` owns one and decides when
+to go to the wire.
+
+### The fast path is free in Rust, and that is the point
+
+Braam has to simulate the fast path: an awaiter whose `await_ready` answers
+true, with a `Task` behind it for the slow half. Rust's `async fn` **is** that
+shape already — one that reaches no `.await` returns `Poll::Ready` on the first
+poll and never touches the reactor. So `get`, `read`, `put`, `write` and
+`getline` each begin with a `*_fast` helper that returns `Some(..)` where the
+buffer answers, and the compiler does the rest.
+
+The measurement is the done test, and it earned its keep immediately.
+
+### The executor was making two `ENTER`s per op
+
+Counting them exposed a bug in T15's reactor that nothing else could have. The
+park computed its `min_complete` as
+
+    ((tail.is_empty() && wait && woke == 0) || blocked) && !idle
+
+where `idle` is `inflight == 0`. With one queued SQE, `tail` is not empty and
+nothing is in flight *yet*, so the first `ENTER` submitted and asked for
+nothing; the loop then went round and made a second `ENTER` to wait. **Every op
+cost two syscalls where the ABI provides one.**
+
+The guard tested `inflight` *before* the submission rather than after. What is
+in `tail` is in flight by the time the kernel tests `min_complete` — that is
+T11's rule, and it is why `ENTER` returns at once when `min_complete` is
+unreachable rather than sleeping for ever. So an op about to be submitted counts
+as one that can answer:
+
+    wait && woke == 0 && (!idle || !tail.is_empty())
+
+Every suite passes unchanged, the 20 000-iteration drop-safety loop included,
+and the three `ENTER`-count tests went from 44, 128 and 8 to 22, 64 and 4. This
+is exactly the class of defect the plan predicted for T31: correct output,
+twice the syscalls, invisible to every behavioural test in the repo.
+
+### `read_chunk` had to stop returning a `String`
+
+T30 made `read_chunk`, `read_some` and `Input::read` return `String`, on the
+reasoning that Rust enforces the UTF-8 Braam only declares. That was wrong for
+these three, and `File`'s refill is what shows it: **a chunk boundary falls
+wherever the read stopped, which may be inside a UTF-8 sequence.** A 64 KiB
+chunk of any non-ASCII file fails `String::from_utf8` roughly whenever a rune
+straddles the end.
+
+The rule is now the distinction Braam's own `String` blurs. Where a call hands
+back a *fragment* — `read_chunk`, `read_some`, `Input::read` — the Rust spelling
+is `Vec<u8>`. Where it hands back a whole thing — `read_file`, `read_link`,
+`cwd_get`, `getline` — it stays a `String`, because a complete file, path or
+line either is UTF-8 or the data really is bad.
+
+T30's own test missed this because its fixture was pure ASCII. So did T31's
+first draft of the carry test: `"aé☃"` is six bytes and 65532 is a multiple of
+six, so no rune ever straddled and deleting the carry passed all 28 tests. The
+fixture is `"aé☃x"` now, seven bytes, and the test asserts its own arithmetic.
+**A boundary test whose fixture divides evenly into the boundary tests
+nothing.**
+
+### Where Rust differs from Braam, and why each is forced
+
+**The standard streams are a slot, not a `File&`.** Braam's `File::stdout()`
+hands back a reference to a singleton. Rust cannot lend out of a thread-local
+across an `await`, so `File::stdout()` returns a `Std` — a name for the slot —
+and each call takes the `File` out for its own duration and puts it back. Two
+tasks sharing one buffered stream is the program's bug in any language, since a
+flush interleaved with an append corrupts the buffer; here it is `Err(Again)`
+instead. `install` clears the cache, because a new ring means new handles and a
+`File` built over the old ones names nothing.
+
+**`err()` is an `Option<Error>`.** Braam's sentinel is `Error(0)`, and koru has
+no such value: raw errno 0 is `Error::closed()`. `Option` is what Rust has for
+exactly this, and vocab.rs already settled that `Option` is Rust's own spelling.
+
+**`File::over` owns its `Input`.** Braam's constructor takes `Input&` and the
+header says it must outlive the `File`. Owning it is how Rust says the same
+thing, and it cannot be got wrong.
+
+**A `FileBuf` owns its block.** Braam lends one from its allocator; here the
+buffer owns a `Vec`, and an `Input` chunk is *moved* in rather than copied,
+which is the same zero-copy the lending buys.
+
+### `Buffering::Auto` has no terminal to ask about yet
+
+Braam's `Auto` probes with `tty_of`. koru has no terminal until Phase 9, so the
+probe is a `STAT` and the question is whether the handle names a character
+device. A redirect to `/dev/null` therefore gets line buffering, which is
+harmless; the screen protocol can sharpen it at T38.
+
+### What was shown to fail
+
+Six perturbations, each applied and reverted.
+
+- **The refill reads one byte at a time.** Every behavioural test still passes —
+  all 27 of them — and only the `ENTER` count catches it. This is the
+  perturbation the plan asked for by name.
+- **The sticky error is not consulted on the fast path.** One test: the stuck
+  stream goes back to the kernel.
+- **`getline` drops a final fragment with no newline.** Two.
+- **The refill does not carry a straddling rune.** One, and only after the
+  fixture was fixed; see above.
+- **`unget` is a no-op.** One.
+- **A walked directory is never descended into.** One.
+
+The reactor's own change is falsified by reverting it: the three count tests
+double, which is how it was found.
+
 ## C++20 userspace binding
 
 The kernel side is **unchanged** — same device, same ioctls, same wire format,
@@ -3256,6 +3369,13 @@ arrive with their tasks.
   is no opcode and no std API for a local time offset. *exists*
 - `rust/runtime/tests/ops.rs` — Braam's prototypes, and the operation layer
   against libc on a fixture tree. *exists*
+- `rust/runtime/src/filebuf.rs` — the half of a buffered stream that performs
+  no syscall, and the UTF-8 decoder `get` needs. *exists*
+- `rust/runtime/src/file.rs` — the buffered `File`, the buffering modes, the
+  scanners and the standard streams. *exists*
+- `rust/runtime/src/iter.rs` — `Input`, `LineReader` and `TreeWalk`. *exists*
+- `rust/runtime/tests/file.rs` — the fast path measured, the sticky error, and
+  the three iterators. *exists*
 - `cpp/include/koru_abi.h` — the C mirror of `koru_abi.rs`, kept in step by
   the T14 conformance diff. *exists*
 - `cpp/include/koru_errno.h` — the C mirror of `error.rs`'s vocabulary and

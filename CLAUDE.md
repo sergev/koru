@@ -5,7 +5,7 @@ code in this repository.
 
 ## State of the repository
 
-**T0–T30 are done.** The kernel surface was complete at T29 and grew once more
+**T0–T31 are done.** The kernel surface was complete at T29 and grew once more
 at T30, for `OPEN`'s creation flags. Braam's hello world runs through koru, and
 the ring can wait for a descriptor. The module registers `/dev/koru`, configures
 a ring with `SETUP`, and submits `NOP`, `DELAY_NS`, `CHECKSUM`, `OPEN`, `READ`,
@@ -180,6 +180,17 @@ generator could mutate an `OPEN`'s flags into a create-and-truncate on a path
 outside the sandbox, and that five slot-exclusivity tests across both suites
 were passing on luck.
 
+T31 added the buffered `File`: `filebuf.rs` is the half that performs no
+syscall, `file.rs` owns one and decides when to go to the wire, and `iter.rs`
+holds `Input`, `LineReader` and `TreeWalk`. Rust's `async fn` **is** Braam's
+awaiter-with-a-fast-path already — one that reaches no `.await` never touches
+the reactor — so the done test measures the `ENTER` count rather than trusting
+it. That measurement found two things: T15's executor was making **two `ENTER`s
+per op** where the ABI provides one, and T30's `read_chunk` could not return a
+`String`, because a chunk boundary may fall inside a UTF-8 sequence. Both are
+fixed; doc/Notes.md has the six perturbations, one of which passes 27 of 28
+tests.
+
 T14 made the two userspace ABI mirrors a diff rather than a promise.
 `cpp/include/koru_abi.h` and `cpp/include/koru_errno.h` are the C mirrors,
 shared with `test/`, and an `abi_dump` on each side emits a canonical record
@@ -202,8 +213,9 @@ its fastest gate: no VM, no device, no module.
 - `rust/` — the Cargo workspace. **Directories are named by role and packages
   by name**: `rust/sys` is `koru-sys`, the raw binding; `rust/runtime` is
   `koru` itself, holding the futures, the executor and the Braam surface
-  (`vocab.rs`, `rt.rs`, `ops.rs`, `args.rs`, and `tz.rs`, which exists only
-  because `clock_now` has no opcode and no std API); `rust/macros` is
+  (`vocab.rs`, `rt.rs`, `ops.rs`, `args.rs`, `filebuf.rs`, `file.rs`, `iter.rs`,
+  and `tz.rs`, which exists only because `clock_now` has no opcode and no std
+  API); `rust/macros` is
   `koru-macros`, `#[koru::main]` alone. Cargo names the package, so `-p
   koru-sys` and `use koru_sys::` are unaffected by the directory. The examples
   in `rust/runtime/examples/` are programs, so the guest runs them.
@@ -284,7 +296,7 @@ survived**.
 
 ## Commands
 
-These work today (T0 through T30):
+These work today (T0 through T31):
 
 ```sh
 KDIR=../kernel-dev/linux-source-7.1
@@ -486,6 +498,16 @@ match their own pattern.
 
 `scripts/check.sh` carries every pass condition there is. Keep it small and
 obvious: a bug in it weakens the whole verdict at once.
+
+**A boundary test whose fixture divides evenly into the boundary tests
+nothing.** T31's first carry test used `"aé☃"`, which is six bytes, against a
+65532-byte read — so no rune ever straddled the boundary and deleting the carry
+passed all 28 tests. Assert the fixture's own arithmetic.
+
+**Measure a fast path; never assume it.** A version that suspends on every
+character produces the right bytes and passes every behavioural test there is.
+`Stats::enters` is the instrument, and asserting an exact count on it is what
+found the executor spending two `ENTER`s per op.
 
 **A test that depends on losing a race has to loop until it wins.** Five
 slot-exclusivity tests asserted that an op behind a deferred one gets `-EBUSY`

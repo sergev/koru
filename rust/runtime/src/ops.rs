@@ -17,8 +17,8 @@ use koru_sys::abi::{
     KORU_O_DIRECTORY, KORU_O_EXCL, KORU_O_RDONLY, KORU_O_RDWR, KORU_O_TRUNC, KORU_O_WRONLY,
     KORU_OP_MKDIR, KORU_OP_READLINK, KORU_OP_RENAME, KORU_OP_RMDIR, KORU_OP_STATX_AT,
     KORU_OP_SYMLINK, KORU_OP_TRUNCATE, KORU_OP_UNLINK, KORU_OP_UTIMES, KORU_POLL_IN, KORU_POLL_OUT,
-    KORU_S_IFDIR, KORU_S_IFLNK, KORU_S_IFMT, KORU_UTIME_NOW, KORU_UTIME_OMIT, KoruDirent, KoruStat,
-    KoruTimes,
+    KORU_S_IFCHR, KORU_S_IFDIR, KORU_S_IFLNK, KORU_S_IFMT, KORU_UTIME_NOW, KORU_UTIME_OMIT,
+    KoruDirent, KoruStat, KoruTimes,
 };
 use koru_sys::error::{EAGAIN, EEXIST, EINVAL, EOPNOTSUPP, EPERM};
 use koru_sys::ring::arg_offset;
@@ -109,55 +109,74 @@ pub struct Clock {
 /// The offset is userspace's own bookkeeping, because `WRITE` never touches
 /// `f_pos`: a seekable handle advances, a stream stays at 0.
 pub async fn write_all(fd: Handle, s: Str<'_>) -> Result<()> {
-    let rt = rt::current();
-    let mut left = s.as_bytes();
+    write_bytes(fd, s.as_bytes()).await
+}
+
+/// The same for bytes a `Str` could not hold: a buffered stream's block, and
+/// the halves of a rune a `put` split across two calls.
+pub(crate) async fn write_bytes(fd: Handle, s: &[u8]) -> Result<()> {
+    let mut left = s;
 
     // The kernel refuses a zero-length write, and Braam's write_all of an
     // empty string is a no-op rather than an error.
     while !left.is_empty() {
-        let mut slot = acquire().await;
-        let n = left.len().min(slot.len());
-        slot[..n].copy_from_slice(&left[..n]);
-
-        let off = rt::position(fd);
-        let (res, back) = rt.write(fd, slot, off, n as u32).await;
-        drop(back);
-
-        match res {
+        match write_once(fd, left).await {
             Ok(0) => return Err(Error::closed()),
-            Ok(wrote) => {
-                rt::advance(fd, wrote as u64);
-                left = &left[wrote..];
-            }
-            Err(e) if e.raw() == EAGAIN => ready(fd, KORU_POLL_OUT).await?,
+            Ok(wrote) => left = &left[wrote..],
             Err(e) => return Err(e),
         }
     }
     Ok(())
 }
 
+/// One `WRITE`, waiting out an `EAGAIN`. A short write is a result, not an
+/// error: the position advances by what it took.
+pub(crate) async fn write_once(fd: Handle, s: &[u8]) -> Result<usize> {
+    let rt = rt::current();
+    loop {
+        let mut slot = acquire().await;
+        let n = s.len().min(slot.len());
+        slot[..n].copy_from_slice(&s[..n]);
+
+        let off = rt::position(fd);
+        let (res, back) = rt.write(fd, slot, off, n as u32).await;
+        drop(back);
+
+        match res {
+            Ok(wrote) => {
+                rt::advance(fd, wrote as u64);
+                return Ok(wrote);
+            }
+            Err(e) if e.raw() == EAGAIN => ready(fd, KORU_POLL_OUT).await?,
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 /// One chunk, or `Err(Closed)` at end of input.
-pub async fn read_chunk(fd: Handle) -> Result<String> {
+///
+/// **Bytes, not a `String`.** Braam's `String` is an unvalidated buffer and
+/// Rust's is not, so where a call can hand back a *fragment* — and a chunk
+/// boundary falls wherever the read stopped, which may be inside a UTF-8
+/// sequence — the faithful spelling is `Vec<u8>`. What comes back whole,
+/// `read_file` and `getline` and `read_link`, stays a `String`.
+pub async fn read_chunk(fd: Handle) -> Result<Vec<u8>> {
     read_some(fd, READ_MAX).await
 }
 
 /// At most `max` bytes, clamped to [`READ_MAX`]; 0 means [`CHUNK`]. What is
 /// left stays on the descriptor, so the next read serves it first.
-///
-/// Rust's `String` enforces the UTF-8 Braam's only declares, so bytes that are
-/// not UTF-8 are `Err(Invalid)` here. `copy_file` moves bytes through the arena
-/// and is unaffected.
-pub async fn read_some(fd: Handle, max: u32) -> Result<String> {
+pub async fn read_some(fd: Handle, max: u32) -> Result<Vec<u8>> {
     let mut buf = Vec::new();
     if read_into(fd, &mut buf, max).await? == 0 {
         return Err(Error::closed()); // end of input
     }
-    String::from_utf8(buf).map_err(|_| Error::from_errno(EINVAL))
+    Ok(buf)
 }
 
 /// One read into `out`, returning the count. Zero is end of input, which is
 /// `READ`'s own `res == 0` and the one thing callers map differently.
-async fn read_into(fd: Handle, out: &mut Vec<u8>, max: u32) -> Result<usize> {
+pub(crate) async fn read_into(fd: Handle, out: &mut Vec<u8>, max: u32) -> Result<usize> {
     let rt = rt::current();
     let want = match max {
         0 => CHUNK,
@@ -355,6 +374,22 @@ pub async fn stat_fd(fd: Handle) -> Result<FileInfo> {
     let out = info_of(&slot[..n]);
     drop(slot);
     Ok(out)
+}
+
+/// Whether `fd` names a character device, which is the closest koru can get to
+/// "the console" before the screen protocol lands. `Buffering::Auto` asks.
+pub(crate) async fn is_console(fd: Handle) -> bool {
+    let rt = rt::current();
+    let Some(slot) = rt.acquire() else {
+        return false;
+    };
+    let len = size_of::<KoruStat>() as u32;
+    let (res, slot) = rt.stat(fd, slot, 0, len).await;
+    let out = res.is_ok_and(|(n, _)| {
+        KoruStat::read_from(&slot[..n]).is_some_and(|s| s.mode & KORU_S_IFMT == KORU_S_IFCHR)
+    });
+    drop(slot);
+    out
 }
 
 /// `STATX_AT` into `out`. The struct replaces the path it was given, so the

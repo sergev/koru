@@ -67,27 +67,6 @@ ABI.
 
 ## Phase 8 — the Rust surface
 
-### T31 [M] — buffered `File` and the iterators, Rust
-
-`File` with `open`, `of`, the standard-stream accessors, `get`, `unget`, `read`,
-`getline`, `put`, `write`, the `scan_*` family, `flush`, `seek`, `close`,
-`detach`, and the sticky-error accessors. `Input`, `LineReader`, `TreeWalk`. The
-buffering modes, and the documented promise that dropping a `File` neither
-flushes nor closes, because a destructor cannot await.
-
-This is where Braam's awaiter-with-a-fast-path shape earns its keep, and it
-earns more here than on Braam, because a miss costs an `ENTER` syscall rather
-than a scheduler step. The poll returns ready whenever the buffer already holds
-the answer; only a genuine refill suspends.
-
-Done test: the fast path is **measured**, not assumed. Read a large file one
-character at a time and assert the `ENTER` count is proportional to refills
-rather than to characters — instrument the ring and assert an exact count,
-because a version that suspends every time still produces correct output and
-would pass any behavioural test. Then the sticky-error idiom: a read error
-mid-stream leaves `failed()` true and `err()` exact, and `Error::Cancelled` maps
-to exit status 130.
-
 ### T32 [M] — the program shell, Rust
 
 `Args` with `size`, indexing, `name` and `tail`. `Opts`, `Opt` and `OptParse`

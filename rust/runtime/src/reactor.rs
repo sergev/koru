@@ -245,14 +245,22 @@ impl Inner {
         let batch = self.take_batch();
         let mut off = 0usize;
         let mut woke = 0usize;
-        let mut blocked = false;
+        let mut blocked;
 
         let chunk = self.sq_len();
         loop {
             let tail = &batch[off..batch.len().min(off + chunk)];
-            // Nothing in flight means the kernel returns at once, not waits.
+            // Ask for the completion on the **submitting** call: `ENTER`
+            // submits and waits in one, which is what makes one op one syscall
+            // rather than two. What is in `tail` is in flight by the time the
+            // kernel tests `min_complete`, so an op about to be submitted
+            // counts as one that can answer.
+            //
+            // Nothing queued and nothing running means nothing can arrive, and
+            // then the kernel returns at once rather than waiting; asking is
+            // still pointless, so this does not.
             let idle = self.inflight.get() == 0;
-            let want = u32::from(((tail.is_empty() && wait && woke == 0) || blocked) && !idle);
+            let want = u32::from(wait && woke == 0 && (!idle || !tail.is_empty()));
 
             let (progress, errno) = match self.ring.enter(tail, cq, want, timeout) {
                 Ok(e) => (e.progress, None),

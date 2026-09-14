@@ -12,7 +12,10 @@
 mod args;
 mod combinator;
 mod exec;
+mod file;
+mod filebuf;
 mod future;
+mod iter;
 mod op;
 mod ops;
 mod reactor;
@@ -35,6 +38,10 @@ pub use vocab::{Errno, Error, KINDS, Kind, Result, Span, SpanMut, Str};
 
 // Braam's surface: a program names none of the machinery above.
 pub use args::Args;
+pub use file::{
+    Buffering, FILE_BUF, File, FileMode, Std, get_rune, put_rune, write_err, write_out,
+};
+pub use iter::{Input, LineReader, TreeWalk};
 pub use koru_macros::main;
 pub use ops::{
     CHUNK, CREATE_MODE, Clock, DirEntry, FileInfo, FileKind, O_ALL, O_APPEND, O_CREATE, O_EXCL,
