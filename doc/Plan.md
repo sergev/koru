@@ -112,32 +112,6 @@ restarted daemon, which a full-screen program would never notice, because the
 resize path already marks the whole grid damaged. Add them here as tasks when
 one of them is actually wanted.
 
-### T35 [R] — the renderer, the window and the pixel oracle
-
-SDL3 window, an embedded bitmap font, cells drawn from the grid with only the
-damage repainted, `SDL_Event` keys normalised to `{code, mods}`, and a window
-resize driving `screen_resize`. Under a test environment variable, a
-`SDL_RenderReadPixels` snapshot to a named path.
-
-Verify in the **first hour** that `SDL_VIDEODRIVER=offscreen` plus the software
-renderer initialises in the virtme-ng guest with no GPU. The fallback is a
-null-renderer headless mode costing about thirty lines, and it loses only the
-pixel oracles, which already run on the host.
-
-Done test: five font-independent oracles under the offscreen driver — golden
-images break on every font change and nobody regenerates them honestly.
-*Geometry*, the surface is exactly the cell size times the grid. *Ink*, a
-glyph's cell holds a non-background pixel and a blank cell holds none, which is
-the only one that catches nothing drawing at all. *Isolation*, writing a
-different character at one cell changes pixels inside it and none outside.
-*Colour*, a red-background cell's modal pixel is the palette's red. *Damage*, a
-blit in the middle leaves every pixel outside it byte-identical to the previous
-frame, which is what separates a renderer that repaints the damage from one
-that repaints everything. Each shown to fail: offset the cell origin and
-isolation and damage both fire; swap `fg` and `bg` and colour fires; repaint
-everything and damage fires; draw no glyphs and ink fires. Then the premise
-itself: a synthesised ctrl-C arrives as `{'c', MOD_CTRL}`, never as byte `0x03`.
-
 ### T36 [R] — the daemon's protocol server
 
 The listening socket with bind-then-rename, one connection, and the frame

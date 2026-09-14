@@ -54,15 +54,49 @@ if(KORU_SANITIZE)
   set(KORU_SAN_FLAGS -fsanitize=address,undefined -fno-omit-frame-pointer -g)
 endif()
 
-# The model's own suite: Braam's cell-exact assertions. The sources are
-# compiled again rather than linked, so the sanitizers are this target's.
-add_executable(ks_model_test
-               screen/screen.cpp screen/ansi.cpp screen/text.cpp
-               screen/tests/harness.cpp screen/tests/test_screen.cpp
-               screen/tests/test_ansi.cpp)
+# SDL3 is the renderer's, and only the renderer's: the model and the protocol
+# build without it, which is what lets most of this gate run anywhere.
+find_package(SDL3 QUIET CONFIG)
+if(NOT SDL3_FOUND)
+  find_package(PkgConfig QUIET)
+  if(PkgConfig_FOUND)
+    pkg_check_modules(SDL3 IMPORTED_TARGET sdl3)
+    if(SDL3_FOUND)
+      add_library(SDL3::SDL3 ALIAS PkgConfig::SDL3)
+    endif()
+  endif()
+endif()
+
+# The model's own suite: Braam's cell-exact assertions, plus the pixel oracles
+# where SDL3 is installed. The sources are compiled again rather than linked,
+# so the sanitizers are this target's.
+set(KS_TEST_SRC screen/screen.cpp screen/ansi.cpp screen/text.cpp
+                screen/tests/harness.cpp screen/tests/test_screen.cpp
+                screen/tests/test_ansi.cpp)
+if(SDL3_FOUND)
+  list(APPEND KS_TEST_SRC screen/render.cpp screen/window.cpp
+                          screen/tests/test_render.cpp)
+endif()
+
+add_executable(ks_model_test ${KS_TEST_SRC})
 target_include_directories(ks_model_test PRIVATE screen screen/tests)
 target_compile_options(ks_model_test PRIVATE ${KORU_WARNINGS} ${KORU_SAN_FLAGS})
 target_link_options(ks_model_test PRIVATE ${KORU_SAN_FLAGS})
+if(SDL3_FOUND)
+  target_compile_definitions(ks_model_test PRIVATE KS_HAVE_SDL)
+  target_link_libraries(ks_model_test PRIVATE SDL3::SDL3)
+endif()
+
+# A window over a terminal fed from stdin: the event pump and the resize path,
+# and how a human looks at the renderer.
+if(SDL3_FOUND)
+  add_executable(ks_show screen/screen.cpp screen/ansi.cpp screen/text.cpp
+                         screen/render.cpp screen/window.cpp screen/tools/ks_show.cpp)
+  target_include_directories(ks_show PRIVATE screen)
+  target_compile_options(ks_show PRIVATE ${KORU_WARNINGS} ${KORU_SAN_FLAGS})
+  target_link_options(ks_show PRIVATE ${KORU_SAN_FLAGS})
+  target_link_libraries(ks_show PRIVATE SDL3::SDL3)
+endif()
 
 # The parser's oracle, driven by a PRNG rather than by coverage. It needs no
 # clang runtime, so this is the one that runs in the everyday gate.

@@ -62,6 +62,9 @@ int main()
 {
     test_screen();
     test_ansi();
+#ifdef KS_HAVE_SDL
+    test_render();
+#endif
 
     // The suite owns the terminal, so freeing it here is what lets the leak
     // checker speak for the model rather than for the harness.

@@ -170,11 +170,12 @@ is what the gate does, and what doc/Notes.md explains.
 
 ## The screen gate
 
-`scripts/screen.sh` builds `build-asan/` with ASan and UBSan on and runs two
-things: the terminal model's suite, which is Braam's own cell-exact assertions
-ported, and the ANSI parser's fuzz oracle. Neither needs a VM, a device, a
-module or SDL — the model has zero koru dependencies, which is the whole reason
-it can be checked here. About a second.
+`scripts/screen.sh` builds `build-asan/` with ASan and UBSan on and runs the
+terminal model's suite — Braam's own cell-exact assertions, ported — the five
+pixel oracles, and the ANSI parser's fuzz oracle. None of it needs a VM, a
+device or a module; the pixel oracles need SDL3 and run under its offscreen
+video driver, which the test sets for itself, so no display is needed either.
+About a second.
 
 ```sh
 scripts/screen.sh
@@ -182,6 +183,10 @@ KS_SEED=12345 scripts/screen.sh     # replay a fuzz failure
 KS_ITERS=500000 scripts/screen.sh   # a longer fuzz run
 CXX=clang++ scripts/screen.sh       # once libclang-rt-*-dev is installed
 ```
+
+Where SDL3 is installed the pixel oracles are not optional: the script asks
+`pkg-config` and fails if they did not run, because a build that quietly
+dropped them would pass everything else.
 
 It defaults to GCC because clang's sanitizer runtimes are a separate Debian
 package. The coverage-guided libFuzzer target is opt-in for the same reason:

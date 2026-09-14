@@ -3476,6 +3476,88 @@ not installed on this machine, so `scripts/screen.sh` defaults to `g++`, whose
 libFuzzer target once that package is there. The everyday gate loses nothing by
 it: the oracle is the same function, and only the search strategy differs.
 
+## The renderer, and five oracles that do not know a pixel in advance
+
+T35 is `screen/render.cpp`, which is pure and names no SDL, and
+`screen/window.cpp`, which is the platform: a window, a texture, keys
+normalised to `{code, mods}`, and a resize that hands back a grid rather than
+pixels. The split is what lets the oracles go through `SDL_RenderReadPixels` —
+the texture upload and the present are inside what is tested — while the
+drawing itself stays testable arithmetic.
+
+### The offscreen driver works, and the fallback is not needed
+
+The plan asked for this in the first hour, and the answer is better than it
+hoped: `SDL_VIDEODRIVER=offscreen` initialises in the virtme-ng guest with
+*both* the software renderer and the opengl one, which finds llvmpipe. The
+null-renderer fallback the plan budgeted thirty lines for is not needed. The
+only thing that had to be handled is that the two renderers read back in
+different pixel formats — software answers ARGB and GL answers ABGR — so
+`win_read` converts rather than trusting either.
+
+### The font is authored here
+
+There is no font to port: Braam's renderer is a browser canvas drawing with a
+CSS font. `screen/tools/mkfont.py` holds 95 glyphs as 5x7 ASCII art inside an
+8x8 cell and generates `screen/font8x8.h`; the art is the source of truth and
+the header says so. Authoring it rather than lifting one keeps the MIT half of
+this repository free of anybody else's licence, and the glyphs were checked by
+rendering a sheet and looking at it, which is the only way to catch a mirrored
+`&`.
+
+A cell is the glyph plus two rows of leading, times a scale that defaults to 2:
+an 8x8 glyph alone is square, and a terminal cell is not.
+
+### What the oracles caught before any perturbation did
+
+The geometry oracle failed on its first run, and it was right: `win_resize`
+resized the texture and the pixel buffer but not the *window*, and the
+renderer's output size is the window's. Every later oracle would have been
+reading a scaled-down interpolation of the right image. `win_read` now refuses
+a read whose size is not the grid's, so the same drift can never be silent
+again.
+
+### Two of the five oracles were weaker than they read
+
+Both were written as a difference between two frames, and both were blind for
+the same reason: **a difference cannot see a constant.**
+
+*Isolation* compared the frame before and after writing one cell. A cell origin
+off by one pixel shifts every cell equally, so the difference is unchanged —
+and the glyph is 5 wide in an 8-wide cell, so the shift hides in the blank
+columns even locally. It is absolute now: one cell is given a background of its
+own and the oracle asks where that colour is, which must be exactly the cell's
+rectangle. Both halves are kept, because they catch different things: the
+absolute one catches the origin, the difference one catches a draw that runs
+past its cell.
+
+*Damage* compared two frames drawn from identical cells, which is true whether
+the renderer repaints the damage or the whole grid. It stages a second change
+now and **does not report it** — a renderer that repaints everything draws it
+and fails, and the one that does not, does not.
+
+### What was shown to fail
+
+Four perturbations, each applied and reverted, and each fails what the plan
+said it should. The cell origin off by one pixel: isolation, three assertions,
+and damage. `fg` and `bg` swapped: colour, both directions, and ink. Every
+frame repaints the whole grid: damage alone. No glyph ever drawn: ink, in four
+places.
+
+One more thing the plan asks for, which is not about pixels at all: a
+synthesised ctrl-C arrives as `{'c', KS_MOD_CTRL}` and never as byte 3, and the
+same key with no modifier is the same code. That is the premise the whole cell
+model rests on, and it is one `CHECK` away from the renderer that draws it.
+
+### `ks_show`, where the resize actually runs
+
+The oracles can synthesise a key event; they cannot synthesise a window
+manager. `screen/tools/ks_show.cpp` is a window over a terminal fed from stdin,
+with the event pump, the `^Q` exit and the resize path that converts pixels to
+cells and drives `screen_resize` before `win_resize`. With `KORU_SCREEN_SNAP`
+set it draws one frame, writes a BMP and exits, which is the snapshot the plan
+asks for and how a human looks at a failure.
+
 ## C++20 userspace binding
 
 The kernel side is **unchanged** — same device, same ioctls, same wire format,
@@ -3689,8 +3771,15 @@ arrive with their tasks.
 - `screen/screen.cpp`, `screen/ansi.cpp`, `screen/text.cpp` — the terminal
   model: the grid, the damage rectangle, the scrollback, the view, the region
   and the parser. Zero koru dependencies. *exists*
-- `screen/tests/` — Braam's own cell-exact suite, ported, plus the parser's
-  fuzz oracle in its two drivers. *exists*
+- `screen/render.cpp` — cells to pixels, damage only, naming no SDL. *exists*
+- `screen/window.cpp` — the SDL3 window, the texture, the key normalisation and
+  the resize that hands back a grid. *exists*
+- `screen/font8x8.h` — the embedded font, generated from the art in
+  `screen/tools/mkfont.py` and authored here. *exists*
+- `screen/tools/ks_show.cpp` — a window over a terminal fed from stdin: the
+  event pump, the resize path and the snapshot. *exists*
+- `screen/tests/` — Braam's own cell-exact suite, ported, the five pixel
+  oracles, and the parser's fuzz oracle in its two drivers. *exists*
 - `cpp/include/koru_abi.h` — the C mirror of `koru_abi.rs`, kept in step by
   the T14 conformance diff. *exists*
 - `cpp/include/koru_errno.h` — the C mirror of `error.rs`'s vocabulary and

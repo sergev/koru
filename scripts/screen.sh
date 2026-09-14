@@ -9,6 +9,9 @@
 #   KS_SEED=12345 scripts/screen.sh    # replay a fuzz failure
 #   KS_ITERS=500000 scripts/screen.sh  # a longer fuzz run
 #
+# The pixel oracles run under SDL's offscreen video driver, which the test sets
+# for itself, so no display is needed here or in the VM.
+#
 # It configures and builds its own directory, because the sanitizers are a
 # per-target flag and `build/` is the plain one the ABI diff uses.
 #
@@ -33,8 +36,8 @@ verdict() {
 
 cmake -B "$BUILD" -S "$ROOT" -DCMAKE_CXX_COMPILER="$CXX" -DCMAKE_C_COMPILER="$CC" \
 	-DKORU_SANITIZE=ON >/dev/null || verdict FAIL
-cmake --build "$BUILD" --target ks_model_test ks_ansi_rand >/dev/null || {
-	cmake --build "$BUILD" --target ks_model_test ks_ansi_rand
+cmake --build "$BUILD" >/dev/null || {
+	cmake --build "$BUILD"
 	verdict FAIL
 }
 
@@ -54,6 +57,17 @@ echo "$out" | grep -q '^== ansi ==$' || {
 	echo "THE ANSI CASES DID NOT RUN"
 	fail=1
 }
+
+# The pixel oracles need SDL3. Where it is installed they are not optional:
+# a build that quietly dropped them would pass everything else.
+if pkg-config --exists sdl3 2>/dev/null; then
+	echo "$out" | grep -q '^== render ==$' || {
+		echo "SDL3 IS INSTALLED BUT THE PIXEL ORACLES DID NOT RUN"
+		fail=1
+	}
+else
+	echo "(no sdl3: the pixel oracles were not built)"
+fi
 
 echo
 echo "=== parser fuzz ==="
