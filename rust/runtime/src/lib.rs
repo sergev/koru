@@ -15,6 +15,7 @@ mod exec;
 mod file;
 mod filebuf;
 mod future;
+mod grid;
 mod iter;
 
 // The screen protocol's mirror. Not Braam's surface: `ks_dump` and, from
@@ -49,6 +50,7 @@ pub use args::Args;
 pub use file::{
     Buffering, FILE_BUF, File, FileMode, Std, get_rune, put_rune, write_err, write_out,
 };
+pub use grid::{Grid, Pane, Rect};
 pub use iter::{Input, LineReader, TreeWalk};
 pub use koru_macros::main;
 pub use ops::{
