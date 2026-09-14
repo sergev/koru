@@ -65,6 +65,11 @@ public:
     /// rather than an accident.
     void drain();
 
+    /// Destroy every spawned frame without waiting for it. The other half of
+    /// that choice: a task still parked on an op is abandoned, and the
+    /// reactor's slab entry survives until its CQE lands.
+    void drop_tasks();
+
     /// One turn: reap what is there, resume what is ready, and park if there
     /// is anything to park for.
     void turn();

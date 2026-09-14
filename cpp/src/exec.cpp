@@ -11,6 +11,11 @@ namespace koru {
 
 Executor::~Executor()
 {
+    drop_tasks();
+}
+
+void Executor::drop_tasks()
+{
     // A spawned task still suspended has an op the reactor knows about; its
     // frame is ours, so it goes here. The reactor's slab entry survives until
     // its CQE lands, which is exactly what the abandon path is for.
@@ -55,9 +60,12 @@ void Executor::turn()
 {
     // Nothing in flight, nothing queued, nothing ready: `ENTER` would return
     // at once rather than sleeping, and this would spin for ever.
-    if (nothing_can_arrive(reactor_.inflight(), reactor_.queued(), 0))
+    size_t ready = reactor_.deferred();
+    if (nothing_can_arrive(reactor_.inflight(), reactor_.queued(), ready))
         fail("koru::Executor: waiting for something that cannot arrive");
-    reactor_.pump(1, park_ns_);
+    // A frame is ready to run, so this turn must not wait for a completion:
+    // `min_complete` is what decides whether `ENTER` sleeps at all.
+    reactor_.pump(ready ? 0 : 1, park_ns_);
     reap_finished();
 }
 

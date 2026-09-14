@@ -211,6 +211,22 @@ koru_sqe cancel(uint64_t user_data, uint64_t target);
 /// `off` is the descriptor to adopt. It grants no authority the caller lacks.
 koru_sqe adopt_fd(uint64_t user_data, int fd);
 
+// The rest of the opcodes, which arrive with the operation layer.
+
+/// Single-shot. A file on no waitqueue completes at once, with 0 where none of
+/// the asked-for events can ever come.
+koru_sqe poll_add(uint64_t user_data, uint32_t handle, uint32_t events);
+/// `off` is a within-slot offset and must be 8-aligned; `len` is the caller's
+/// buffer size, which is also its version negotiation.
+koru_sqe stat(uint64_t user_data, uint32_t handle, uint32_t slot, uint64_t off, uint32_t len);
+/// `off` is a resume cookie, 0 for the beginning.
+koru_sqe readdir(uint64_t user_data, uint32_t handle, uint32_t slot, uint64_t off, uint32_t len);
+/// Every path op: the caller has already put the path at `off` and any
+/// argument after it. `handle` is zero on all but `MKDIR`, which spends it on
+/// the mode.
+koru_sqe path(uint8_t op, uint64_t user_data, uint32_t slot, uint64_t off, uint32_t len,
+              uint32_t handle = 0);
+
 } // namespace sqe
 
 /// Where an opcode's argument goes: after the path, rounded up to eight.

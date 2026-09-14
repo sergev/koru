@@ -8,7 +8,11 @@ project(koru CXX C)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_CXX_EXTENSIONS OFF)
+# -std=gnu++20, not c++20: Braam's TRY and CO_TRY are statement expressions,
+# and C++ has no other way to spell "unwrap or return" as an expression. T44
+# is what needed it; doc/Notes.md records the change, and the GCC bug that
+# makes `CO_TRY(co_await ...)` clang-only.
+set(CMAKE_CXX_EXTENSIONS ON)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS OFF)
@@ -18,32 +22,45 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
 
 # Per target, never in CMAKE_CXX_FLAGS: the documented configure line passes
 # -DCMAKE_CXX_FLAGS=-fsanitize=..., which replaces that variable wholesale.
-set(KORU_WARNINGS -Wall -Wextra -Werror -Wpedantic)
+#
+# Two sets. **-Wpedantic means "warn about anything not ISO", and since T44 the
+# binding's dialect is deliberately not ISO**: Braam's TRY, TRY_VOID, CO_TRY
+# and CO_TRY_VOID are statement expressions, which is the only way C++ has to
+# spell "unwrap or return" as an expression. Both compilers refuse one under
+# -Wpedantic — GCC as an error at the `({`, clang at every use site — and
+# neither can be silenced from inside the header, because the diagnostic lands
+# in the user's translation unit and not in the macro's.
+#
+# So anything that includes koru/vocab.hpp gets KORU_WARNINGS, and everything
+# that does not — the two ABI mirrors, the C11 probes and the whole screen
+# daemon — keeps KORU_PEDANTIC, where the ISO check is worth having.
+set(KORU_WARNINGS -Wall -Wextra -Werror)
+set(KORU_PEDANTIC ${KORU_WARNINGS} -Wpedantic)
 
 add_executable(abi_dump cpp/tools/abi_dump.cpp)
 target_include_directories(abi_dump PRIVATE cpp/include)
-target_compile_options(abi_dump PRIVATE ${KORU_WARNINGS})
+target_compile_options(abi_dump PRIVATE ${KORU_PEDANTIC})
 
 # koru_abi.h must compile as C11 too, not only as C++.
 add_library(koru_abi_c11 OBJECT cpp/tools/abi_c11.c)
 target_include_directories(koru_abi_c11 PRIVATE cpp/include)
-target_compile_options(koru_abi_c11 PRIVATE ${KORU_WARNINGS})
+target_compile_options(koru_abi_c11 PRIVATE ${KORU_PEDANTIC})
 
 # The screen protocol, T33. Canonical here, mirrored by
 # rust/runtime/src/ks_abi.rs, and diffed by the same script.
 add_executable(ks_dump screen/tools/ks_dump.cpp)
 target_include_directories(ks_dump PRIVATE screen)
-target_compile_options(ks_dump PRIVATE ${KORU_WARNINGS})
+target_compile_options(ks_dump PRIVATE ${KORU_PEDANTIC})
 
 add_library(ks_abi_c11 OBJECT screen/tools/ks_abi_c11.c)
 target_include_directories(ks_abi_c11 PRIVATE screen)
-target_compile_options(ks_abi_c11 PRIVATE ${KORU_WARNINGS})
+target_compile_options(ks_abi_c11 PRIVATE ${KORU_PEDANTIC})
 
 # T34: the terminal model, headless. No SDL, no socket, no koru — it builds
 # and runs on the host with nothing installed.
 add_library(ks_model OBJECT screen/screen.cpp screen/ansi.cpp screen/text.cpp)
 target_include_directories(ks_model PUBLIC screen)
-target_compile_options(ks_model PRIVATE ${KORU_WARNINGS})
+target_compile_options(ks_model PRIVATE ${KORU_PEDANTIC})
 
 # scripts/screen.sh configures a second build directory with this on. It is a
 # per-target flag, never CMAKE_CXX_FLAGS, for the reason above.
@@ -61,15 +78,37 @@ endif()
 # T39: libkoru, the synchronous core. RAII `Ring` and `Arena`, the buffer pool,
 # `result<T>` and the errno table, on the same unchanged ABI the Rust binding
 # uses. It builds anywhere; only its suite needs the device.
+#
+# T44-T48 add the surface itself on top of it: the vocabulary and the ambient
+# ring, the operation layer, the buffered stream, the program shell and the
+# screen client. All of it is Braam's, and `cpp/include/koru/braam.hpp` hoists
+# it to global scope.
 add_library(koru STATIC cpp/src/error.cpp cpp/src/ring.cpp cpp/src/pool.cpp
-                        cpp/src/reactor.cpp cpp/src/exec.cpp)
+                        cpp/src/reactor.cpp cpp/src/exec.cpp cpp/src/args.cpp
+                        cpp/src/rt.cpp cpp/src/ops.cpp cpp/src/filebuf.cpp
+                        cpp/src/file.cpp cpp/src/iter.cpp cpp/src/opt.cpp
+                        cpp/src/usage.cpp cpp/src/time.cpp cpp/src/grid.cpp
+                        cpp/src/textbuf.cpp cpp/src/screen.cpp)
 target_include_directories(koru PUBLIC cpp/include)
-target_compile_options(koru PRIVATE ${KORU_WARNINGS} ${KORU_SAN_FLAGS})
+# ks_abi.h is the screen protocol's canonical mirror, and the client's cell is
+# its `ks_cell`: that is what makes the read-a-blit-in-place claim true.
+target_include_directories(koru PUBLIC screen)
+# -O2 for the same reason koru_cpp_unit has it: GCC performs a coroutine's
+# symmetric transfer only with optimization on, and every operation above is a
+# coroutine awaiting another.
+target_compile_options(koru PRIVATE ${KORU_WARNINGS} -O2 ${KORU_SAN_FLAGS})
+
+# The `main` a koru program does not write. Its own library, so a binary with
+# a `main` of its own can link libkoru without getting a second one.
+add_library(koru_start STATIC cpp/src/main.cpp)
+target_link_libraries(koru_start PUBLIC koru)
+target_compile_options(koru_start PRIVATE ${KORU_WARNINGS} -O2 ${KORU_SAN_FLAGS})
 
 # The device-free half: the slab, the op state machine and the vocabulary. It
 # needs no module, so ctest runs it on the host.
 add_executable(koru_cpp_unit cpp/tests/harness.cpp cpp/tests/unit.cpp
-                             cpp/tests/task.cpp)
+                             cpp/tests/task.cpp cpp/tests/vocab.cpp
+                             cpp/tests/shell.cpp cpp/tests/ui.cpp)
 target_include_directories(koru_cpp_unit PRIVATE cpp/tests)
 target_link_libraries(koru_cpp_unit PRIVATE koru)
 # -O2 even in the plain build: GCC performs a coroutine's symmetric transfer
@@ -82,7 +121,8 @@ target_link_options(koru_cpp_unit PRIVATE ${KORU_SAN_FLAGS})
 # the module, so scripts/run-cpp.sh runs it in the VM.
 add_executable(koru_cpp_check cpp/tests/harness.cpp cpp/tests/common.cpp
                               cpp/tests/kernel.cpp cpp/tests/reactor.cpp
-                              cpp/tests/drop.cpp)
+                              cpp/tests/drop.cpp cpp/tests/ops.cpp
+                              cpp/tests/file.cpp cpp/tests/screen.cpp)
 target_include_directories(koru_cpp_check PRIVATE cpp/tests)
 target_link_libraries(koru_cpp_check PRIVATE koru)
 target_compile_options(koru_cpp_check PRIVATE ${KORU_WARNINGS} ${KORU_SAN_FLAGS})
@@ -95,6 +135,29 @@ add_executable(cpp_read_file cpp/examples/read_file.cpp)
 target_link_libraries(cpp_read_file PRIVATE koru)
 target_compile_options(cpp_read_file PRIVATE ${KORU_WARNINGS} -O2 ${KORU_SAN_FLAGS})
 target_link_options(cpp_read_file PRIVATE ${KORU_SAN_FLAGS})
+
+# T44's: Braam's hello world, in Braam style, with `braam.hpp` the only
+# include and `koru_start` the `main` it does not write.
+add_executable(cpp_hello cpp/examples/hello.cpp)
+target_link_libraries(cpp_hello PRIVATE koru_start)
+target_compile_options(cpp_hello PRIVATE ${KORU_WARNINGS} -O2 ${KORU_SAN_FLAGS})
+target_link_options(cpp_hello PRIVATE ${KORU_SAN_FLAGS})
+
+# T47's: Braam's `date`, the program shell end to end. Which stream a usage
+# block goes to and what status follows it is a program's question, so it
+# cannot be asked of a library; scripts/cpp.sh runs this with redirections.
+add_executable(cpp_date cpp/examples/date.cpp)
+target_link_libraries(cpp_date PRIVATE koru_start)
+target_compile_options(cpp_date PRIVATE ${KORU_WARNINGS} -O2 ${KORU_SAN_FLAGS})
+target_link_options(cpp_date PRIVATE ${KORU_SAN_FLAGS})
+
+# T48's: Braam's pager, painting a real window through the daemon.
+# scripts/e2e.sh runs it beside the Rust one and compares the two window
+# snapshots byte for byte.
+add_executable(cpp_less cpp/examples/less.cpp)
+target_link_libraries(cpp_less PRIVATE koru_start)
+target_compile_options(cpp_less PRIVATE ${KORU_WARNINGS} -O2 ${KORU_SAN_FLAGS})
+target_link_options(cpp_less PRIVATE ${KORU_SAN_FLAGS})
 
 # SDL3 is the renderer's, and only the renderer's: the model and the protocol
 # build without it, which is what lets most of this gate run anywhere.
@@ -122,7 +185,7 @@ endif()
 
 add_executable(ks_model_test ${KS_TEST_SRC})
 target_include_directories(ks_model_test PRIVATE screen screen/tests)
-target_compile_options(ks_model_test PRIVATE ${KORU_WARNINGS} ${KORU_SAN_FLAGS})
+target_compile_options(ks_model_test PRIVATE ${KORU_PEDANTIC} ${KORU_SAN_FLAGS})
 target_link_options(ks_model_test PRIVATE ${KORU_SAN_FLAGS})
 if(SDL3_FOUND)
   target_compile_definitions(ks_model_test PRIVATE KS_HAVE_SDL)
@@ -135,7 +198,7 @@ if(SDL3_FOUND)
                  screen/screen.cpp screen/ansi.cpp screen/text.cpp screen/proto.cpp
                  screen/render.cpp screen/window.cpp screen/ks_daemon.cpp)
   target_include_directories(koru-screen PRIVATE screen)
-  target_compile_options(koru-screen PRIVATE ${KORU_WARNINGS} ${KORU_SAN_FLAGS})
+  target_compile_options(koru-screen PRIVATE ${KORU_PEDANTIC} ${KORU_SAN_FLAGS})
   target_link_options(koru-screen PRIVATE ${KORU_SAN_FLAGS})
   target_link_libraries(koru-screen PRIVATE SDL3::SDL3)
 endif()
@@ -144,7 +207,7 @@ endif()
 # No SDL: it parses the BMP itself, which is what lets it run where the window
 # is long gone.
 add_executable(ks_pixel screen/tools/ks_pixel.cpp)
-target_compile_options(ks_pixel PRIVATE ${KORU_WARNINGS} ${KORU_SAN_FLAGS})
+target_compile_options(ks_pixel PRIVATE ${KORU_PEDANTIC} ${KORU_SAN_FLAGS})
 target_link_options(ks_pixel PRIVATE ${KORU_SAN_FLAGS})
 
 # A window over a terminal fed from stdin: the event pump and the resize path,
@@ -153,7 +216,7 @@ if(SDL3_FOUND)
   add_executable(ks_show screen/screen.cpp screen/ansi.cpp screen/text.cpp
                          screen/render.cpp screen/window.cpp screen/tools/ks_show.cpp)
   target_include_directories(ks_show PRIVATE screen)
-  target_compile_options(ks_show PRIVATE ${KORU_WARNINGS} ${KORU_SAN_FLAGS})
+  target_compile_options(ks_show PRIVATE ${KORU_PEDANTIC} ${KORU_SAN_FLAGS})
   target_link_options(ks_show PRIVATE ${KORU_SAN_FLAGS})
   target_link_libraries(ks_show PRIVATE SDL3::SDL3)
 endif()
@@ -165,7 +228,7 @@ add_executable(ks_ansi_rand
                screen/tests/fuzz_ansi.cpp)
 target_include_directories(ks_ansi_rand PRIVATE screen)
 target_compile_definitions(ks_ansi_rand PRIVATE KS_FUZZ_STANDALONE)
-target_compile_options(ks_ansi_rand PRIVATE ${KORU_WARNINGS} ${KORU_SAN_FLAGS})
+target_compile_options(ks_ansi_rand PRIVATE ${KORU_PEDANTIC} ${KORU_SAN_FLAGS})
 target_link_options(ks_ansi_rand PRIVATE ${KORU_SAN_FLAGS})
 
 # The protocol server's oracle, the same shape.
@@ -174,7 +237,7 @@ add_executable(ks_proto_rand
                screen/tests/fuzz_proto.cpp)
 target_include_directories(ks_proto_rand PRIVATE screen)
 target_compile_definitions(ks_proto_rand PRIVATE KS_FUZZ_STANDALONE)
-target_compile_options(ks_proto_rand PRIVATE ${KORU_WARNINGS} ${KORU_SAN_FLAGS})
+target_compile_options(ks_proto_rand PRIVATE ${KORU_PEDANTIC} ${KORU_SAN_FLAGS})
 target_link_options(ks_proto_rand PRIVATE ${KORU_SAN_FLAGS})
 
 # The same oracle under libFuzzer's coverage guidance. libFuzzer is clang's and
@@ -186,7 +249,7 @@ if(KORU_FUZZ)
                    screen/screen.cpp screen/ansi.cpp screen/text.cpp screen/proto.cpp
                    screen/tests/fuzz_${target}.cpp)
     target_include_directories(ks_${target}_fuzz PRIVATE screen)
-    target_compile_options(ks_${target}_fuzz PRIVATE ${KORU_WARNINGS} -g
+    target_compile_options(ks_${target}_fuzz PRIVATE ${KORU_PEDANTIC} -g
                            -fsanitize=fuzzer,address,undefined -fno-omit-frame-pointer)
     target_link_options(ks_${target}_fuzz PRIVATE -fsanitize=fuzzer,address,undefined)
   endforeach()

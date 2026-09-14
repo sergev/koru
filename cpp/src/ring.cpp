@@ -369,6 +369,53 @@ koru_sqe adopt_fd(uint64_t user_data, int fd)
     return s;
 }
 
+koru_sqe poll_add(uint64_t user_data, uint32_t handle, uint32_t events)
+{
+    koru_sqe s  = {};
+    s.opcode    = KORU_OP_POLL_ADD;
+    s.len       = events;
+    s.user_data = user_data;
+    s.handle    = handle;
+    return s;
+}
+
+koru_sqe stat(uint64_t user_data, uint32_t handle, uint32_t slot, uint64_t off, uint32_t len)
+{
+    koru_sqe s  = {};
+    s.opcode    = KORU_OP_STAT;
+    s.len       = len;
+    s.off       = off;
+    s.user_data = user_data;
+    s.slot      = slot;
+    s.handle    = handle;
+    return s;
+}
+
+koru_sqe readdir(uint64_t user_data, uint32_t handle, uint32_t slot, uint64_t off, uint32_t len)
+{
+    koru_sqe s  = {};
+    s.opcode    = KORU_OP_READDIR;
+    s.len       = len;
+    s.off       = off;
+    s.user_data = user_data;
+    s.slot      = slot;
+    s.handle    = handle;
+    return s;
+}
+
+koru_sqe path(uint8_t op, uint64_t user_data, uint32_t slot, uint64_t off, uint32_t len,
+              uint32_t handle)
+{
+    koru_sqe s  = {};
+    s.opcode    = op;
+    s.len       = len;
+    s.off       = off;
+    s.user_data = user_data;
+    s.slot      = slot;
+    s.handle    = handle;
+    return s;
+}
+
 } // namespace sqe
 
 uint64_t arg_offset(uint64_t off, uint32_t len)

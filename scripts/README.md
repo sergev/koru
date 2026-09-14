@@ -211,7 +211,7 @@ a real window under SDL's offscreen driver. It is the only gate that needs all
 three of the module, SDL and a runtime directory, which is why it is its own.
 
 ```sh
-cmake -B build && cmake --build build      # the daemon and ks_pixel
+cmake -B build && cmake --build build      # the daemon, ks_pixel and cpp_less
 (cd rust && cargo build --examples)        # less, hello, date and screen_probe
 scripts/run-e2e.sh
 ```
@@ -225,6 +225,14 @@ next one is served; `hello` and `date` print on the window rather than on the
 terminal they were started from, while a redirected stdout is untouched; and
 `less` paints a status line whose modal colour is the palette's cyan, which is
 a pixel assertion rather than "it ran".
+
+Last of all, T48's: the same pager compiled against each binding, painting the
+same file through the same daemon, and the two window snapshots compared with
+`cmp`. Two things that case depends on. The snapshot is copied **while the
+pager is still alive**: killing it gives the alternate screen back, the daemon
+repaints the scrolling one, and two blank windows then compare equal. And the
+status line's cyan is asserted on the Rust one first, because a comparison of
+two blank windows would otherwise pass.
 
 The byte channel's cases need a terminal to be started from, which `script`
 supplies: the child's stdout is a pty, so what the pty saw is exactly what
@@ -243,16 +251,24 @@ braid their lines.
 
 `scripts/run-cpp.sh` boots the VM and runs `scripts/cpp.sh` in it, which drives
 `build/koru_cpp_check` — the T4-T11 matrix and the T3 matrices in C++, case for
-case with `rust/sys/tests/kernel.rs`.
+case with `rust/sys/tests/kernel.rs`, and from T45 the operation layer, the
+buffered stream and the screen client against its fake daemon.
 
 ```sh
 cmake -B build && cmake --build build
 scripts/run-cpp.sh
-scripts/run-cpp.sh cancel read   # only cases whose name matches
+scripts/run-cpp.sh ops_ file_    # only cases whose name matches
 ```
 
-It also runs T15's demo in both languages and compares the bytes on both
-streams, which is why it needs `cargo build --examples` as well as the module.
+It also runs three programs in both languages and compares the bytes on both
+streams — T15's demo, Braam's hello world and Braam's `date` — so it needs
+`cargo build --examples` as well as the module. The last of those cases
+is the sharpest: a stdout that cannot be re-opened through `/proc/self/fd`, as
+the VM's console is, must be refused by both bindings with the same status.
+
+The host-only half of the C++ suite is `ctest --test-dir build`, which needs
+neither VM nor device: the slab, the op state machine, `task<T>`'s depth case,
+the vocabulary, the option parser, the calendar, the grid and the text buffer.
 
 The verdict is `KORU-CPP-PASS`, and it gates on the same things the Rust runner
 does: the suite's own "OK: 0 failure(s)" line, a floor on the number of cases

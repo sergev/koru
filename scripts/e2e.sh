@@ -19,6 +19,7 @@ LESS=${LESS:-}
 HELLO=${HELLO:-}
 DATE=${DATE:-}
 DAEMON=${DAEMON:-$ROOT/build/koru-screen}
+CPPLESS=${CPPLESS:-$ROOT/build/cpp_less}
 PIXEL=${PIXEL:-$ROOT/build/ks_pixel}
 RUN=/tmp/koru-e2e
 SOCK=$RUN/koru-screen.sock
@@ -72,7 +73,7 @@ echo "=== koru screen end to end ==="
 uname -r
 
 fence "environment"
-for f in "$PROBE" "$LESS" "$HELLO" "$DATE" "$DAEMON"; do
+for f in "$PROBE" "$LESS" "$HELLO" "$DATE" "$DAEMON" "$CPPLESS"; do
 	if [ ! -x "$f" ]; then
 		echo "NOT BUILT: $f"
 		fail=1
@@ -304,6 +305,68 @@ fi
 kill -9 $pager 2>/dev/null
 wait $pager 2>/dev/null
 
+# ------------------------------------------- the same pager in both bindings
+#
+# T48's done test. Braam's `less`, compiled once against the Rust binding and
+# once against the C++ one, painting the same file through the same daemon:
+# the two window snapshots must be **byte-identical**.
+#
+# This is the language-neutrality claim made on a surface that paints rather
+# than one that prints, and it is a stronger test than two demos emitting the
+# same text: every cell, every colour and the cursor all have to agree, over a
+# protocol neither binding shares a line of code for.
+fence "less in two bindings"
+# The snapshot is copied **while the pager is still alive**. Killing it gives
+# the alternate screen back, the daemon repaints the scrolling one, and the
+# file then holds a blank window with a cursor in it — which is what the first
+# version of this case compared, twice, and called a match.
+snap_pager() {
+	pkill -x -f "$DAEMON" 2>/dev/null
+	sleep 0.3
+	rm -f "$SOCK" "$SOCK.lock" "$2" "$3"
+	KORU_SCREEN_SNAP="$2" "$1" $RUN/fixture.txt >/dev/null 2>"$3.err" &
+	pager=$!
+	# Long enough for a daemon started from cold: the window is SDL's, and
+	# this is the one place in the run where nothing is warm.
+	sleep 4
+	if kill -0 $pager 2>/dev/null; then
+		cp "$2" "$3" 2>/dev/null
+	else
+		echo "FAILED: $1 exited early:"
+		cat "$3.err"
+		fail=1
+	fi
+	kill -9 $pager 2>/dev/null
+	wait $pager 2>/dev/null
+}
+
+reset_run
+seq 1 200 | sed 's/^/line /' >$RUN/fixture.txt
+snap_pager "$LESS" $RUN/live-rs.bmp $RUN/less-rs.bmp
+snap_pager "$CPPLESS" $RUN/live-cpp.bmp $RUN/less-cpp.bmp
+if [ -f "$RUN/less-rs.bmp" ] && [ -f "$RUN/less-cpp.bmp" ]; then
+	# That both painted at all is asserted first: two blank windows would
+	# compare equal, and this case would then prove nothing.
+	size=$("$PIXEL" $RUN/less-rs.bmp size)
+	cols=${size%x*}
+	rows=${size#*x}
+	last=$((rows - 20))
+	echo "   window $size"
+	want_eq "the Rust pager painted its status line" \
+		"$("$PIXEL" $RUN/less-rs.bmp modal 0 $last "$cols" 20)" "00cdcd"
+	if cmp -s $RUN/less-rs.bmp $RUN/less-cpp.bmp; then
+		echo "ok: the two bindings painted the same pixels"
+	else
+		echo "MISMATCH: the two pagers' windows differ"
+		cmp $RUN/less-rs.bmp $RUN/less-cpp.bmp | head -3
+		fail=1
+	fi
+else
+	echo "FAILED: one of the pagers left no snapshot"
+	fail=1
+fi
+pkill -x -f "$DAEMON" 2>/dev/null
+
 # `less` with no daemon to be had is `cat`, which is the other half of its
 # first decision and needs no window at all.
 fence "less with no screen"
@@ -312,6 +375,8 @@ sleep 0.2
 rm -rf $RUN/koru-screen.sock
 out=$(KORU_SCREEN_BIN=/nonexistent "$LESS" $RUN/fixture.txt 2>$RUN/cat.err | tail -1)
 want_eq "it catted the file instead" "$out" "line 200"
+out=$(KORU_SCREEN_BIN=/nonexistent "$CPPLESS" $RUN/fixture.txt 2>$RUN/cat.err | tail -1)
+want_eq "and so did the C++ one" "$out" "line 200"
 
 pkill -x -f "$DAEMON" 2>/dev/null
 

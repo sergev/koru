@@ -138,8 +138,14 @@ uint32_t Reactor::pump(uint32_t min_complete, uint64_t timeout_ns)
     EnterResult r = ring_.enter(go, cq_, min_complete, timeout_ns);
     if (!r) {
         // The ioctl itself failed, which is a protocol failure rather than an
-        // op's result: nothing was consumed, so the batch goes back.
+        // op's result: nothing was consumed, so the batch goes back. Whoever
+        // yielded still runs, or a task waiting on one would wait for ever.
         pending_.assign(go.begin(), go.end());
+        std::vector<std::coroutine_handle<>> again = std::move(deferred_);
+        deferred_.clear();
+        for (std::coroutine_handle<> h : again)
+            if (h && !h.done())
+                h.resume();
         return 0;
     }
 
@@ -187,7 +193,15 @@ uint32_t Reactor::pump(uint32_t min_complete, uint64_t timeout_ns)
     // pumps again, and none of that may happen while the slab is being walked.
     std::vector<std::coroutine_handle<>> resume = std::move(woken_);
     woken_.clear();
+    // Whoever yielded goes with them, and the list is taken first: one of them
+    // may yield again, and appending to a list being walked is a dangling
+    // iterator in a loop that already looks safe.
+    std::vector<std::coroutine_handle<>> again = std::move(deferred_);
+    deferred_.clear();
     for (std::coroutine_handle<> h : resume)
+        if (h && !h.done())
+            h.resume();
+    for (std::coroutine_handle<> h : again)
         if (h && !h.done())
             h.resume();
     return n;

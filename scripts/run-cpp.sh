@@ -26,10 +26,10 @@ MEMORY=${MEMORY:-2G}
 CPUS=${CPUS:-4}
 TIMEOUT=${TIMEOUT:-900}
 
-# The number of cases an unfiltered run must reach. It is the whole of the
-# T4-T11 matrix plus the T3 matrices, and it equals the Rust suite's count for
-# the same sections: raise it when a case is added.
-FLOOR=${FLOOR:-72}
+# The number of cases an unfiltered run must reach: the T4-T11 matrix, the T3
+# matrices, and from T45-T48 the operation layer, the buffered stream and the
+# screen client. Raise it when a case is added.
+FLOOR=${FLOOR:-126}
 
 if [ ! -d "$KDIR" ]; then
 	echo "no kernel tree at $KDIR; set KDIR" >&2
@@ -43,8 +43,9 @@ fi
 # CMakeLists.txt records.
 cmake -B "$BUILD" -S "$ROOT" -DCMAKE_CXX_COMPILER="$CXX" -DCMAKE_C_COMPILER="$CC" \
 	-DKORU_SANITIZE=ON >/dev/null || exit 1
-cmake --build "$BUILD" --target koru_cpp_check koru_cpp_unit cpp_read_file >/dev/null || {
-	cmake --build "$BUILD" --target koru_cpp_check koru_cpp_unit cpp_read_file
+TARGETS="koru_cpp_check koru_cpp_unit cpp_read_file cpp_hello cpp_date"
+cmake --build "$BUILD" --target $TARGETS >/dev/null || {
+	cmake --build "$BUILD" --target $TARGETS
 	exit 1
 }
 
@@ -64,25 +65,35 @@ fi
 	exit 1
 }
 
-# T42's demo has to be compared against the Rust one, so ask cargo where that
-# is rather than globbing target/debug, where a stale binary would outlive a
+# Every demo has to be compared against the Rust one, so ask cargo where those
+# are rather than globbing target/debug, where a stale binary would outlive a
 # failed build and pass.
-RUSTDEMO=$(cd "$ROOT/rust" && cargo build -p koru --example read_file \
-	--message-format=json 2>/dev/null |
-	grep -F '"kind":["example"]' |
-	tr ',' '\n' |
-	sed -n 's/.*"executable":"\([^"]*\)".*/\1/p' | tail -1)
-if [ -z "$RUSTDEMO" ] || [ ! -x "$RUSTDEMO" ]; then
-	echo "no Rust read_file example to compare against" >&2
-	echo "run: (cd rust && cargo build --examples)" >&2
-	exit 1
-fi
+find_rust_example() {
+	bin=$(cd "$ROOT/rust" && cargo build -p koru --example "$1" \
+		--message-format=json 2>/dev/null |
+		grep -F '"kind":["example"]' |
+		tr ',' '\n' |
+		sed -n 's/.*"executable":"\([^"]*\)".*/\1/p' | tail -1)
+	if [ -z "$bin" ] || [ ! -x "$bin" ]; then
+		echo "no Rust $1 example to compare against" >&2
+		echo "run: (cd rust && cargo build --examples)" >&2
+		exit 1
+	fi
+	echo "$bin"
+}
+
+RUSTDEMO=$(find_rust_example read_file) || exit 1
+RUSTHELLO=$(find_rust_example hello) || exit 1
+RUSTDATE=$(find_rust_example date) || exit 1
 
 cd "$ROOT" || exit 1
 
 out=$(timeout "$TIMEOUT" vng --run "$KDIR" --user root --memory "$MEMORY" --cpus "$CPUS" \
 	--exec "CHECKBIN='$BUILD/koru_cpp_check' FLOOR='$FLOOR' \
-		DEMO='$BUILD/cpp_read_file' RUSTDEMO='$RUSTDEMO' sh scripts/cpp.sh $*" 2>&1)
+		DEMO='$BUILD/cpp_read_file' RUSTDEMO='$RUSTDEMO' \
+		HELLO='$BUILD/cpp_hello' RUSTHELLO='$RUSTHELLO' \
+		DATE='$BUILD/cpp_date' RUSTDATE='$RUSTDATE' \
+		sh scripts/cpp.sh $*" 2>&1)
 
 verdict=$(echo "$out" | grep -oE 'KORU-CPP-(PASS|FAIL)' | tail -1)
 case "$verdict" in

@@ -4375,14 +4375,253 @@ mid-flight" and gets the same treatment:
 - **Coroutine frames heap-allocate.** HALO elision is real but unreliable across
   compilers; do not design around it. If allocation shows up in a profile, a
   pooled `operator new` on the promise type is the fix.
-- **Toolchain**: GCC ≥ 11 or Clang ≥ 14, `-std=c++20`. Build with
-  `-fsanitize=address,undefined` from day one — ASan catches the
-  resumed-dangling-handle bug immediately, and that is the bug this binding is
-  most likely to have.
+- **Toolchain**: GCC ≥ 11 or Clang ≥ 14, **`-std=gnu++20`**. T44 is what
+  changed that from `c++20`: Braam's `TRY` family are statement expressions,
+  which are a GNU extension, and C++ has no other way to spell "unwrap or
+  return" as an expression. Build with `-fsanitize=address,undefined` from day
+  one — ASan catches the resumed-dangling-handle bug immediately, and that is
+  the bug this binding is most likely to have.
 
 The two userspace bindings share no code. That is intentional: the second
 binding exists to demonstrate the ABI is language-neutral, so resist factoring
 common logic across them.
+
+## The C++ surface
+
+T44–T48 put Braam's whole userspace API on top of T39–T43's core: the
+vocabulary and the ambient ring, the operation layer, the buffered stream and
+its iterators, the program shell, and the screen client. `cpp/include/koru/`
+grew `vocab.hpp`, `args.hpp`, `rt.hpp`, `ops.hpp`, `filebuf.hpp`, `file.hpp`,
+`iter.hpp`, `opt.hpp`, `usage.hpp`, `time.hpp`, `grid.hpp`, `textbuf.hpp`,
+`screen.hpp` and `braam.hpp`, and `cpp/src/` the implementations.
+
+It is a transcription of the Rust surface, not a port of it: the two share no
+line of code, and everything below is a place where C++ forced a different
+answer to the same question.
+
+### `braam.hpp` is the whole portability claim
+
+One header, every name at global scope, nothing defined twice: `Task` is
+`koru::task`, `Result` is `koru::result`, `Error` is the one libkoru has had
+since T39. A Braam source compiles with that include line as its only edit,
+which is what T49 will measure and what `cpp/examples/hello.cpp`,
+`date.cpp` and `less.cpp` already demonstrate — none of them writes `koru::`,
+`std::`, or any other header.
+
+### `CO_TRY(co_await f())` is an internal compiler error in GCC
+
+Braam's `TRY` must be an *expression*: `i32 n = TRY(f());` is how every Braam
+program is written. The only way C++ can spell an early return inside an
+expression is a statement expression, `({ ... })`, which is why T44's plan said
+to move to `-std=gnu++20`.
+
+GCC cannot compile one that contains both a `co_await` and a `co_return`. It is
+an ICE, not a diagnostic, and it happens at `-O0`, `-O1` and `-O2` alike:
+
+```c++
+#include <coroutine>
+struct task {
+    struct promise_type {
+        task get_return_object() { return {}; }
+        std::suspend_never initial_suspend() { return {}; }
+        std::suspend_never final_suspend() noexcept { return {}; }
+        void return_value(int) {}
+        void unhandled_exception() {}
+    };
+    bool await_ready() { return true; }
+    void await_suspend(std::coroutine_handle<>) {}
+    int await_resume() { return 0; }
+};
+task f() { int n = ({ if (co_await task{}) co_return 1; 0; }); co_return n; }
+```
+
+`g++ -std=gnu++20 -c` on GCC 16.2: *internal compiler error: in gimplify_expr,
+at gimplify.cc:21341*. Clang 21 compiles it. Neither a declaration inside the
+braced group nor a `co_await` inside one is a problem on its own; it is the two
+together.
+
+Two consequences, and the second is why the repo did not lose a compiler:
+
+- **A Braam source that writes `CO_TRY(co_await f())` for a value needs
+  clang.** There is no workaround: the early return has to be inside the
+  expression, and that is the construct GCC rejects.
+- **`TRY_VOID` and `CO_TRY_VOID` are unaffected**, because they are
+  `do { ... } while (0)` — a statement, not a braced group. Only a value
+  coming *out* of the await is the problem, and `cpp/examples/hello.cpp`
+  compiles with either compiler for exactly that reason.
+
+libkoru's own sources therefore use `CO_LET(name, expr)` and `CO_OK(expr)`,
+which are koru's own and are statements. That is not aesthetics: it is what
+keeps libkoru, its 126-case device suite and its 85-case host suite buildable
+by **either** compiler, and with them T41's measurement of GCC's symmetric
+transfer — which is a claim about GCC's codegen and cannot be re-run on clang.
+
+### `-Wpedantic` had to be split in two
+
+`-Wpedantic` means "warn about anything that is not ISO", and since T44 this
+binding's dialect deliberately is not. Both compilers refuse a statement
+expression under it — GCC as an error at the `({`, clang at every use site —
+and neither can be silenced from inside the header, because the diagnostic
+lands in the *user's* translation unit and not in the macro's.
+
+So `CMakeLists.txt` has two warning sets. Anything that includes
+`koru/vocab.hpp` gets `KORU_WARNINGS`; the two ABI mirrors, the C11 probes and
+the whole screen daemon never see it and keep `KORU_PEDANTIC`, where the ISO
+check is still worth having.
+
+### Two standard-library names the examples still spell out
+
+`braam.hpp` gets a Braam source to compile with no `koru::` anywhere, but two
+names from the standard library survive in the three examples and T49 is what
+will settle them. `std::move` cannot be hoisted: clang's
+`-Wunqualified-std-cast-call` refuses an unqualified call to it found through a
+using-declaration, so a `move` at global scope would have to be a definition of
+koru's own rather than an alias. And `snprintf` is there because this surface
+has no formatting of Braam's — its `String` helpers are outside the list T44
+carried, and inventing an API ahead of the program that needs one is what this
+plan avoids everywhere else.
+
+### Three Braam names are libc macros
+
+`stdin`, `stdout` and `stderr` are macros in `<cstdio>`, so no identifier can
+be one of them: the three handles are `in_fd`, `out_fd` and `err_fd`, and the
+three streams are `File::in()`, `File::out()` and `File::err()`. The Rust
+binding has no such constraint and spells them `koru::stdin()` and
+`File::stdin()`. This is the one place the two surfaces differ by a name rather
+than by a type.
+
+`SEEK_SET`, `SEEK_CUR`, `SEEK_END`, `O_TRUNC`, `O_APPEND` and `O_EXCL` are
+macros too, and those `ops.hpp` **takes back**: it includes `<cstdio>` and
+`<fcntl.h>` first, static-asserts that the three `SEEK_*` values agree with
+Braam's, and `#undef`s all six. The three `O_*` deliberately do *not* agree —
+Braam's `O_TRUNC` is 8 and POSIX's is 0x200 — which is the whole reason
+`open_flags` translates, and a source that wants POSIX's own must say so before
+this header.
+
+### `koru_main` returns a `Result`, and the plan's sketch could not
+
+T44's plan said `koru_main(Args) -> task<i32>`. That signature cannot use the
+macros the same task exists to add: `CO_TRY` returns an `Error` from the
+function it is written in, so an entry that cannot carry one is an entry no
+Braam program can use them in. It is `task<result<i32>>`, and `exit_status` is
+the Rust binding's `Exit` trait as a function — a value is itself, `Cancelled`
+is 130, anything else is 1 with a diagnostic.
+
+`run_main` and the `main` that calls it live in `koru_start`, a library of
+their own. Not for tidiness: `run_main` *calls* `koru_main`, so an object
+carrying it inside libkoru would make every binary that links libkoru owe a
+definition of a program entry it may have no use for — which is exactly what
+the test binaries and the screen daemon do not have.
+
+### The executor needed a way to resume a frame with no op behind it
+
+`acquire()` waits for an arena slot, and the screen client's single-writer rule
+waits for the one write in flight. Neither is an op, so neither has a
+completion to be woken by; the Rust binding spells both as a
+`cx.waker().wake_by_ref()` followed by `Poll::Pending`.
+
+`Reactor::defer(handle)` is the C++ answer: a list of frames to resume on the
+next pump, with `co_await yield(r)` as the awaiter. Two things it forced, and
+both are load-bearing:
+
+- **`Executor::turn` must not park when something is deferred.** It passes
+  `min_complete` 0 in that case, because `min_complete` is what decides whether
+  `ENTER` waits at all — a turn that slept while a runnable frame waited would
+  deadlock against itself.
+- **The deferred list is taken before it is walked.** A resumed frame may yield
+  again, and appending to a vector being iterated is a dangling iterator in a
+  loop that looks safe. The woken list already had this rule; the deferred one
+  needed it too, including on the path where `ENTER` itself failed — otherwise
+  a task waiting on a yield would wait for ever.
+
+### Every `Str` argument must outlive its task
+
+A C++ coroutine copies its parameters into the frame, and a `string_view`
+copied there still points at the caller's bytes. `co_await read_file(String(p))`
+is a dangling read where `co_await read_file(p)` is not. Braam's surface has
+the same rule for the same reason; the Rust binding gets it from the borrow
+checker instead, and this is the sharpest thing the C++ binding gives up.
+
+### The buffered stream: what the fast halves actually buy
+
+T31's rule — *measure a fast path; never assume it* — transferred, and
+measuring it found that the instrument had to change.
+
+The `ENTER` count works and is asserted exactly: 10,277 runes out of a 512-byte
+block cost 22 `ENTER`s, one per refill and one for the read that reports the
+end, and a refill shortened to one byte costs 10,278. But **deleting
+`take_fast` changes no `ENTER` count at all**, because `get`'s slow half also
+answers out of the buffer without suspending. In Rust the fast half is what
+keeps a call away from the reactor; in C++ the slow half is already there.
+
+What a C++ fast half saves is a *coroutine frame*: a `co_await` of another task
+allocates one whether or not it suspends, and `put_fast` is what keeps the
+nested `settle` out of a buffered `put`. So `detail::frames_allocated` counts
+them, and the case asserts that 255 buffered puts cost exactly 255 frames —
+`put` itself and nothing inside it. Deleting `put_fast` makes it 510, and no
+`ENTER` count sees that.
+
+### The three standard streams are `File &`, as Braam's are
+
+Rust cannot lend out of a thread-local across an `await`, which is why the Rust
+binding has a `Std` handle that takes the `File` out for the length of one
+call. C++ can hold a reference across a suspension point, so `File::out()`
+returns the `File` itself and the whole indirection disappears. `install` and
+`shutdown` clear the cache through `detail::reset_std`, because a new ring
+means new handles and a `File` built over the old ones names nothing.
+
+### The screen client, and the fake daemon that has to be two threads
+
+`Conn`, the pump, the `seq` demultiplexing, the write token and the banding are
+T37's, transcribed. The awaiters are where C++ differs: a reply wakes its
+caller through `Reactor::defer`, never by resuming it from inside the pump,
+because a resumed frame submits and pumps again and none of that may happen
+while the pump is walking its own buffer.
+
+`~Screen` closes the descriptor it opened and **nothing else** — no claim
+release, no protocol goodbye, because a destructor cannot await. The claims go
+back when the ring's teardown drops the reference `ADOPT_FD` took, which is
+T38's EOF teardown and the argument Braam's own header already makes.
+
+The fake daemon is C++ threads over a `socketpair`, two of them for T37's
+reason: one thread that both read and wrote would block in its read while a
+reply waited behind it in the queue. `Fake::take` is a coroutine that polls
+with `sleep_for(1)`, because a blocking wait would hold the only thread the
+client has.
+
+### The done test is a window, not a line of text
+
+T48's is the strongest form of the language-neutrality claim this project
+makes: Braam's `less`, compiled once against each binding, painting the same
+file through the same daemon, and the two window snapshots compared with `cmp`.
+Every cell, every colour and the cursor all have to agree, over a protocol
+neither binding shares a line of code for.
+
+It needed one correction before it could catch anything. **The snapshot has to
+be copied while the pager is still alive.** Killing it gives the alternate
+screen back, the daemon repaints the scrolling one, and the file then holds a
+blank window with a cursor in it — which is what the first version compared,
+twice, and called a match. The `modal` assertion on the status line is what
+says the comparison is not vacuous, and it is what caught this.
+
+### What was shown to fail
+
+- **The single-writer token, deleted.** `several_blits_at_once_are_whole_frames`
+  fails immediately and loudly: the fake's own length check refuses a frame
+  whose length is not a multiple of eight, one frame is found carrying two
+  grids, and three of eight painters' letters never arrive whole.
+- **`put_fast`, deleted.** 255 buffered puts cost 510 coroutine frames instead
+  of 255. No `ENTER` count moves, which is the finding above.
+- **A refill shortened to one byte.** 10,277 runes cost 10,278 `ENTER`s where
+  22 is one per refill.
+- **`stat_of` made to always follow.** An unfollowed link reports its target's
+  kind and size, and the listing disagrees with `readdir` on both symlinks.
+- **The option parser reading a byte rather than a rune.** `-é` comes out as
+  `!Ã` with the rest of the sequence left in the operand list — the panic the
+  Rust binding gets from slicing mid-sequence, as a silently wrong answer.
+- **The C++ pager's status line changed by one character** (an em dash for a
+  hyphen). The two windows differ and `cmp` says so, which is what makes the
+  byte-identical comparison mean something.
 
 ## Known gaps, accepted for the PoC
 
@@ -4540,13 +4779,30 @@ arrive with their tasks.
   errno table, as X-macros. *exists*
 - `cpp/tools/abi_dump.cpp` and `rust/sys/src/bin/abi_dump.rs` — the two
   emitters `scripts/abi.sh` diffs. *exists*
-- `cpp/include/koru.hpp` — `Ring`, `BufPool`, move-only `BufSlot`,
-  `result<T>`.
+- `cpp/include/koru/ring.hpp`, `pool.hpp`, `error.hpp`, `result.hpp` — `Ring`,
+  `Arena`, `BufPool`, move-only `BufSlot`, the errno table and `result<T, E>`.
 - `cpp/include/koru/task.hpp` — `task<T>` promise type, symmetric transfer,
-  `sync_wait`.
-- `cpp/include/koru/awaiter.hpp` — op slab, `op_awaiter`, the abandonment
-  path.
-- `cpp/examples/read_file.cpp` — the C++20 demo.
+  `sync_wait`, and the coroutine-frame allocation counter T46 measures with.
+- `cpp/include/koru/slab.hpp`, `op.hpp`, `reactor.hpp`, `exec.hpp` — the op
+  slab, the state machine, `op_awaiter` and the abandonment path, the yield
+  awaiter, and the executor.
+- `cpp/include/koru/vocab.hpp` — Braam's aliases, the `TRY` family, and the
+  portable `CO_LET`/`CO_OK` pair libkoru's own sources use.
+- `cpp/include/koru/rt.hpp`, `args.hpp` — the ambient ring, the handle
+  bookkeeping, the at-exit hook and `Args`.
+- `cpp/include/koru/ops.hpp` — Braam's operation layer, T30's list.
+- `cpp/include/koru/filebuf.hpp`, `file.hpp`, `iter.hpp` — the buffered stream
+  and the three iterators.
+- `cpp/include/koru/opt.hpp`, `usage.hpp`, `time.hpp` — the program shell.
+- `cpp/include/koru/grid.hpp`, `textbuf.hpp`, `screen.hpp` — the screen
+  client's pure half and the client itself.
+- `cpp/include/koru/braam.hpp` — all of it at global scope, and the only
+  include a Braam source needs.
+- `cpp/src/main.cpp` — the `main` a koru program does not write. Its own
+  library, `koru_start`.
+- `cpp/examples/read_file.cpp`, `hello.cpp`, `date.cpp`, `less.cpp` — the
+  C++20 demo and the three Braam programs, each with a Rust twin the gates
+  compare it against.
 
 `test/koru_check` stays the kernel's own check and is not superseded by the
 Rust suite: it owns the fuzz, the two `rmmod` races and the heavy-phase leak

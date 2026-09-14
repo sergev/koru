@@ -48,12 +48,18 @@ namespace detail {
 /// ordinary run can.
 inline unsigned fail_frame_allocations = 0;
 
+/// Coroutine frames allocated. The instrument for a fast path that is meant
+/// to reach no nested coroutine: a `co_await` of another task costs a frame
+/// whether or not it suspends, so this counts what an `ENTER` count cannot.
+inline unsigned long long frames_allocated = 0;
+
 inline void *frame_alloc(size_t n) noexcept
 {
     if (fail_frame_allocations) {
         fail_frame_allocations--;
         return nullptr;
     }
+    frames_allocated++;
     return ::operator new(n, std::nothrow);
 }
 

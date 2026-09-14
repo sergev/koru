@@ -101,6 +101,13 @@ public:
     size_t queued() const { return pending_.size(); }
     size_t live() const { return slab_.live(); }
 
+    /// Resume `h` on the next pump, with no op behind it. What a task waiting
+    /// for a resource another task holds — an arena slot, the one write in
+    /// flight on a socket — parks on: the pool comes back when somebody else's
+    /// op completes, which is progress the executor makes anyway.
+    void defer(std::coroutine_handle<> h) { deferred_.push_back(h); }
+    size_t deferred() const { return deferred_.size(); }
+
     /// `ENTER` calls made. Measured, never assumed: one per pump is what the
     /// ABI provides, and a binding that pays two per op passes every
     /// behavioural test there is.
@@ -130,12 +137,28 @@ private:
     std::vector<koru_sqe> pending_;
     std::vector<koru_cqe> cq_;
     std::vector<std::coroutine_handle<>> woken_;
+    std::vector<std::coroutine_handle<>> deferred_;
     size_t inflight_  = 0;
     uint64_t enters_  = 0;
     uint64_t sqes_    = 0;
     uint64_t cqes_    = 0;
     uint64_t cancels_ = 0;
 };
+
+/// `co_await yield(r)` — one turn of the executor, then carry on. Nothing is
+/// submitted, so this costs no op and no `ENTER` of its own.
+struct yield_awaiter {
+    Reactor *reactor = nullptr;
+
+    bool await_ready() const noexcept { return false; }
+    void await_suspend(std::coroutine_handle<> h) const { reactor->defer(h); }
+    void await_resume() const noexcept {}
+};
+
+inline yield_awaiter yield(Reactor &r)
+{
+    return yield_awaiter{ &r };
+}
 
 } // namespace koru
 

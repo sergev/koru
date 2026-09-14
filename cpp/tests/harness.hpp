@@ -47,6 +47,14 @@ void test_skip(const char *what, const char *why);
             return;    \
     } while (0)
 
+/// The same inside a coroutine, where `return` is not a statement that
+/// compiles.
+#define CO_REQUIRE(e)  \
+    do {               \
+        if (!CHECK(e)) \
+            co_return; \
+    } while (0)
+
 /// A message with the same prefix as a failure, for a case that wants to say
 /// which row of a matrix it is on.
 void test_note(const char *fmt, ...) __attribute__((format(printf, 1, 2)));

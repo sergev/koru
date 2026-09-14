@@ -85,50 +85,13 @@ the whole grid damaged. Add them here as tasks when one of them is wanted.
 
 ## Phase 11 — the C++ surface
 
-### T44 [M] — the vocabulary and runtime entry, C++
-
-`Error`, `result<T>`, `TRY`, `TRY_VOID`, `CO_TRY`, `CO_TRY_VOID`. Those macros
-are statement expressions and need `-std=gnu++20`, where Notes.md says `c++20`;
-change it there. Aliases for `Str`, `Span`, `String`, `Option`, and
-`koru/braam.hpp` hoisting everything to global scope. Then the ambient ring,
-`koru_main(Args) -> task<i32>`, the spawn and the at-exit hook.
-
-Done test: the errno table from T20, in C++, giving identical results. Then a
-source file written in Braam style, with no namespace qualification anywhere,
-compiling with only `braam.hpp` included — and Braam's hello world running with
-the same output as T21's.
-
-### T45 [M] — the operation layer, C++
-
-T30's function list, same signatures.
-
-Done test: T30's signature-conformance and behavioural matrix, in C++.
-
-### T46 [M] — buffered `File` and the iterators, C++
-
-T31's surface. `~File` neither flushes nor closes, which is Braam's documented
-behaviour and not an oversight.
-
-Done test: T31's, including the measured `ENTER` count.
-
-### T47 [M] — the program shell, C++
-
-T32's surface.
-
-Done test: T32's, against the same vectors.
-
-### T48 [M] — the screen client, C++
-
-T37's surface transcribed, over a C++ port of the same pure library.
-`~ProcScreen` neither releases the claims nor closes the connection, because a
-destructor cannot await — T38's EOF teardown is what makes that safe, and it is
-the argument Braam's own header already makes.
-
-Done test: T37's matrix in C++ against the same fake daemon, identical
-assertions in a different language. Then Braam's `less` through the C++ binding
-producing a pixel snapshot **byte-identical** to the Rust run of T38. That is
-the language-neutrality claim made on a surface that paints rather than one
-that prints, and it is a stronger test than two demos emitting the same text.
+Built. Braam's whole userspace API sits on T39-T43's core: the vocabulary and
+the ambient ring, the operation layer, the buffered stream and its iterators,
+the program shell, and the screen client. `cpp/include/koru/braam.hpp` hoists
+all of it to global scope, and `hello`, `date` and `less` are Braam sources
+with that include line as their only edit — each compared against its Rust
+twin, `less` in pixels. doc/Notes.md has the design and what each task taught,
+including the GCC bug that makes `CO_TRY(co_await ...)` clang-only.
 
 ## Phase 12 — the proof
 
@@ -140,7 +103,14 @@ By ascending difficulty: `echo`, `basename`, `dirname`, `pwd`, `seq`, `sleep`,
 `touch`, `mkdir`, `rm`, `ln`, `truncate`, `date`, `cat`, `wc`, `head`, `tail`,
 `tr`, `cut`, `uniq`, `cmp`, `tee`, `grep`. Then `less` and `edit`, which are the
 full-screen half of `src/cmd` and the only two that exercise Phase 9's pure
-library end to end; `less` already ran at T38, so `edit` is what this adds.
+library end to end; `less` already runs in both bindings at T48, so `edit` is
+what this adds.
+
+**A program that wants a value out of an await needs clang.** GCC cannot
+compile a statement expression holding both a `co_await` and a `co_return`, so
+`i32 n = CO_TRY(co_await f());` is an internal compiler error there;
+doc/Notes.md has the reproducer. `CO_TRY_VOID` is unaffected. This task records
+which of Braam's programs that actually bites.
 
 Done test: a stated number of them compile with no source change beyond the
 include, and each produces byte-identical output to its coreutils equivalent on
@@ -200,23 +170,29 @@ lands:
    `cargo run` cannot reach `/dev/koru` from here. `scripts/rust.sh` runs each
    three ways, because a pipe, a regular file and an argument are three
    different assertions about the entry.
-5. `cmake -B build -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined"`, then
-   `cmake --build build`.
+5. `cmake -B build && cmake --build build`, then `ctest --test-dir build` —
+   the host-only C++ half: the slab and the op state machine (T39–T40), the
+   symmetric-transfer depth case (T41), the vocabulary and `Args` (T44), the
+   option parser and the calendar (T47), and the grid, the text buffer and the
+   view (T48). No VM, no device.
 6. `scripts/abi.sh` — the two ABI dumps agree (T14). The screen protocol's two
    dumps share the same runner (T33).
-7. `ctest --test-dir build` — the C++ matrix (T39), abandonment (T40),
-   symmetric transfer (T41), drop safety (T43), the C++ surface (T44–T47) and
-   the C++ screen client (T48), under ASan and UBSan.
-8. `./build/examples/read_file` — the C++ demo (T42). Must match the Rust
-   example of step 4 byte for byte.
-9. `ctest --test-dir build -L screen` — the terminal model against Braam's own
+7. `scripts/run-cpp.sh` — the C++ device suite, in a VM and under ASan and
+   UBSan: the T4–T11 matrix (T39), abandonment (T40), drop safety (T43), the
+   operation layer (T45), the buffered stream (T46) and the screen client
+   against its fake daemon (T48). It also runs T42's demo, T44's hello world
+   and T47's `date` beside their Rust twins and compares the bytes.
+8. `ctest --test-dir build -L screen` — the terminal model against Braam's own
    cell-exact tests (T34), the protocol server's rejection matrix through
    `feed()` (T36) and the five pixel oracles (T35). **These need no VM, no
    `/dev/koru` and no display server**, so they are the fastest feedback in the
    whole list and should run first in practice.
+9. `scripts/run-e2e.sh` — the daemon end to end (T38), the byte channel
+   (T38b), and Braam's `less` in both bindings painting a byte-identical
+   window (T48).
 10. `ctest --test-dir build -L portability` — Braam's programs against
     coreutils, `less` and `edit` included (T49).
-11. Steps 4 and 8 **concurrently** (T43). Both must still be correct.
+11. Steps 4 and 7 **concurrently** (T43). Both must still be correct.
 
 The dev kernel must have KASAN, `PROVE_LOCKING` and `DEBUG_KMEMLEAK` on from day
 one; they pay for themselves in the first week.

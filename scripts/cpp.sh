@@ -8,9 +8,10 @@
 # Prints exactly one KORU-CPP-PASS or KORU-CPP-FAIL marker, which
 # scripts/run-cpp.sh greps for. Every check below gates that marker.
 #
-# CHECKBIN is the suite binary and FLOOR the number of cases it must run;
-# DEMO and RUSTDEMO are T15's demo in each language, which must print the same
-# bytes. All four are passed in by the runner.
+# CHECKBIN is the suite binary and FLOOR the number of cases it must run. The
+# rest are one program per binding, which must print the same bytes: T15's demo
+# (T42), Braam's hello world (T44) and Braam's `date` (T47). All are passed in
+# by the runner.
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 KO=${KO:-$ROOT/kernel/koru.ko}
@@ -18,6 +19,10 @@ CHECKBIN=${CHECKBIN:-$ROOT/build/koru_cpp_check}
 FLOOR=${FLOOR:-72}
 DEMO=${DEMO:-}
 RUSTDEMO=${RUSTDEMO:-}
+HELLO=${HELLO:-}
+RUSTHELLO=${RUSTHELLO:-}
+DATE=${DATE:-}
+RUSTDATE=${RUSTDATE:-}
 FILTERS="$*"
 OUT=/tmp/koru-cpp-out
 ERR=/tmp/koru-cpp-err
@@ -120,6 +125,74 @@ if [ -z "$FILTERS" ]; then
 		same_file "the two demos agree on stdout" "$OUT" "$ROUT"
 		same_file "and on stderr" "$ERR" "$RERR"
 	fi
+fi
+
+# T44's and T47's. The two bindings' programs must be indistinguishable on
+# both streams and in their exit status — the same claim T42's demo makes, on
+# the surface a program is actually written against.
+#
+# Everything is redirected: the virtio console a VM is run on is one of the
+# descriptors `/proc/self/fd` cannot re-open, so koru adopts the raw one and
+# refuses a write to it. Both bindings fail there in exactly the same way,
+# which the last case below is what says.
+if [ -z "$FILTERS" ]; then
+	fence "the surface"
+	for pair in "hello:$HELLO:$RUSTHELLO" "date:$DATE:$RUSTDATE"; do
+		name=${pair%%:*}
+		rest=${pair#*:}
+		cpp=${rest%%:*}
+		rs=${rest#*:}
+		if [ ! -x "$cpp" ] || [ ! -x "$rs" ]; then
+			echo "NOT BUILT: $cpp or $rs"
+			fail=1
+		fi
+	done
+
+	"$HELLO" >$OUT 2>$ERR
+	want_eq "hello exit status" "$?" "0"
+	want_eq "hello to a regular file" "$(cat $OUT)" "Hello, world!"
+	want_eq "hello with an argument" "$("$HELLO" koru 2>$ERR)" "Hello, koru!"
+	"$RUSTHELLO" >$ROUT 2>$RERR
+	same_file "the two hello worlds agree on stdout" "$OUT" "$ROUT"
+	same_file "and on stderr" "$ERR" "$RERR"
+
+	# The usage helpers: which stream the block goes to and what the status
+	# is, neither of which a library test can see.
+	"$DATE" -h >$OUT 2>$ERR
+	want_eq "date -h status" "$?" "0"
+	want_eq "date -h to stdout" "$(head -1 $OUT)" "Usage:"
+	want_eq "date -h says nothing on stderr" "$(cat $ERR)" ""
+	"$RUSTDATE" -h >$ROUT 2>$RERR
+	same_file "the two usage blocks are the same bytes" "$OUT" "$ROUT"
+
+	"$DATE" -x >$OUT 2>$ERR
+	want_eq "date -x status" "$?" "2"
+	want_eq "date -x to stderr" "$(head -1 $ERR)" "Usage:"
+	want_eq "date -x says nothing on stdout" "$(cat $OUT)" ""
+	"$DATE" a b >$OUT 2>$ERR
+	want_eq "date with two operands" "$?" "2"
+
+	# To the minute, against the host's read either side of it, so a second
+	# boundary cannot make it flake.
+	before=$(date -u '+%a %b %d %H:%M')
+	got=$("$DATE" -u 2>$ERR)
+	after=$(date -u '+%a %b %d %H:%M')
+	case "$got" in
+	"$before"* | "$after"*) echo "ok: date -u agrees with the host's" ;;
+	*) echo "MISMATCH date -u: got [$got] want [$before]"; fail=1 ;;
+	esac
+	want_eq "date -u zone" "$(echo "$got" | awk '{print $(NF-1)}')" "+0000"
+	want_eq "date -u year" "${got##* }" "$(date -u +%Y)"
+
+	# A program whose stdout cannot be re-opened fails the same way in both
+	# bindings, message and status alike. That is the console a VM is run on,
+	# and it is the sharpest form of the claim: the two agree when they work
+	# and when they do not.
+	"$HELLO" 2>$ERR >/dev/console
+	cst=$?
+	"$RUSTHELLO" 2>$RERR >/dev/console
+	rst=$?
+	want_eq "both bindings refuse an unadoptable stdout" "$cst" "$rst"
 fi
 
 fence "rmmod"

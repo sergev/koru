@@ -5,7 +5,7 @@ code in this repository.
 
 ## State of the repository
 
-**T0–T43 are done**, and Phases 9 and 10 with them. The kernel surface was
+**T0–T48 are done**, and Phases 9, 10 and 11 with them. The kernel surface was
 complete at T29 and grew once more at T30, for `OPEN`'s creation flags. Braam's
 hello world runs through koru, on a window koru owns; the ring can wait for a
 descriptor; and T15's demo now runs from **two** bindings that share no code,
@@ -332,6 +332,30 @@ reached at all (0 of 500), and **an argument list is not a sequence point** —
 `submit(sqe::read(.., slot.index(), ..), std::move(slot))` reads a moved-from
 slot in unspecified order and works only by luck.
 
+T44–T48 are Phase 11, Braam's whole userspace API in C++ over T39–T43's
+core: the vocabulary and the ambient ring, the operation layer, the buffered
+stream and its iterators, the program shell, and the screen client.
+`cpp/include/koru/braam.hpp` hoists every name to global scope, and `hello`,
+`date` and `less` are Braam sources with that include line as their only
+edit — each compared against its Rust twin, and `less` **in pixels**: two
+bindings
+that share no code paint a byte-identical window through one daemon.
+
+Five things Phase 11 taught. **`CO_TRY(co_await f())` is an internal compiler
+error in GCC** — a statement expression holding both a `co_await` and a
+`co_return`, at every optimization level — so libkoru's own sources use koru's
+`CO_LET`/`CO_OK`, which are statements, and only a Braam source that wants a
+value out of an await needs clang; `CO_TRY_VOID` is unaffected. **`-Wpedantic`
+had to be split in two**, because the dialect is deliberately `gnu++20` now.
+**`stdin`, `stdout` and `stderr` are libc macros**, so the handles are
+`in_fd`/`out_fd`/`err_fd` and the streams `File::in()`/`out()`/`err()`, and
+`ops.hpp` takes six more macro names back with a static assert and an `#undef`.
+**An `ENTER` count cannot see what a C++ fast path buys** — the slow half
+answers out of the buffer too — so `detail::frames_allocated` counts coroutine
+frames instead, and that is what `put_fast` moves. And **the window snapshot
+has to be copied while the pager is still alive**, or the daemon repaints the
+scrolling screen on its way out and two blank windows compare equal.
+
 T14 made the two userspace ABI mirrors a diff rather than a promise.
 `cpp/include/koru_abi.h` and `cpp/include/koru_errno.h` are the C mirrors,
 shared with `test/`, and an `abi_dump` on each side emits a canonical record
@@ -362,8 +386,14 @@ its fastest gate: no VM, no device, no module.
   in `rust/runtime/examples/` are programs, so the guest runs them.
 - `cpp/` — the C++ binding. `include/koru_abi.h` and `include/koru_errno.h`
   are the C mirrors, shared with `test/`, and `tools/abi_dump.cpp` dumps them;
-  `include/koru/` and `src/` are `libkoru` itself, and `tests/` is its device
-  suite. Built by the top-level `CMakeLists.txt`.
+  `include/koru/` and `src/` are `libkoru` itself — the synchronous core, the
+  reactor and the executor, and from T44 Braam's whole surface, with
+  `braam.hpp` hoisting it to global scope and `src/main.cpp` in a library of
+  its own, `koru_start`. `tests/` is the suite: `unit.cpp`, `task.cpp`,
+  `vocab.cpp`, `shell.cpp` and `ui.cpp` need no device and run under `ctest`;
+  `kernel.cpp`, `reactor.cpp`, `drop.cpp`, `ops.cpp`, `file.cpp` and
+  `screen.cpp` need `/dev/koru` and run in the VM. `examples/` holds the demo
+  and the three Braam programs. Built by the top-level `CMakeLists.txt`.
 - `screen/` — the koru-screen daemon. `ks_abi.h` is the canonical screen
   protocol, mirrored by `rust/runtime/src/ks_abi.rs`; `screen.cpp`, `ansi.cpp`
   and `text.cpp` are the terminal model, Braam's ported; `render.cpp` and
@@ -435,9 +465,18 @@ A config change means rebuilding the kernel and then the module against it.
 Verified toolchain: rustc and cargo 1.98.1 from **rustup**, with the `rust-src`
 component, plus bindgen 0.72.1, clang and lld 21 from Debian testing, and
 `make LLVM=1`. `make LLVM=1 rustavailable` passes. Floors from the design were
-rustc 1.85.0 and bindgen 0.71.1. For C++: GCC ≥ 11 or Clang ≥ 14, `-std=c++20`,
-built with `-fsanitize=address,undefined` **and with optimization on** — GCC
-performs a coroutine's symmetric transfer only at -O2, which T41 measured.
+rustc 1.85.0 and bindgen 0.71.1. For C++: GCC ≥ 11 or Clang ≥ 14,
+**`-std=gnu++20`** since T44, built with `-fsanitize=address,undefined` **and
+with optimization on** — GCC performs a coroutine's symmetric transfer only at
+-O2, which T41 measured.
+
+**A Braam source that writes `CO_TRY(co_await f())` needs clang.** GCC cannot
+compile a statement expression holding both a `co_await` and a `co_return`; it
+is an internal compiler error at every optimization level, and doc/Notes.md has
+the fourteen-line reproducer. `CO_TRY_VOID` is a `do { } while (0)` and is
+unaffected, and libkoru's own sources use koru's `CO_LET`/`CO_OK` instead, so
+the library and both its suites still build with either compiler — which is
+what keeps T41's measurement of GCC's codegen re-runnable.
 
 T13 moved the whole project off Debian's rustc 1.95.0 onto rustup's 1.98.1;
 `~/.cargo/env` puts it ahead of `/usr/bin`. Kernel Rust needs `rust-src`, so
@@ -449,7 +488,7 @@ survived**.
 
 ## Commands
 
-These work today (T0 through T31):
+These work today (T0 through T48):
 
 ```sh
 KDIR=../kernel-dev/linux-source-7.1
@@ -492,6 +531,21 @@ KORU_ITERS=100000 TIMEOUT=2400 scripts/run-rust.sh drop_safety
 cmake -B build && cmake --build build
 scripts/abi.sh
 ctest --test-dir build          # the same comparison, as a registered test
+
+# The C++ binding. `ctest` above also runs the host-only half: the slab, the
+# op state machine, `task<T>`'s depth case, the vocabulary, the option parser,
+# the calendar, the grid and the text buffer. The device suite needs the
+# module, so it runs in a VM.
+scripts/run-cpp.sh              # the device suite, the demo, hello and date
+scripts/run-cpp.sh ops_ file_   # only cases whose name matches
+
+# The screen, host-side: the terminal model, the protocol server and the two
+# fuzz oracles, under ASan and UBSan. No VM, no device, no display server.
+scripts/screen.sh
+
+# The daemon end to end, in a VM: auto-spawn, the lifecycle, the byte channel,
+# and Braam's `less` in both bindings painting a byte-identical window.
+scripts/run-e2e.sh
 ```
 
 `test/koru_check` is the entire test suite for the module: one binary, one
