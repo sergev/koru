@@ -5,18 +5,19 @@ code in this repository.
 
 ## State of the repository
 
-**T0–T38b are done**, and Phase 9 with them. The kernel surface was complete
-at T29 and grew once more at T30, for `OPEN`'s creation flags. Braam's hello
-world runs through koru, on a window koru owns, and the ring can wait for a
-descriptor. The module registers `/dev/koru`, configures a ring with `SETUP`,
-and submits `NOP`, `DELAY_NS`, `CHECKSUM`, `OPEN`, `READ`, `WRITE`, `CLOSE`,
-`CANCEL`, `ADOPT_FD`, `POLL_ADD`, `STAT`, `TRUNCATE`, `UTIMES`, `READLINK`,
-`STATX_AT`, `MKDIR`, `SYMLINK`, `UNLINK`, `RMDIR`, `RENAME` and `READDIR`
-through `ENTER`, which blocks for completions. The arena is mmap'd, with slot
-exclusivity enforced by the kernel. Open files live in a generational handle
-table. A queued op can be genuinely dequeued, and `close(fd)` cancels whatever
-is still queued. The whole validation surface has been fuzzed under KASAN,
-lockdep and kmemleak.
+**T0–T43 are done**, and Phases 9 and 10 with them. The kernel surface was
+complete at T29 and grew once more at T30, for `OPEN`'s creation flags. Braam's
+hello world runs through koru, on a window koru owns; the ring can wait for a
+descriptor; and T15's demo now runs from **two** bindings that share no code,
+printing bytes a `cmp` cannot tell apart. The module registers `/dev/koru`,
+configures a ring with `SETUP`, and submits `NOP`, `DELAY_NS`, `CHECKSUM`,
+`OPEN`, `READ`, `WRITE`, `CLOSE`, `CANCEL`, `ADOPT_FD`, `POLL_ADD`, `STAT`,
+`TRUNCATE`, `UTIMES`, `READLINK`, `STATX_AT`, `MKDIR`, `SYMLINK`, `UNLINK`,
+`RMDIR`, `RENAME` and `READDIR` through `ENTER`, which blocks for completions.
+The arena is mmap'd, with slot exclusivity enforced by the kernel. Open files
+live in a generational handle table. A queued op can be genuinely dequeued, and
+`close(fd)` cancels whatever is still queued. The whole validation surface has
+been fuzzed under KASAN, lockdep and kmemleak.
 
 T13 added `rust/sys`: the ABI mirror, the ioctl wrappers, `Ring`, `Arena`,
 `BufPool` and the errno table, with the T4–T11 matrix re-expressed as Rust
