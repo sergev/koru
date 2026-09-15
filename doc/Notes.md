@@ -85,8 +85,34 @@ not composition of safe abstractions. Budget accordingly.
   inserted with `vm_insert_page`.
 
 Since `ENTER` is the only entry point, a shared SQ would save zero syscalls. A
-shared CQ would save syscalls on reaping — a real but deferrable optimization
-(T50).
+shared CQ would save syscalls on reaping, and that was carried as a deferred
+task until Phase 12 closed. It is **retired now, unbuilt**, for four reasons.
+
+The win is smaller than it looks. One `ENTER` per pump carries the batch and
+the reap together, so the call a shared CQ would remove is the one the executor
+makes to submit and park anyway. Both bindings are built that way and both
+measure it — T31 found the Rust executor spending two `ENTER`s where the ABI
+provides one, and `Reactor::enters()` asserts the count on the C++ side.
+Nothing in this repo has yet shown an `ENTER` that exists only to reap, which
+is the measurement that would justify the work.
+
+The cost grew while the benefit did not. The done test was the whole kernel
+suite in both modes, fuzz included, in both bindings. At T12 that was twelve
+tasks; at T49b it is twenty-one opcodes, the handle table, slot exclusivity,
+the cancel refcount rule and the heavy-phase leak window — all of it doubled.
+
+It gives back the property the ioctl was chosen for. `copy_from_user` hands the
+kernel a private snapshot by construction, which is what eliminates every
+shared-memory ordering hazard and every lying head/tail attack at once. A
+shared ring reintroduces all of them in the one place where being wrong is a
+security bug rather than a slow path.
+
+And it was never koru's task to begin with. Research finding 2 is a missing
+*kernel* capability — no legitimate stable kernel virtual address into a
+`Page`, no way to place an `Atomic<u32>` over a shared word — so the first
+step is patching `rust/kernel/page.rs` and arguing it upstream. That is a
+different project. If it ever lands, re-open this with a number, not an
+argument.
 
 ### The central invariant
 

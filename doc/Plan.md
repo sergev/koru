@@ -117,19 +117,6 @@ the one most likely to have wanted it — uses only that.
 
 ## Phase 13 — only if justified
 
-### T50 [R] — shared mmap'd SQ/CQ
-
-`Atomic<u32>` indices behind a `features` bit, keeping the ioctl path as a
-fallback. **Requires first solving research finding 2** in [Notes.md](Notes.md):
-a legitimate stable kernel virtual address into a `Page`, which may mean
-patching `rust/kernel/page.rs`. Re-examine whether it is worth it at all — with
-one `ENTER` per submit, the only win is syscall-free CQE reading, and Phases 5
-and 7 widened the surface this must prove in both modes without widening that
-benefit.
-
-Done test: the whole T4–T12 suite plus every kernel task above passes in both
-modes, fuzz included, in **both** bindings.
-
 ### T51 [R] — eventfd and tokio bridge
 
 eventfd registration plus a tokio `AsyncFd` bridge. Only if tokio integration

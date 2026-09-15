@@ -858,8 +858,10 @@ and citations.
   (`read_raw`, `write_raw`) are `memcpy` with a documented "no concurrent
   access" precondition that a ring shared with untrusted userspace violates by
   definition, and there is no way to place an `Atomic<u32>` over a shared word.
-  This is why the control plane is an ioctl. Revisiting it is T50, and it
-  requires solving that problem first.
+  This is why the control plane is an ioctl. The task to revisit it was retired
+  unbuilt: the only win is syscall-free reaping, which one `ENTER` per pump
+  already makes marginal, and the first step is a kernel patch rather than koru
+  work. doc/Notes.md has the four reasons.
 - **Do not defer `OPEN` to a workqueue.** In a kworker, `current_cred()` is
   `&init_cred` and `current->fs` is the init root, so `filp_open` would resolve
   and permission-check as root in the initial namespaces — a privilege
