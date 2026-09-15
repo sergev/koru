@@ -275,6 +275,40 @@ does: the suite's own "OK: 0 failure(s)" line, a floor on the number of cases
 an unfiltered run reached (a filter matching nothing runs none and exits 0), a
 `KORU-CPP-SKIP` marker, and then rmmod, kmemleak, taint and the dmesg scan.
 
+## The portability proof
+
+`scripts/run-portability.sh` boots the VM and runs `scripts/portability.sh` in
+it: T49's twenty-one Braam programs from `cpp/cmd/`, each against its coreutils
+equivalent on a fixture tree, and five of them against their idiomatic-Rust
+twins. It builds its own sanitized directory, `build-port/`, because the done
+test is that the programs are correct **and** clean under ASan and UBSan.
+
+```sh
+make -C ../kernel-dev/linux-source-7.1 M=$PWD/kernel LLVM=1
+(cd rust && cargo build --examples)
+scripts/run-portability.sh
+scripts/run-portability.sh cut uniq   # only cases whose name matches
+```
+
+The verdict is `KORU-PORT-PASS`. Every case runs the two programs in **two
+copies of one fixture tree** and compares four things: stdout byte for byte,
+the exit status, the tree before and after — the *delta*, so one real
+difference does not fail every case after it — and stderr as present or absent.
+The wording of a diagnostic is Braam's `who: what: why` and not GNU's, which is
+a difference in the program rather than in the substrate.
+
+Six of Braam's programs are deliberately not GNU's: its `wc` pads to seven
+columns and counts runes rather than bytes, its `tail` terminates every line,
+its `cmp -b` says `char`, its `rm` takes an empty directory without `-r`, and
+its `grep` is `grep -F -h`. Four are handled by a normaliser named at the case
+and three are asserted outright in the `differences` section. doc/Notes.md says
+why each is Braam's own and not koru's.
+
+Like the other runners it does not build the module, and it asks `cmd_cat`
+whether ASan is really linked into it rather than trusting the CMake cache.
+`FLOOR` is the number of cases an unfiltered run must reach, for the reason
+`WANT_PASSED` exists above; raise it when a case is added.
+
 ## The ABI conformance diff
 
 `scripts/abi.sh` compares two pairs of mirrors, C and Rust, by diffing a

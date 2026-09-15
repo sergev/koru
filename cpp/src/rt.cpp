@@ -183,6 +183,11 @@ Handle err_fd()
     return amb().std_[2];
 }
 
+Handle std_fd(Handle h)
+{
+    return h < 3 ? amb().std_[h] : h;
+}
+
 bool is_screen(Handle h)
 {
     return h != 0 && amb().screen == h;

@@ -110,7 +110,7 @@ bool take_frame(String &buf, Frame &out, String &why)
         return false;
     out.op  = u16(u32(p[4]) | (u32(p[5]) << 8));
     out.seq = u32(p[8]) | (u32(p[9]) << 8) | (u32(p[10]) << 16) | (u32(p[11]) << 24);
-    out.body.assign(buf, 16, len - 16);
+    out.body.assign(buf.data() + 16, len - 16);
     buf.erase(0, len);
     return true;
 }

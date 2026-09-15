@@ -4403,10 +4403,14 @@ answer to the same question.
 
 One header, every name at global scope, nothing defined twice: `Task` is
 `koru::task`, `Result` is `koru::result`, `Error` is the one libkoru has had
-since T39. A Braam source compiles with that include line as its only edit,
-which is what T49 will measure and what `cpp/examples/hello.cpp`,
-`date.cpp` and `less.cpp` already demonstrate — none of them writes `koru::`,
+since T39. A Braam source compiles with that include line as its only edit, and
+none of `cpp/examples/hello.cpp`, `date.cpp` or `less.cpp` writes `koru::`,
 `std::`, or any other header.
+
+**Only `hello.cpp` is Braam's own source.** The other two are koru's programs
+in Braam's style, and this paragraph used to name all three as evidence for a
+claim nothing checked. T49 is what measured it, and what the twenty-one
+programs in `cpp/cmd/` now check on every run.
 
 ### `CO_TRY(co_await f())` is an internal compiler error in GCC
 
@@ -4623,6 +4627,276 @@ says the comparison is not vacuous, and it is what caught this.
   hyphen). The two windows differ and `cmp` says so, which is what makes the
   byte-identical comparison mean something.
 
+## The portability proof
+
+T49 is the deliverable the whole Braam effort was for: real programs from
+Braam's `src/cmd`, compiled against koru with the include block as the only
+edit, and each one's output compared against its coreutils equivalent on a
+fixture tree.
+
+Twenty-one of the twenty-two text programs the plan named do compile that way
+and do agree with coreutils. They live in `cpp/cmd/`, they are Braam's sources
+with their `#include "..."` block replaced by one `#include <koru/braam.hpp>`,
+and `scripts/run-portability.sh` is the gate: 118 cases in a VM, under ASan and
+UBSan, comparing stdout byte for byte, the exit status, and what the fixture
+tree looks like afterwards.
+
+The twenty-second is `tee`, and the reason is a scope boundary this plan
+declared from the start rather than anything koru could not carry. See below.
+
+### The claim was not true before this task
+
+T44 said "a Braam source compiles with that include line as its only edit" and
+pointed at `cpp/examples/hello.cpp`, `date.cpp` and `less.cpp` as the evidence.
+Two of those three are rewrites. `hello.cpp` is genuinely Braam's; `date.cpp`
+and `less.cpp` are koru's own programs in Braam's style, and a diff against the
+originals is most of the file. Nothing checked the claim, so nothing caught it.
+
+What was actually missing was not small. Braam's programs reach for its whole
+freestanding standard library without thinking about it — `kernel/fmt.h`'s
+`Buf<N>`, `kernel/text.h`'s character classes and scanners, `kernel/vec.h`,
+`fs/path.h`, `proc/size.h`, `math/ftoa.h` — and for the `SYS_*` constants its
+kernel publishes. The surface T44–T48 built was `proc/io.h`, `proc/file.h`,
+`proc/opt.h`, `proc/usage.h`, `proc/time.h` and `ui/`, which is the half a
+manual describes and not the half a program uses.
+
+### What the surface was missing
+
+Seven headers arrived with this task, none of which touches the ring:
+
+- `koru/fmt.hpp` — `Buf<N>`, the fixed-capacity builder fourteen of the
+  twenty-two use.
+- `koru/text.hpp` and `cpp/src/text.cpp` — `is_space`, `is_digit`,
+  `rune_safe`, `rune_lower`, `rune_upper`, `parse_u32`, the `Str` scanners, and
+  Braam's `(char32_t, char *)` spellings of `utf8_encode` and `utf8_decode`
+  beside `filebuf.hpp`'s span-measuring pair.
+- `koru/path.hpp` — `path_resolve`, `path_dirname`, `path_basename`,
+  `path_join`, `path_under`. Text, not paths: koru resolves in the kernel, so
+  none of it is what `open_at` calls.
+- `koru/size.hpp` — `truncate(1)`'s SIZE operand, `parse_size` and
+  `size_apply`.
+- `koru/ftoa.hpp` — **the one place this binding stands on libc rather than
+  porting.** Braam carries musl's `strtod` and printf engines because it has no
+  libc at all; koru has one, and a second copy of `%g` is a worse thing to own
+  than a wrapper over the one already linked. `seq` is what needs it.
+- `koru/alloc.hpp` — `heap_new` and `heap_delete` over `new (std::nothrow)`.
+- `koru/sysabi.hpp` — the `SYS_*` constants, aliases for the libkoru names that
+  already carry the values, with one exception below.
+
+And three vocabulary types that had to change shape rather than be added:
+`Str`, `String` and `Vec<T>`.
+
+### `Str`, `String` and `Vec` derive rather than alias
+
+`Str` was `std::string_view` and `String` was `std::string`. Braam's have
+members C++'s do not: `Str::split`, which is how every tokenising loop in
+`src/cmd` is written, `Str::contains`, which is C++23, and `String`'s fallible
+`push`/`append`/`assign` and its `str()`, `truncate()` and one-byte-default
+`erase()`. So each now **derives** from the standard type it used to alias.
+`Vec<T>` is new and derives from `std::vector<T>`; nothing in libkoru's own
+surface returns one, so it is the programs'.
+
+Deriving keeps every `std::string_view` and `std::string` the standard library
+hands back convertible in both directions, which an aliasing wrapper would not.
+It costs four things, and all four were found by the compiler or by the suite:
+
+- **A hidden overload is not an ambiguous one.** `bool append(Str)` hides every
+  `std::string::append`, so `out.append(p, n)` inside libkoru stopped
+  compiling until a two-argument form was added beside it. The same for
+  `assign`. This is the good case: the build says so.
+- **`erase`'s default changed from "the rest" to "one byte"**, because Braam's
+  does. `TextBuf::split` called `lines_[row].erase(k)` meaning "the rest", and
+  one `ui` case caught it. It is now `truncate(k)`, which says what it means.
+- **Adding `operator==(const String &, Str)` makes `String == String`
+  ambiguous**, because both sides then have a user-defined conversion into the
+  other's parameter. `std::string == std::string_view` already works; the
+  friend is not needed and is gone.
+- **`std::filesystem::path` will not take a derived `std::string`.** Its
+  `Source` constructor is constrained to the exact type. Fourteen call sites in
+  the two test files pass `.c_str()` now. Nothing in the library was affected.
+
+And one thing that could not be had. `move(x)` unqualified, which five of the
+programs write, resolves to `std::move` through the using-declaration in
+`braam.hpp`, and clang warns about exactly that under
+`-Wunqualified-std-cast-call`. Defining koru's own `move` beside it does not
+help: `String` derives from `std::string`, so `std` is an associated namespace
+and ADL finds `std::move` too — the call becomes ambiguous rather than
+unqualified. The programs are built with that one warning off, and
+CMakeLists.txt says so.
+
+### `SYS_STDIN` is a constant and a koru handle is not
+
+Braam's three standard descriptors are 0, 1 and 2, and a program passes them as
+constants: `write_all(SYS_STDOUT, s)`. koru's handles are `(index, generation)`
+pairs adopted at startup and known only at run time. The surface had `in_fd()`,
+`out_fd()` and `err_fd()` for that reason.
+
+So 0, 1 and 2 stay the constants they are, and every call that takes a `Handle`
+maps them through `std_fd`. **A real koru handle has a generation of at least 1
+in its high half and so is never below `1 << 16`**, which is what makes the
+mapping unambiguous and idempotent — `write_all` maps, and so does
+`detail::write_bytes` underneath it, and mapping twice is mapping once. It is
+applied at the public entry of every operation and in `File::of` and `Input`,
+so what gets *stored* is the real handle and the offset bookkeeping in `rt.cpp`
+still keys on one thing.
+
+### What the programs found in libkoru
+
+Five changes, each forced by a real program rather than by a test:
+
+- **`OptParse` held its `Args` by reference, and three programs dangle it.**
+  `OptParse p(Args{ args.v.subspan(first - 1) }, ...)` is how `head`, `tail`
+  and `grep` hand on the rest of a command line, and the temporary dies at the
+  end of the full expression. ASan called it a stack-use-after-scope on the
+  first run of `head -n 3`. It holds the `Args` by value now, as Braam's does;
+  an `Args` is a counted handle, so that keeps the words alive as well, which
+  is more than Braam's span promises.
+- **`Args` had no `v`.** Braam's is a `Span<const Str>` in a public member, and
+  `Args{ args.v.subspan(n) }` is the idiom. `Args` is now a wrapper around one
+  public `Words v`, which is a counted view of the shared vector with
+  `subspan`.
+- **`Opt::name` is a byte again.** T32 made it a rune, because argv is
+  attacker-supplied and Rust panics on a slice through a codepoint. Five
+  programs write `Str(&o.name, 1)`, which needs a byte. The parser still
+  *advances* by whole runes — that was the safety point — and reports the lead
+  byte in `Opt::name` and the whole rune in `OptError::name`. The Rust binding
+  keeps `char`, which is Rust's natural spelling of the same thing.
+- **`open_at` and `open_read` return `Result<i32>`.** Braam's `io.h` spells a
+  descriptor `i32` there and `u32` everywhere else; four programs declare the
+  `i32`. `result<T, E>` gained a converting constructor for that, and for
+  `Result<bool> r = p.next(o)` where koru's `next` answers
+  `result<bool, OptError>`.
+- **`File::err()` collided.** koru's was the static `stderr` stream; Braam's is
+  the instance's sticky error, which `cat` reads. The streams are
+  `File::stdin()`, `File::stdout()` and `File::stderr()` now — `stdin` and its
+  kin are *self-expanding* macros in glibc, so a member may carry one after
+  all, which T44 assumed otherwise. `File::in()` and `File::out()` stay; there
+  is no `File::err()`.
+
+`FileKind` also stopped being an `enum class`: Braam's `kind` is a bare `u32`
+and `cmp -h` stores one in one. It is a struct with a nested enum now, so the
+three names still have to be qualified and the value still converts. And two
+declarations of `io.h` that had never been transcribed are in: `next_line` and
+`next_field`, which cut up what a `/proc` file hands back without allocating,
+and `list_dir` answers `Vec<DirEntry>` rather than `std::vector<DirEntry>`.
+`cpp/tests/ops.cpp`'s prototype-drift case now names each of these as Braam
+spells it, which is the whole point of that case and what it was not doing.
+
+### `tee` is the one that does not port, and the reason was declared
+
+`tee -i` keeps going when `^C` arrives, which is `sig_catch(SIG_INT)` and
+`sig_take`. Processes, pipes, signals and job control are out of scope for this
+whole effort, and the plan said so before the first line of the surface was
+written.
+
+It could have been faked. `sig_catch` over POSIX `sigaction` is four lines, and
+`ENTER` really does come back `-EINTR` when a signal lands. But the reactor
+treats `-EINTR` as a protocol failure, puts the batch back and carries on, so a
+parked `read_chunk` would never answer `Intr` and `tee`'s `-i` branch would be
+dead code — while the installed handler would stop `^C` killing the program at
+all. A stub that makes a program compile and then behave worse than not
+compiling is not a port. Delivering `Intr` to a parked op means cancelling it
+in the reactor, which is a kernel-adjacent change and not this task's.
+
+`tee` would need a second edit anyway: `Str(&o.name, 1)` was the reason
+`Opt::name` went back to a byte, and that fix is in — so signals are the whole
+of what is left.
+
+### Braam's programs are not GNU's, in six places
+
+The done test compares against coreutils, so every place the two differ is a
+case that had to be written down rather than normalised away in silence. The
+comparison is stdout byte for byte, the exit status, and the tree afterwards;
+**stderr is compared only as present or absent**, because a diagnostic here is
+Braam's `who: what: why` and not GNU's wording, and that is a difference in the
+program and not in the substrate.
+
+Six differences. Four are normalised in the harness, each with the normaliser
+named at the case; two are asserted outright, because there is nothing to
+normalise:
+
+- **`wc` pads its counts to seven columns**, as BSD's does; GNU's width is the
+  widest count in the run. Both sides go through a blank-squeezing filter.
+  `uniq -c`'s four-column count and `cmp -l`'s offsets are the same difference.
+- **GNU's `wc -m` counts bytes in the POSIX locale.** Braam's counts runes
+  whatever the environment says, so the reference is asked for `C.UTF-8`.
+- **Braam's `tail` terminates every line it prints**, so a final fragment with
+  no newline gains one where GNU's leaves it alone. Both sides go through
+  `awk 1`, and the `differences` section asserts the extra newline directly.
+- **Braam's `cmp -b` calls the offset a `char`** where GNU calls it a `byte`.
+  One word is substituted; the rest of the line is compared as it stands.
+- **Braam's `rm` takes an empty directory without `-r`**, where GNU's refuses.
+  That is `remove_path(p, false)`, which is `rmdir` for a directory on both
+  sides. Asserted, not normalised.
+- **Braam's `grep` never prefixes the file name**, which is GNU's `-h`, and it
+  matches fixed text rather than a regular expression, which is GNU's `-F`.
+  The reference is `grep -F -h`.
+
+### The Rust half
+
+`echo`, `basename`, `cat`, `grep` and `uniq` are written again as idiomatic
+Rust in `rust/runtime/examples/`, against the same function names, and the
+suite runs each beside Braam's own C++ source and compares the bytes.
+Twenty-four cases, including the error paths: a missing file, a bad option, a
+pattern that matches nothing.
+
+That is the language-neutrality claim made on a real surface rather than on one
+demo. The two sides share no code; one of them is a program somebody else
+wrote.
+
+### `less` and `edit` are not done
+
+The plan's last paragraph asks for the full-screen half too, and this task does
+not deliver it. `cpp/examples/less.cpp` is still koru's rewrite, not Braam's
+source.
+
+What stands in the way is one design decision and its consequences. **A koru
+`Pane` does not hold its grid** — T37's finding, taken from the Rust binding,
+where lending one object twice is not allowed — so every write takes the grid
+as an argument: `bar.write(screen.grid(), line)` where Braam writes
+`bar.write(line)`. Braam's `less` and `edit` are written the second way, and so
+is `TextView::paint(Pane &, const TextBuf &)`.
+
+Four more follow from it: `ProcScreen` is default-constructed and claims
+lazily where `Screen::connect()` is an async factory; `tty_of(SYS_STDOUT)` is
+how a pager decides whether to page at all, and koru has only
+`detail::is_console`; `TextBuf`'s mutators answer `Result<void>` on Braam and
+`void` here; and the palette is `COLOR_*` rather than `KS_COLOR_*`.
+
+None of that is a limitation of the substrate — T48 already paints the same
+window from both bindings — and the additive shape is known: a second pane type
+that carries `Grid &`, a `ProcScreen` over `Screen`, and `tty_of` over
+`is_console`. It is a task of its own and doc/Plan.md now carries it.
+
+### What was shown to fail
+
+- **`OptParse` holding its `Args` by reference.** `head -n 3` is a
+  stack-use-after-scope under ASan and a segfault without it. This is the
+  finding, not a perturbation: it is what the first full run reported.
+- **The fixture trees compared whole rather than by delta.** One real
+  difference — Braam's `rm` taking a directory — failed every one of the
+  thirty-odd cases after it, because the two trees never converged again. The
+  comparison is `diff before after` on each side now, so a case is judged on
+  the change it made.
+- **`String::erase`'s one-byte default.** Deleting the `truncate` fix in
+  `TextBuf::split` fails `textbuf_a_split_and_a_join_are_inverses` and nothing
+  else.
+- **The sanitizers, taken away.** `run-portability.sh` asks `cmd_cat` whether
+  ASan is really linked into it rather than asking the CMake cache, and that
+  guard fired on its first run: a `build-port` configured by hand without the
+  compiler variables reconfigured itself and dropped them.
+- **A filter that matches nothing.** `FLOOR` is 118 and a filtered run reports
+  `TOO FEW CASES RAN`, for the reason `WANT_PASSED` exists in the Rust runner.
+- **`std_fd` made the identity.** `wc`, `uniq` and the Rust `uniq` fail, and
+  nothing else does: those are what write through `write_all(SYS_STDOUT, ..)`,
+  while `cat` and `echo` go through `File::stdout()`, which holds the real
+  handle already. That perturbation is also what found the `differences`
+  section ignoring the filter and running its `rm` case in every filtered run.
+- **The Rust `uniq`'s count column narrowed by one.** Exactly
+  `twin-uniq-count` fails. `uniq-count` against coreutils still passes, because
+  the blank-squeezing normaliser cannot see a width — which is the point of
+  having both comparisons.
+
 ## Known gaps, accepted for the PoC
 
 - **`rmmod` remnant.** Both `module_put` calls run from module text, so a
@@ -4796,13 +5070,20 @@ arrive with their tasks.
 - `cpp/include/koru/opt.hpp`, `usage.hpp`, `time.hpp` — the program shell.
 - `cpp/include/koru/grid.hpp`, `textbuf.hpp`, `screen.hpp` — the screen
   client's pure half and the client itself.
+- `cpp/include/koru/fmt.hpp`, `text.hpp`, `path.hpp`, `size.hpp`, `ftoa.hpp`,
+  `alloc.hpp`, `sysabi.hpp` — Braam's freestanding standard library, the half
+  a program uses without thinking about it. T49 is what needed them.
 - `cpp/include/koru/braam.hpp` — all of it at global scope, and the only
   include a Braam source needs.
 - `cpp/src/main.cpp` — the `main` a koru program does not write. Its own
-  library, `koru_start`.
+  library, `koru_start`, with `proc_main.cpp` beside it as `koru_start_proc`
+  for a source whose entry is Braam's.
 - `cpp/examples/read_file.cpp`, `hello.cpp`, `date.cpp`, `less.cpp` — the
-  C++20 demo and the three Braam programs, each with a Rust twin the gates
-  compare it against.
+  C++20 demo and three programs in Braam's style, each with a Rust twin the
+  gates compare it against. Only `hello.cpp` is Braam's own source.
+- `cpp/cmd/` — twenty-one of Braam's `src/cmd` sources, each with its include
+  block replaced and **nothing else changed**. A diff against Braam is what
+  they are for, so they are not to be tidied.
 
 `test/koru_check` stays the kernel's own check and is not superseded by the
 Rust suite: it owns the fuzz, the two `rmmod` races and the heavy-phase leak

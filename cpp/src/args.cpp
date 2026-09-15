@@ -12,13 +12,4 @@ Args Args::from_env(int argc, char **argv)
     return Args(std::move(v));
 }
 
-Args Args::skip(size_t n) const
-{
-    Args out;
-    out.v_     = v_;
-    size_t at  = start_ + n;
-    out.start_ = at < start_ || at > v_->size() ? v_->size() : at; // saturating
-    return out;
-}
-
 } // namespace koru

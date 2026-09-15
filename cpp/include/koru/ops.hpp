@@ -86,7 +86,19 @@ inline constexpr u32 READ_MAX = 65536 - 4;
 /// What a listing says about an entry, never resolving a link. koru reports
 /// more kinds than Braam's three, and everything that is neither a directory
 /// nor a symlink reports as a file.
-enum class FileKind { File, Dir, Link };
+///
+/// Braam's is a bare `u32` and a program stores one in one — `cmp -h` does —
+/// so this converts to `u32` rather than being an `enum class`. The three
+/// names still have to be qualified, which is what an `enum class` was for.
+struct FileKind {
+    enum Named : u32 { File = 0, Dir = 1, Link = 2 };
+
+    u32 v = File;
+
+    constexpr FileKind() = default;
+    constexpr FileKind(u32 x) : v(x) {}
+    constexpr operator u32() const { return v; }
+};
 
 /// `mtime` is milliseconds since the epoch, 0 where none was reported.
 struct FileInfo {
@@ -139,13 +151,18 @@ task<result<String>> read_file(Str path);
 /// A diagnostic on stderr: "who: what: why".
 task<void> errln(Str who, Str what, Error why);
 
+/// Cutting up what a `/proc` file hands back. Both advance `rest` past what
+/// they return and neither allocates.
+bool next_line(Str &rest, Str &line);
+Str next_field(Str &line);
+
 // ---------------------------------------------------------------------------
 // Descriptors
 // ---------------------------------------------------------------------------
 
 /// Opens `path` with the `O_*` flags above.
-task<result<Handle>> open_at(Str path, u32 flags);
-task<result<Handle>> open_read(Str path);
+task<result<i32>> open_at(Str path, u32 flags);
+task<result<i32>> open_read(Str path);
 
 /// Retires the handle. Braam's returns nothing: there is no answer a program
 /// could act on, and the kernel frees the file either way.
@@ -169,7 +186,7 @@ task<result<void>> truncate_fd(Handle fd, u64 n);
 // ---------------------------------------------------------------------------
 
 /// `follow` false reports a symbolic link itself rather than its target.
-task<result<FileInfo>> stat_of(Str path, bool follow);
+task<result<FileInfo>> stat_of(Str path, bool follow = true);
 task<result<FileInfo>> stat_fd(Handle fd);
 
 // ---------------------------------------------------------------------------
@@ -177,7 +194,7 @@ task<result<FileInfo>> stat_fd(Handle fd);
 // ---------------------------------------------------------------------------
 
 /// Every entry but `.` and `..`, with a stat apiece.
-task<result<std::vector<DirEntry>>> list_dir(Str path);
+task<result<Vec<DirEntry>>> list_dir(Str path);
 
 task<result<void>> make_dir(Str path);
 

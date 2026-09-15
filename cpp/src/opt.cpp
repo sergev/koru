@@ -42,7 +42,7 @@ bool help_asked(const Args &args)
 
 result<bool, OptError> OptParse::next(Opt &out)
 {
-    const Args &args = *args_;
+    const Args &args = args_;
     if (at_ >= args.size())
         return false;
 
@@ -64,7 +64,9 @@ result<bool, OptError> OptParse::next(Opt &out)
     size_t n      = utf8_decode(rest);
     if (n == 0)
         return false;
-    u32 c = utf8_rune(rest);
+    char32_t c = char32_t(utf8_rune(rest));
+    // Braam's `Opt::name` is one byte; the whole rune goes to the error.
+    char lead = w[in_];
     in_ += n;
     bool last = in_ >= w.size();
 
@@ -81,10 +83,11 @@ result<bool, OptError> OptParse::next(Opt &out)
         } else {
             at_++;
             in_ = 0;
+            out = Opt{ lead, Str() }; // Braam reads the letter out of `out`
             return OptError{ c, Error::from_errno(Errno(ENOENT)) };
         }
         in_  = 0;
-        out  = Opt{ c, value };
+        out  = Opt{ lead, value };
         return true;
     }
 
@@ -93,9 +96,11 @@ result<bool, OptError> OptParse::next(Opt &out)
         in_ = 0;
     }
     // Advanced first, so a caller that carries on does not loop on the letter.
-    if (!holds(spec_.flags, c))
+    if (!holds(spec_.flags, c)) {
+        out = Opt{ lead, Str() };
         return OptError{ c, Error::from_errno(Errno(EINVAL)) };
-    out = Opt{ c, Str() };
+    }
+    out = Opt{ lead, Str() };
     return true;
 }
 

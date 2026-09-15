@@ -14,14 +14,21 @@
 #ifndef KORU_BRAAM_HPP
 #define KORU_BRAAM_HPP
 
+#include <koru/alloc.hpp>
 #include <koru/args.hpp>
 #include <koru/file.hpp>
+#include <koru/fmt.hpp>
+#include <koru/ftoa.hpp>
 #include <koru/iter.hpp>
 #include <koru/ops.hpp>
 #include <koru/opt.hpp>
+#include <koru/path.hpp>
 #include <koru/rt.hpp>
 #include <koru/screen.hpp>
+#include <koru/size.hpp>
+#include <koru/sysabi.hpp>
 #include <koru/task.hpp>
+#include <koru/text.hpp>
 #include <koru/textbuf.hpp>
 #include <koru/time.hpp>
 #include <koru/usage.hpp>
@@ -38,11 +45,27 @@ using Task = koru::task<T>;
 template <class T, class E = koru::Error>
 using Result = koru::result<T, E>;
 
+using koru::None;
 using koru::Option;
 using koru::Span;
 using koru::SpanMut;
 using koru::Str;
 using koru::String;
+using koru::Vec;
+
+/// Braam's `kernel/traits.h`: the slice of `<utility>` a program uses, at
+/// global scope because there is no `std::` in that tree. These are `std::`'s
+/// own — a second definition beside them would be ambiguous by ADL, because
+/// `String` derives from `std::string` and so makes `std` an associated
+/// namespace. What that costs is one clang warning; CMakeLists.txt says which.
+using std::forward;
+using std::max;
+using std::min;
+using std::move;
+using std::swap;
+
+using koru::heap_delete;
+using koru::heap_new;
 
 using koru::f64;
 using koru::i16;
@@ -53,9 +76,12 @@ using koru::u16;
 using koru::u32;
 using koru::u64;
 using koru::u8;
+using koru::isize;
+using koru::usize;
 
-using koru::Error;
+using koru::Err;
 using koru::Errno;
+using koru::Error;
 using koru::Kind;
 using koru::kind_name;
 
@@ -70,6 +96,26 @@ using koru::out_fd;
 using koru::spawn;
 
 // ------------------------------------------------------------ the operations
+
+using koru::SYS_CHUNK;
+using koru::SYS_KIND_DIR;
+using koru::SYS_KIND_FILE;
+using koru::SYS_KIND_LINK;
+using koru::SYS_O_ALL;
+using koru::SYS_O_APPEND;
+using koru::SYS_O_CREATE;
+using koru::SYS_O_EXCL;
+using koru::SYS_O_READ;
+using koru::SYS_O_TRUNC;
+using koru::SYS_O_WRITE;
+using koru::SYS_READ_MAX;
+using koru::SYS_SEEK_CUR;
+using koru::SYS_SEEK_END;
+using koru::SYS_SEEK_MAX;
+using koru::SYS_SEEK_SET;
+using koru::SYS_STDERR;
+using koru::SYS_STDIN;
+using koru::SYS_STDOUT;
 
 using koru::Clock;
 using koru::DirEntry;
@@ -100,6 +146,8 @@ using koru::cwd_get;
 using koru::cwd_set;
 using koru::dup_fd;
 using koru::errln;
+using koru::next_field;
+using koru::next_line;
 using koru::list_dir;
 using koru::make_dir;
 using koru::make_dir_all;
@@ -139,6 +187,54 @@ using koru::write_out;
 using koru::Input;
 using koru::LineReader;
 using koru::TreeWalk;
+
+// ------------------------------------------------------ the pure libraries
+//
+// `kernel/fmt.h`, `kernel/text.h`, `fs/path.h` and `proc/size.h`. Not one of
+// them touches the ring; every one of them is what a `src/cmd` source reaches
+// for without thinking about it.
+
+using koru::Buf;
+
+// `math/math.h`'s classifiers. The rest of libm is already at global scope
+// through `<cmath>`; these five are macros in C and only `std::` has them.
+using std::isfinite;
+using std::isinf;
+using std::isnan;
+using std::isnormal;
+using std::signbit;
+
+using koru::fmt_f64;
+using koru::fmt_f64_padded;
+using koru::fmt_f64_shortest;
+using koru::parse_f64;
+using koru::put_f64;
+using koru::scan_f32;
+using koru::scan_f64;
+
+using koru::is_digit;
+using koru::is_space;
+using koru::parse_u32;
+using koru::rune_lower;
+using koru::rune_safe;
+using koru::rune_upper;
+using koru::scan_i64;
+using koru::scan_space;
+using koru::scan_token;
+using koru::scan_u64;
+using koru::scan_until;
+
+using koru::path_basename;
+using koru::path_dirname;
+using koru::path_join;
+using koru::path_resolve;
+using koru::path_under;
+
+using koru::parse_size;
+using koru::SIZE_BLOCK;
+using koru::SizeMod;
+using koru::SizeSpec;
+using koru::size_apply;
 
 // ----------------------------------------------------------- the program shell
 
@@ -188,5 +284,13 @@ using koru::MOD_ALT;
 using koru::MOD_CTRL;
 using koru::MOD_META;
 using koru::MOD_SHIFT;
+
+// ----------------------------------------------------------------- the entry
+//
+// Braam's. `koru_main` is libkoru's own and carries a `Result`, because
+// `CO_TRY` must have somewhere to send an error; a `src/cmd` source writes
+// this one and links `koru_start_proc`, which adapts it.
+
+Task<i32> proc_main(Args args);
 
 #endif // KORU_BRAAM_HPP

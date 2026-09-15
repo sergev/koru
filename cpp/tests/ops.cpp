@@ -43,9 +43,9 @@ Task<void> braam_prototypes(Handle fd, Str path, u32 flags, Error why)
     // Task<Result<String>> read_some(u32 fd, u32 max);
     Result<String> c = co_await read_some(fd, u32(0));
     // Task<Result<i32>> open_at(Str path, u32 flags);
-    Result<Handle> d = co_await open_at(path, flags);
+    Result<i32> d = co_await open_at(path, flags);
     // Task<Result<i32>> open_read(Str path);
-    Result<Handle> e = co_await open_read(path);
+    Result<i32> e = co_await open_read(path);
     // Task<Result<String>> read_file(Str path);
     Result<String> f = co_await read_file(path);
     // Task<void> close_fd(u32 fd);
@@ -61,7 +61,7 @@ Task<void> braam_prototypes(Handle fd, Str path, u32 flags, Error why)
     // Task<Result<FileInfo>> stat_fd(u32 fd);
     Result<FileInfo> k = co_await stat_fd(fd);
     // Task<Result<Vec<DirEntry>>> list_dir(Str path);
-    Result<std::vector<DirEntry>> l = co_await list_dir(path);
+    Result<Vec<DirEntry>> l = co_await list_dir(path);
     // Task<Result<void>> make_dir(Str path);
     Result<void> m = co_await make_dir(path);
     // Task<Result<void>> make_dir_all(Str path);
@@ -90,10 +90,15 @@ Task<void> braam_prototypes(Handle fd, Str path, u32 flags, Error why)
     Result<Clock> y = co_await clock_now();
     // Task<void> errln(Str who, Str what, Error why);
     co_await errln(path, path, why);
+    // bool next_line(Str &rest, Str &line);
+    Str rest = path, line;
+    bool z = next_line(rest, line);
+    // Str next_field(Str &line);
+    Str field = next_field(line);
 
     (void)a, (void)b, (void)c, (void)d, (void)e, (void)f, (void)g, (void)h, (void)i;
     (void)j, (void)k, (void)l, (void)m, (void)n, (void)o, (void)p, (void)q, (void)r;
-    (void)s, (void)t, (void)u, (void)v, (void)w, (void)x, (void)y;
+    (void)s, (void)t, (void)u, (void)v, (void)w, (void)x, (void)y, (void)z, (void)field;
 }
 
 } // namespace
@@ -453,8 +458,8 @@ CASE(ops_every_stat_agrees_with_libcs)
     String link = dir + "/link";
     put(file, "0123456789");
     std::error_code ec;
-    fs::create_directory(sub, ec);
-    fs::create_symlink("file", link, ec);
+    fs::create_directory(sub.c_str(), ec);
+    fs::create_symlink("file", link.c_str(), ec);
     run(case_stat(file, sub, link));
 }
 
@@ -524,7 +529,7 @@ Task<void> case_mkdir(String dir, String deep, String file)
 {
     String one = dir + "/one";
     CHECK((co_await make_dir(one)).ok());
-    CHECK(fs::is_directory(one));
+    CHECK(fs::is_directory(one.c_str()));
 
     // A second make_dir over it is Exists; make_dir_all is not.
     Result<void> again = co_await make_dir(one);
@@ -532,7 +537,7 @@ Task<void> case_mkdir(String dir, String deep, String file)
     CHECK((co_await make_dir_all(one)).ok());
 
     CHECK((co_await make_dir_all(deep)).ok());
-    CHECK(fs::is_directory(deep));
+    CHECK(fs::is_directory(deep.c_str()));
     CHECK((co_await make_dir_all(deep)).ok()); // idempotent
 
     // Anything else in the leaf's place is Exists, and a missing parent is
@@ -547,18 +552,18 @@ Task<void> case_mkdir(String dir, String deep, String file)
 Task<void> case_remove(String file, String empty, String tree)
 {
     CHECK((co_await remove_path(file, false)).ok());
-    CHECK(!fs::exists(fs::symlink_status(file)));
+    CHECK(!fs::exists(fs::symlink_status(file.c_str())));
 
     CHECK((co_await remove_path(empty, false)).ok());
-    CHECK(!fs::exists(fs::symlink_status(empty)));
+    CHECK(!fs::exists(fs::symlink_status(empty.c_str())));
 
     // Without `all` a populated directory stays, with its errno.
     Result<void> busy = co_await remove_path(tree, false);
     CHECK(!busy.ok() && busy.error() == Kind::NotEmpty);
-    CHECK(fs::is_directory(tree));
+    CHECK(fs::is_directory(tree.c_str()));
 
     CHECK((co_await remove_path(tree, true)).ok());
-    CHECK(!fs::exists(fs::symlink_status(tree)));
+    CHECK(!fs::exists(fs::symlink_status(tree.c_str())));
 
     Result<void> gone = co_await remove_path(file, true);
     CHECK(!gone.ok() && gone.error() == Kind::NotFound);
@@ -569,7 +574,7 @@ Task<void> case_link(String dir, String link, String file)
     CHECK((co_await make_link("file", link)).ok());
     Result<String> back = co_await read_link(link);
     CHECK(back.ok() && back.value() == "file");
-    CHECK(fs::read_symlink(link).string() == "file"); // and libc agrees
+    CHECK(fs::read_symlink(link.c_str()).string() == "file"); // and libc agrees
 
     // The target is kept as written and not checked.
     String dangling = dir + "/dangling";
@@ -587,7 +592,7 @@ Task<void> case_rename(String a, String b)
 {
     // An existing destination is replaced.
     CHECK((co_await rename_path(a, b)).ok());
-    CHECK(!fs::exists(fs::symlink_status(a)));
+    CHECK(!fs::exists(fs::symlink_status(a.c_str())));
     CHECK(slurp(b) == "content");
 
     Result<void> gone = co_await rename_path(a, b);
@@ -641,7 +646,7 @@ CASE(ops_a_removal_takes_what_rm_would_have_taken)
     String tree  = dir + "/tree";
     put(file, "x");
     std::error_code ec;
-    fs::create_directory(empty, ec);
+    fs::create_directory(empty.c_str(), ec);
     fs::create_directories(tree + "/a/b", ec);
     put(tree + "/a/b/deep", "x");
     put(tree + "/top", "x");

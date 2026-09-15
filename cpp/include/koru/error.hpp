@@ -79,11 +79,26 @@ class Error {
 public:
     Error() = default;
 
+    /// A vocabulary name with no errno behind it. Braam's `Error` **is** the
+    /// vocabulary, so this conversion is what lets a program write it.
+    Error(Kind k) : kind_(k) {}
+
     static Error from_errno(Errno raw) { return Error(kind_of(raw), raw); }
 
     /// End of file, which has no errno at all; raw 0 means synthesised here.
     /// The only such constructor, on purpose. doc/Notes.md says why.
     static Error closed() { return Error(Kind::Closed, Errno(0)); }
+
+    /// A vocabulary name with no errno behind it: `Err(Error::NoMemory)` names
+    /// a failure the kernel was never asked about. doc/Notes.md says why this
+    /// does not weaken `closed()`'s rule.
+    static Error of(Kind k) { return Error(k, Errno(0)); }
+
+    /// Braam's enumerators, as names in the type that carries them. Each is a
+    /// [`Kind`], not a second enumeration.
+#define KORU_KIND_NAME(name, value) static constexpr Kind name = Kind::name;
+    KORU_KIND_TABLE(KORU_KIND_NAME)
+#undef KORU_KIND_NAME
 
     Kind kind() const { return kind_; }
     Errno raw() const { return raw_; }
@@ -108,6 +123,24 @@ private:
     Kind kind_ = Kind::Io;
     Errno raw_ = Errno(0);
 };
+
+/// Braam's `Err(...)`, which tags a value as the failing side of a `Result`.
+/// Here the tag is not needed — `result<T, E>` tells the two apart by type —
+/// so both forms simply build the `Error` the result is constructed from.
+inline Error Err(Error e)
+{
+    return e;
+}
+
+inline Error Err(Kind k)
+{
+    return Error::of(k);
+}
+
+inline Error Err(Errno e)
+{
+    return Error::from_errno(e);
+}
 
 /// The `res` sign convention, in exactly one place: `>= 0` is a result,
 /// negative is `-errno`.

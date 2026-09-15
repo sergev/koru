@@ -88,7 +88,8 @@ add_library(koru STATIC cpp/src/error.cpp cpp/src/ring.cpp cpp/src/pool.cpp
                         cpp/src/rt.cpp cpp/src/ops.cpp cpp/src/filebuf.cpp
                         cpp/src/file.cpp cpp/src/iter.cpp cpp/src/opt.cpp
                         cpp/src/usage.cpp cpp/src/time.cpp cpp/src/grid.cpp
-                        cpp/src/textbuf.cpp cpp/src/screen.cpp)
+                        cpp/src/textbuf.cpp cpp/src/screen.cpp cpp/src/text.cpp
+                        cpp/src/path.cpp cpp/src/size.cpp cpp/src/ftoa.cpp)
 target_include_directories(koru PUBLIC cpp/include)
 # ks_abi.h is the screen protocol's canonical mirror, and the client's cell is
 # its `ks_cell`: that is what makes the read-a-blit-in-place claim true.
@@ -103,6 +104,12 @@ target_compile_options(koru PRIVATE ${KORU_WARNINGS} -O2 ${KORU_SAN_FLAGS})
 add_library(koru_start STATIC cpp/src/main.cpp)
 target_link_libraries(koru_start PUBLIC koru)
 target_compile_options(koru_start PRIVATE ${KORU_WARNINGS} -O2 ${KORU_SAN_FLAGS})
+
+# The same for a Braam `src/cmd` source, whose entry is `proc_main` and whose
+# status is a bare `i32`. T49's programs link this one.
+add_library(koru_start_proc STATIC cpp/src/main.cpp cpp/src/proc_main.cpp)
+target_link_libraries(koru_start_proc PUBLIC koru)
+target_compile_options(koru_start_proc PRIVATE ${KORU_WARNINGS} -O2 ${KORU_SAN_FLAGS})
 
 # The device-free half: the slab, the op state machine and the vocabulary. It
 # needs no module, so ctest runs it on the host.
@@ -158,6 +165,28 @@ add_executable(cpp_less cpp/examples/less.cpp)
 target_link_libraries(cpp_less PRIVATE koru_start)
 target_compile_options(cpp_less PRIVATE ${KORU_WARNINGS} -O2 ${KORU_SAN_FLAGS})
 target_link_options(cpp_less PRIVATE ${KORU_SAN_FLAGS})
+
+# T49: Braam's own `src/cmd` programs, each with its include block replaced by
+# `<koru/braam.hpp>` and nothing else changed. They are the portability proof,
+# so they are listed one by one rather than globbed — a source that stopped
+# compiling must break the build, not quietly leave the list.
+set(KORU_CMD echo basename dirname pwd seq sleep touch mkdir rm ln truncate
+             date cat wc head tail tr cut uniq cmp grep)
+# Braam writes `move(x)` unqualified, because its own `move` is at global
+# scope; here the name is `std::move`, and clang warns on every such call under
+# -Wunqualified-std-cast-call. The warning is about this binding's hoisting and
+# not about the program, and it is the only flag any of these sources needs.
+foreach(prog ${KORU_CMD})
+  add_executable(cmd_${prog} cpp/cmd/${prog}.cpp)
+  target_link_libraries(cmd_${prog} PRIVATE koru_start_proc)
+  target_compile_options(cmd_${prog} PRIVATE ${KORU_WARNINGS} -O2 ${KORU_SAN_FLAGS}
+    $<$<CXX_COMPILER_ID:Clang>:-Wno-unqualified-std-cast-call>)
+  target_link_options(cmd_${prog} PRIVATE ${KORU_SAN_FLAGS})
+endforeach()
+add_custom_target(koru_cmd DEPENDS)
+foreach(prog ${KORU_CMD})
+  add_dependencies(koru_cmd cmd_${prog})
+endforeach()
 
 # SDL3 is the renderer's, and only the renderer's: the model and the protocol
 # build without it, which is what lets most of this gate run anywhere.

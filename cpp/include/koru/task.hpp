@@ -118,6 +118,10 @@ public:
         {
             value.emplace(std::forward<U>(v));
         }
+
+        /// `co_return {};` — how a Braam source spells a successful
+        /// `Result<void>`. A braced list deduces nothing, so it needs its own.
+        void return_value(T v) { value.emplace(std::move(v)); }
     };
 
     task() = default;

@@ -69,8 +69,7 @@ String scan(std::initializer_list<const char *> v, Opts spec, Kind *err = nullpt
         if (!got.value())
             break;
         out += sep;
-        u8 e[4];
-        out.append(reinterpret_cast<const char *>(e), utf8_encode(o.name, e));
+        out += o.name; // a byte, as Braam's is; the error carries the whole rune
         if (!o.value.empty()) {
             out += '=';
             out += String(o.value);
@@ -189,12 +188,14 @@ CASE(opt_a_multibyte_letter_is_refused_whole)
     want(scan({ "ls", "-\xc3\xa9", "x" }, VALUED, &k), "!\xc3\xa9/x");
     CHECK(k == Kind::Invalid);
 
+    // `Opt::name` holds the lead byte alone; that `=5` and not `=\xa95` is
+    // what says the whole rune was consumed.
     Opts spec{ "", "\xc3\xa9" };
     want(scan({ "ls", "-\xc3\xa9"
                       "5",
                 "x" },
               spec),
-         "\xc3\xa9=5/x");
+         "\xc3=5/x");
 }
 
 CASE(opt_help_is_asked_only_as_the_whole_line)

@@ -242,7 +242,7 @@ task<void> pump(std::shared_ptr<Conn> conn)
             Reply r;
             r.flags = u16(u32(p[6]) | (u32(p[7]) << 8));
             r.res   = i32(le32(p + 12));
-            r.body.assign(buf, at + 16, len - 16);
+            r.body.assign(buf.data() + at + 16, len - 16);
             conn->deliver(le32(p + 8), std::move(r));
             at += len;
         }

@@ -75,8 +75,8 @@ inline koru::String fixture(const char *root, const char *name)
 {
     koru::String dir = koru::String(root) + "/" + name;
     std::error_code ec;
-    std::filesystem::remove_all(dir, ec);
-    std::filesystem::create_directories(dir, ec);
+    std::filesystem::remove_all(dir.c_str(), ec);
+    std::filesystem::create_directories(dir.c_str(), ec);
     return dir;
 }
 

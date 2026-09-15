@@ -707,10 +707,10 @@ namespace {
 Task<void> case_std_streams()
 {
     CHECK(&File::out() == &File::out());
-    CHECK(&File::err() == &File::err());
-    CHECK(&File::out() != &File::err());
+    CHECK(&File::stderr() == &File::stderr());
+    CHECK(&File::out() != &File::stderr());
     CHECK(File::out().fd() == out_fd());
-    CHECK(File::err().fd() == err_fd());
+    CHECK(File::stderr().fd() == err_fd());
     CHECK(File::in().fd() == in_fd());
     // stderr is unbuffered so a diagnostic is out before whatever follows it.
     co_await write_err("");

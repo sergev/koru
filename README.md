@@ -199,8 +199,21 @@ permission-checks as root — the check proves that by deliberately moving one t
 a worker and watching an unprivileged process delete a file it had no business
 touching.
 
-The kernel surface is complete. Next is the rest of the operation layer, the
-terminal, and the C++ binding that has to transcribe all of it.
+**Twenty-one of Braam's own programs now compile against koru with their
+include block as the only edit** — `echo`, `basename`, `dirname`, `pwd`, `seq`,
+`sleep`, `touch`, `mkdir`, `rm`, `ln`, `truncate`, `date`, `cat`, `wc`, `head`,
+`tail`, `tr`, `cut`, `uniq`, `cmp` and `grep` — and each is compared against
+its coreutils equivalent on a fixture tree, under ASan and UBSan. Five of them
+are written again as idiomatic Rust against the same function names and
+compared against the C++ ones byte for byte. That is the language-neutrality
+claim made on somebody else's programs rather than on a demo.
+`scripts/run-portability.sh` is the gate.
+
+The twenty-second, `tee`, does not port: it wants signals, which this API
+leaves out on purpose. The two full-screen programs, `less` and `edit`, are not
+done either; `doc/Plan.md` says exactly what stands in the way.
+
+The kernel surface is complete.
 
 [doc/Notes.md](doc/Notes.md) has the design and the reasoning behind it.
 [doc/Plan.md](doc/Plan.md) has the remaining tasks, each with a test.

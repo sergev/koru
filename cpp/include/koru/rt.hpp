@@ -64,6 +64,12 @@ Handle in_fd();
 Handle out_fd();
 Handle err_fd();
 
+/// Braam's `SYS_STDIN`, `SYS_STDOUT` and `SYS_STDERR` are the constants 0, 1
+/// and 2, so every call taking a `Handle` maps them here. A real handle has a
+/// generation of at least 1 in its high half and so is never below 1 << 16,
+/// which makes this unambiguous and idempotent.
+Handle std_fd(Handle h);
+
 /// True where `h` is the screen's byte channel. It is a socket, so nothing
 /// about the handle itself says it is a console; only this does.
 bool is_screen(Handle h);

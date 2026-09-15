@@ -107,7 +107,7 @@ size_t utf8_encode(u32 c, u8 *out)
 FileBuf FileBuf::with_capacity(size_t cap)
 {
     FileBuf b;
-    b.b_.assign(cap, '\0');
+    b.b_ = String(cap, '\0');
     return b;
 }
 

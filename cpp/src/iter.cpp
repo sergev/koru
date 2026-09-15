@@ -9,7 +9,7 @@ namespace koru {
 // ---------------------------------------------------------------------------
 
 Input::Input(Args paths, Handle fallback, Str who)
-    : paths_(std::move(paths)), who_(who), fd_(fallback)
+    : paths_(std::move(paths)), who_(who), fd_(std_fd(fallback))
 {
     own_ = !paths_.empty();
 }
@@ -54,7 +54,7 @@ bool LineReader::take(String &out)
 {
     size_t nl = buf_.find('\n', pos_);
     if (nl != String::npos) {
-        out.assign(buf_, pos_, nl - pos_);
+        out.assign(buf_.data() + pos_, nl - pos_);
         pos_ = nl + 1;
         if (pos_ == buf_.size()) {
             buf_.clear();
@@ -65,7 +65,7 @@ bool LineReader::take(String &out)
     if (!eof_ || pos_ == buf_.size())
         return false;
     // A final fragment with no newline is a line.
-    out.assign(buf_, pos_, String::npos);
+    out.assign(buf_.data() + pos_, buf_.size() - pos_);
     buf_.clear();
     pos_ = 0;
     return true;

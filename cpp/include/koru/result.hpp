@@ -38,6 +38,22 @@ public:
     result(T v) : ok_(true) { new (&val_) T(std::move(v)); }
     result(E e) : ok_(false) { new (&err_) E(std::move(e)); }
 
+    /// A result over a narrower value or error type: Braam spells a descriptor
+    /// `i32` where `Handle` is a `u32`, and its `OptParse::next` answers a
+    /// plain `Result<bool>` where koru's carries the letter at fault. Neither
+    /// binding's own code makes either conversion.
+    template <class U, class F,
+              class = std::enable_if_t<(!std::is_same_v<U, T> || !std::is_same_v<F, E>) &&
+                                       std::is_convertible_v<U, T> &&
+                                       std::is_convertible_v<F, E>>>
+    result(result<U, F> o) : ok_(o.ok())
+    {
+        if (ok_)
+            new (&val_) T(std::move(o).take());
+        else
+            new (&err_) E(o.error());
+    }
+
     result(const result &o) : ok_(o.ok_)
     {
         if (ok_)
@@ -68,6 +84,9 @@ public:
     ~result() { destroy(); }
 
     bool ok() const { return ok_; }
+    /// Braam's spelling of the same question.
+    bool is_ok() const { return ok_; }
+    bool is_err() const { return !ok_; }
     explicit operator bool() const { return ok_; }
 
     T &value() &
@@ -133,7 +152,17 @@ public:
     result(E e) : ok_(false), err_(std::move(e)) {}
 
     bool ok() const { return ok_; }
+    bool is_ok() const { return ok_; }
+    bool is_err() const { return !ok_; }
     explicit operator bool() const { return ok_; }
+
+    /// Braam's `Result<void>::value()`: nothing, but it aborts on an error, so
+    /// a caller that got it wrong says so here rather than further on.
+    void value() const
+    {
+        if (!ok_)
+            fail("koru::result: value() on an error");
+    }
 
     const E &error() const
     {

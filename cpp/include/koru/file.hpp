@@ -66,7 +66,7 @@ public:
     File(File &&)                 = default;
     File &operator=(File &&)      = default;
 
-    static task<result<File>> open(Str path, FileMode m);
+    static task<result<File>> open(Str path, FileMode m = FileMode::Read);
 
     /// Wraps a handle this `File` does not own and will not close.
     static File of(Handle fd, FileMode m);
@@ -76,12 +76,21 @@ public:
     /// cannot be got wrong.
     static File over(Input src);
 
-    /// The three standard streams. `in`, `out` and `err` rather than Braam's
-    /// `stdin`, `stdout` and `stderr`, which are macros in `<cstdio>` and so
-    /// cannot be identifiers here.
-    static File &in();
-    static File &out();
-    static File &err();
+    /// Braam's spelling of the same thing. It **moves** the `Input` in, where
+    /// Braam's keeps a pointer: the lifetime rule its header states is then
+    /// enforced rather than documented.
+    explicit File(Input &src) : File(over(std::move(src))) {}
+
+    /// The three standard streams, in Braam's spelling: `stdin` and its kin
+    /// are self-expanding macros, so a member may carry one after all — which
+    /// T44 assumed otherwise. `in` and `out` stay as they were; there is no
+    /// `err`, because Braam's `err()` is the sticky error below.
+    static File &stdin();
+    static File &stdout();
+    static File &stderr();
+
+    static File &in() { return stdin(); }
+    static File &out() { return stdout(); }
 
     // ----------------------------------------------------------------- state
 
@@ -90,6 +99,10 @@ public:
     /// The first error this stream met. Braam's sentinel is `Error(0)`; this
     /// is an `Option`, as the Rust binding's is.
     Option<Error> error() const { return err_; }
+
+    /// Braam's: the error itself, `Invalid` standing for its `Error(0)` — a
+    /// zero is not a vocabulary name here, so `clean()` is the question to ask.
+    Error err() const { return err_.value_or(Error::of(Kind::Invalid)); }
 
     bool clean() const { return !err_.has_value(); }
     /// An end of input is not a failure.
@@ -100,7 +113,7 @@ public:
     void set_buffering(Buffering b) { how_ = b; }
 
     /// Asks for a larger block than [`FILE_BUF`].
-    void reserve(size_t n);
+    result<void> reserve(size_t n);
 
     /// Puts a rune back, in front of what is buffered, so `read` and `getline`
     /// see it too. False where there is no room in front.
@@ -115,9 +128,12 @@ public:
     /// of input, so a short read is never mistaken for one.
     task<result<size_t>> read(SpanMut<u8> into);
 
+    /// Braam spells the destination `Span<char>`, and hands it an array.
+    task<result<size_t>> read(SpanMut<char> into);
+
     /// One line, without its newline unless `keep_nl`. `false` at end of
     /// input; a final fragment with no newline is a line.
-    task<result<bool>> getline(String &out, bool keep_nl);
+    task<result<bool>> getline(String &out, bool keep_nl = false);
 
     // ---------------------------------------------------------------- output
 
@@ -154,16 +170,17 @@ public:
 
     /// The next byte must be `c`; `false` and nothing taken where it is not.
     task<result<bool>> scan_lit(u8 c);
+    task<result<bool>> scan_lit(char c) { return scan_lit(u8(c)); }
 
     /// `scanf`'s `%s`. `false` at end of input.
-    task<result<bool>> scan_token(String &out, size_t width);
+    task<result<bool>> scan_token(String &out, size_t width = 0);
 
     /// `scanf`'s `%[^set]`. `false` where the first byte is already in `stop`.
-    task<result<bool>> scan_until(String &out, Str stop, size_t width);
+    task<result<bool>> scan_until(String &out, Str stop, size_t width = 0);
 
     /// `scanf`'s `%d %i %u %o %x`; `base` 0 is C's prefix rules.
-    task<result<i64>> scan_i64(u32 base, size_t width);
-    task<result<u64>> scan_u64(u32 base, size_t width);
+    task<result<i64>> scan_i64(u32 base = 10, size_t width = 0);
+    task<result<u64>> scan_u64(u32 base = 10, size_t width = 0);
 
 private:
     static File bare(Handle fd, FileMode m);

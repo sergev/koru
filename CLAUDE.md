@@ -5,7 +5,7 @@ code in this repository.
 
 ## State of the repository
 
-**T0–T48 are done**, and Phases 9, 10 and 11 with them. The kernel surface was
+**T0–T49 are done**, and Phases 9 through 12 with them. The kernel surface was
 complete at T29 and grew once more at T30, for `OPEN`'s creation flags. Braam's
 hello world runs through koru, on a window koru owns; the ring can wait for a
 descriptor; and T15's demo now runs from **two** bindings that share no code,
@@ -336,10 +336,10 @@ T44–T48 are Phase 11, Braam's whole userspace API in C++ over T39–T43's
 core: the vocabulary and the ambient ring, the operation layer, the buffered
 stream and its iterators, the program shell, and the screen client.
 `cpp/include/koru/braam.hpp` hoists every name to global scope, and `hello`,
-`date` and `less` are Braam sources with that include line as their only
-edit — each compared against its Rust twin, and `less` **in pixels**: two
-bindings
-that share no code paint a byte-identical window through one daemon.
+`date` and `less` in `cpp/examples/` are each compared against their Rust
+twin, `less` **in pixels**: two bindings that share no code paint a
+byte-identical window through one daemon. Only `hello` is Braam's own source,
+which is what T49 found out.
 
 Five things Phase 11 taught. **`CO_TRY(co_await f())` is an internal compiler
 error in GCC** — a statement expression holding both a `co_await` and a
@@ -348,13 +348,30 @@ error in GCC** — a statement expression holding both a `co_await` and a
 value out of an await needs clang; `CO_TRY_VOID` is unaffected. **`-Wpedantic`
 had to be split in two**, because the dialect is deliberately `gnu++20` now.
 **`stdin`, `stdout` and `stderr` are libc macros**, so the handles are
-`in_fd`/`out_fd`/`err_fd` and the streams `File::in()`/`out()`/`err()`, and
-`ops.hpp` takes six more macro names back with a static assert and an `#undef`.
+`in_fd`/`out_fd`/`err_fd`, and `ops.hpp` takes six more macro names back with a
+static assert and an `#undef`. (The streams were `File::in()`/`out()`/`err()`
+for the same reason, and T49 found the macros are *self-expanding*, so a member
+may carry one after all: they are `File::stdin()`/`stdout()`/`stderr()` now.)
 **An `ENTER` count cannot see what a C++ fast path buys** — the slow half
 answers out of the buffer too — so `detail::frames_allocated` counts coroutine
 frames instead, and that is what `put_fast` moves. And **the window snapshot
 has to be copied while the pager is still alive**, or the daemon repaints the
 scrolling screen on its way out and two blank windows compare equal.
+
+T49 is Phase 12, the portability proof: twenty-one of Braam's twenty-two text
+programs in `cpp/cmd/`, their include block the only edit, each compared
+against its coreutils equivalent on a fixture tree under ASan and UBSan, and
+five of them compared against idiomatic-Rust twins byte for byte.
+`scripts/run-portability.sh` is the gate — 118 cases in one VM boot.
+
+It needed seven headers the surface did not have (`fmt`, `text`, `path`,
+`size`, `ftoa`, `alloc`, `sysabi`), `Str`, `String` and `Vec` **derived** from
+their standard types rather than aliased, and five fixes in libkoru that real
+programs found: `OptParse` dangled a temporary `Args`, `Args` had no `v`,
+`Opt::name` had to go back to being a byte, `open_at` answers `Result<i32>`,
+and `File::err()` collided with Braam's sticky-error accessor. `tee` is the one
+program that does not port, because signals are out of scope. `less` and `edit`
+are not done and are T49b in the plan.
 
 T14 made the two userspace ABI mirrors a diff rather than a promise.
 `cpp/include/koru_abi.h` and `cpp/include/koru_errno.h` are the C mirrors,
@@ -384,6 +401,9 @@ its fastest gate: no VM, no device, no module.
   `koru-macros`, `#[koru::main]` alone. Cargo names the package, so `-p
   koru-sys` and `use koru_sys::` are unaffected by the directory. The examples
   in `rust/runtime/examples/` are programs, so the guest runs them.
+- `cpp/cmd/` — T49's proof: Braam's own `src/cmd` sources, each with its
+  include block replaced by `<koru/braam.hpp>` and **nothing else changed**.
+  Do not tidy them; a diff against Braam is what they are for.
 - `cpp/` — the C++ binding. `include/koru_abi.h` and `include/koru_errno.h`
   are the C mirrors, shared with `test/`, and `tools/abi_dump.cpp` dumps them;
   `include/koru/` and `src/` are `libkoru` itself — the synchronous core, the
@@ -546,6 +566,12 @@ scripts/screen.sh
 # The daemon end to end, in a VM: auto-spawn, the lifecycle, the byte channel,
 # and Braam's `less` in both bindings painting a byte-identical window.
 scripts/run-e2e.sh
+
+# T49's portability proof, in a VM under ASan and UBSan: Braam's own programs
+# against coreutils, and five of them against their Rust twins. It needs
+# `(cd rust && cargo build --examples)` as well as the module.
+scripts/run-portability.sh
+scripts/run-portability.sh cut uniq   # only cases whose name matches
 ```
 
 `test/koru_check` is the entire test suite for the module: one binary, one

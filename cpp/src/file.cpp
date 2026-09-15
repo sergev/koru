@@ -131,7 +131,7 @@ task<result<File>> File::open(Str path, FileMode m)
 
 File File::of(Handle fd, FileMode m)
 {
-    return bare(fd, m);
+    return bare(std_fd(fd), m);
 }
 
 File File::over(Input src)
@@ -143,7 +143,7 @@ File File::over(Input src)
 
 /// Fully buffered, and tied to `out()`: a prompt is out before what answers it
 /// is read.
-File &File::in()
+File &File::stdin()
 {
     File &f    = std_stream(0, in_fd(), FileMode::Read, Buffering::Full);
     f.tie_out_ = true;
@@ -152,13 +152,13 @@ File &File::in()
 
 /// `Buffering::Auto`: line-buffered on the console, fully buffered when
 /// redirected, decided once on the first flush.
-File &File::out()
+File &File::stdout()
 {
     return std_stream(1, out_fd(), FileMode::Write, Buffering::Auto);
 }
 
 /// Unbuffered, so a diagnostic is out before whatever follows it.
-File &File::err()
+File &File::stderr()
 {
     return std_stream(2, err_fd(), FileMode::Write, Buffering::None);
 }
@@ -190,11 +190,17 @@ void File::block_ready()
         buf_ = FileBuf::with_capacity(want_);
 }
 
-void File::reserve(size_t n)
+result<void> File::reserve(size_t n)
 {
     want_ = n > FILE_BUF ? n : FILE_BUF;
     if (!src_ && how_ != Buffering::None)
         block_ready();
+    return {};
+}
+
+task<result<size_t>> File::read(SpanMut<char> into)
+{
+    co_return co_await read(SpanMut<u8>(reinterpret_cast<u8 *>(into.data()), into.size()));
 }
 
 bool File::unget(u32 c)
@@ -812,7 +818,7 @@ task<result<void>> write_out(Str s)
 
 task<result<void>> write_err(Str s)
 {
-    co_return co_await File::err().write(s);
+    co_return co_await File::stderr().write(s);
 }
 
 } // namespace koru

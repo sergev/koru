@@ -286,6 +286,7 @@ task<BufSlot> acquire()
 
 task<result<size_t>> write_once(Handle fd, Span<u8> s)
 {
+    fd = std_fd(fd);
     for (;;) {
         BufSlot slot = co_await acquire();
         size_t n     = s.size() < slot.size() ? s.size() : slot.size();
@@ -309,6 +310,7 @@ task<result<size_t>> write_once(Handle fd, Span<u8> s)
 
 task<result<void>> write_bytes(Handle fd, Span<u8> s)
 {
+    fd = std_fd(fd);
     size_t at = 0;
     // The kernel refuses a zero-length write, and Braam's write_all of an
     // empty string is a no-op rather than an error.
@@ -323,6 +325,7 @@ task<result<void>> write_bytes(Handle fd, Span<u8> s)
 
 task<result<size_t>> read_into(Handle fd, String &out, u32 max)
 {
+    fd = std_fd(fd);
     u32 want = max == 0 ? CHUNK : (max < READ_MAX ? max : READ_MAX);
     for (;;) {
         BufSlot slot = co_await acquire();
@@ -347,6 +350,7 @@ task<result<size_t>> read_into(Handle fd, String &out, u32 max)
 
 task<bool> is_console(Handle fd)
 {
+    fd = std_fd(fd);
     // The byte channel is a socket, so `STAT` cannot answer for it: only the
     // runtime knows which socket is the terminal.
     if (is_screen(fd))
@@ -376,11 +380,13 @@ task<bool> is_console(Handle fd)
 
 task<result<void>> write_all(Handle fd, Str s)
 {
+    fd = std_fd(fd);
     co_return co_await detail::write_bytes(fd, bytes_of(s));
 }
 
 task<result<String>> read_some(Handle fd, u32 max)
 {
+    fd = std_fd(fd);
     String buf;
     CO_LET(n, co_await detail::read_into(fd, buf, max));
     if (n == 0)
@@ -390,6 +396,7 @@ task<result<String>> read_some(Handle fd, u32 max)
 
 task<result<String>> read_chunk(Handle fd)
 {
+    fd = std_fd(fd);
     co_return co_await read_some(fd, READ_MAX);
 }
 
@@ -413,6 +420,29 @@ task<result<String>> read_file(Str path)
     co_return std::move(buf);
 }
 
+bool next_line(Str &rest, Str &line)
+{
+    if (rest.empty())
+        return false;
+    line = rest.split('\n', rest);
+    return true;
+}
+
+Str next_field(Str &line)
+{
+    size_t skip = 0;
+    while (skip < line.size() && (line[skip] == ' ' || line[skip] == '\t'))
+        skip++;
+    line = line.substr(skip);
+
+    size_t n = 0;
+    while (n < line.size() && line[n] != ' ' && line[n] != '\t')
+        n++;
+    Str out = line.substr(0, n);
+    line    = line.substr(n);
+    return out;
+}
+
 task<void> errln(Str who, Str what, Error why)
 {
     String line = detail::diag_line(who, what, why);
@@ -423,7 +453,7 @@ task<void> errln(Str who, Str what, Error why)
 // Descriptors
 // ---------------------------------------------------------------------------
 
-task<result<Handle>> open_at(Str path, u32 flags)
+task<result<i32>> open_at(Str path, u32 flags)
 {
     std::pair<u32, u64> f = CO_TRY(detail::open_flags(flags));
     u32 kflags            = f.first;
@@ -456,22 +486,24 @@ task<result<Handle>> open_at(Str path, u32 flags)
     result<FileInfo> info = co_await stat_fd(h);
     bool seekable         = info.ok() && info.value().kind == FileKind::File;
     register_opened(h, seekable, (flags & O_WRITE) != 0, String(path));
-    co_return h;
+    co_return i32(h);
 }
 
-task<result<Handle>> open_read(Str path)
+task<result<i32>> open_read(Str path)
 {
     co_return co_await open_at(path, O_READ);
 }
 
 task<void> close_fd(Handle fd)
 {
+    fd = std_fd(fd);
     if (release_handle(fd))
         co_await reactor().submit(sqe::close(0, fd));
 }
 
 task<result<Handle>> dup_fd(Handle fd)
 {
+    fd = std_fd(fd);
     if (retain_handle(fd))
         co_return fd;
     co_return einval();
@@ -479,6 +511,7 @@ task<result<Handle>> dup_fd(Handle fd)
 
 task<result<u64>> seek_fd(Handle fd, i64 off, u32 whence)
 {
+    fd = std_fd(fd);
     if (!is_seekable(fd))
         co_return Error::from_errno(Errno(EOPNOTSUPP));
 
@@ -517,6 +550,7 @@ task<result<u64>> seek_fd(Handle fd, i64 off, u32 whence)
 
 task<result<void>> truncate_fd(Handle fd, u64 n)
 {
+    fd = std_fd(fd);
     if (!is_seekable(fd))
         co_return Error::from_errno(Errno(EOPNOTSUPP));
     if (!is_writable(fd))
@@ -553,6 +587,7 @@ task<result<FileInfo>> stat_of(Str path, bool follow)
 
 task<result<FileInfo>> stat_fd(Handle fd)
 {
+    fd = std_fd(fd);
     BufSlot slot = co_await detail::acquire();
     u32 index    = slot.index();
 
@@ -574,7 +609,7 @@ task<result<FileInfo>> stat_fd(Handle fd)
 // Directories
 // ---------------------------------------------------------------------------
 
-task<result<std::vector<DirEntry>>> list_dir(Str path)
+task<result<Vec<DirEntry>>> list_dir(Str path)
 {
     CO_LET(fd, co_await open_at_koru(path, KORU_O_RDONLY | KORU_O_DIRECTORY));
     std::vector<std::pair<String, u8>> names;

@@ -92,7 +92,7 @@ void TextBuf::split(size_t row, size_t at)
     ensure(row);
     size_t k    = clamp(row, at);
     String tail = lines_[row].substr(k);
-    lines_[row].erase(k);
+    lines_[row].truncate(k);
     lines_.insert(lines_.begin() + long(row) + 1, std::move(tail));
     modified_ = true;
 }
