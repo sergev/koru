@@ -391,11 +391,11 @@ shared with `test/`, and an `abi_dump` on each side emits a canonical record
 dump that `scripts/abi.sh` compares. That is the repo's first CMake build and
 its fastest gate: no VM, no device, no module.
 
-- `doc/Notes.md` — the global picture: design, ABI invariants, research
-  findings, accepted gaps, and what T0–T12 established. It records *why* several
-  obvious-looking approaches are wrong. Read it before writing anything.
-- `doc/Plan.md` — the remaining tasks only, each with a "done" test. Completed
-  tasks are deleted from it, not marked.
+- `doc/Notes.md` — **the only design document**: design, ABI invariants,
+  research findings, accepted gaps, what each task established, the
+  verification sequence, and what is deliberately not being built. It records
+  *why* several obvious-looking approaches are wrong. Read it before writing
+  anything. `doc/Plan.md` held the task list and is gone; the work is done.
 - `README.md` — the short explanation of the idea.
 - `kernel/` — the out-of-tree Rust module. `koru_abi.rs` is the canonical wire
   format; `koru.rs` holds the device, the ring state and the `ENTER` path,
@@ -456,10 +456,11 @@ Two documentation rules, both load-bearing:
 - Every `*.md` file in this repo wraps at 80 columns and uses **no tables**.
   Reflow the whole paragraph when you edit one, rather than letting a line run
   long. A table forces long lines, so use headed sections or lists instead.
-- When a task is finished, **delete it from `doc/Plan.md`**. Anything it taught
-  that outlives it — a corrected assumption, an ABI change, a trap worth not
-  falling into twice — moves into `doc/Notes.md` first. `Plan.md` is future
-  work only; `Notes.md` is the accumulated global picture.
+- Anything a piece of work teaches that outlives it — a corrected assumption,
+  an ABI change, a trap worth not falling into twice — goes into
+  `doc/Notes.md`. That is the accumulated global picture and the only place
+  such a finding belongs. This holds for work that is *abandoned* too: what it
+  measured on the way is the part worth keeping.
 
 ## What this project is
 
@@ -800,14 +801,8 @@ submodules of that one crate, reached by `mod` declarations, not separate
 editing a submodule alone. Inherent `impl RingCtx` blocks live in `koru_ops.rs`
 too, which is why `RingCtx` and its fields are `pub(crate)` rather than private.
 
-The rest of `doc/Plan.md`'s Verification sequence does not work yet; the
-load-bearing one will be:
-
-```sh
-cargo run --example read_file   # Rust demo
-```
-
-Add them here as they start working, rather than inventing them ahead of time.
+`doc/Notes.md`'s Verification section lists every gate in the order that finds
+a break soonest; the commands themselves are above.
 
 ## Architecture
 

@@ -17,7 +17,7 @@ set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS OFF)
 
-# doc/Plan.md's verification sequence names ./build/abi_dump.
+# doc/Notes.md's verification sequence names ./build/abi_dump.
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
 
 # Per target, never in CMAKE_CXX_FLAGS: the documented configure line passes

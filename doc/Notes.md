@@ -1,8 +1,10 @@
 # koru — design notes
 
 The global picture: why this API is shaped the way it is, what the ABI
-guarantees, and what building T0–T12 actually taught us. [Plan.md](Plan.md)
-holds the remaining tasks and nothing else.
+guarantees, and what building it actually taught us. This is now the only
+design document. `Plan.md` held the task list and was deleted when the last of
+it was built; "What is not being built" at the end records the three ideas that
+were considered and dropped, and why.
 
 ## Context
 
@@ -277,7 +279,7 @@ once `release` runs, and no deferred op touches the handle table.
 
 ## What T0–T12 established
 
-The tasks themselves are gone from [Plan.md](Plan.md); what they proved is here.
+The tasks themselves are long finished; what they proved is here.
 
 ### Environment and module skeleton
 
@@ -2274,8 +2276,8 @@ aborts the emitter rather than passing quietly.
 C++ binary that dies before printing and a cargo build that fails compare two
 empty streams and report success — the same hole `WANT_PASSED` closes in
 `rust.sh`. `scripts/abi.sh` checks both exit statuses, both lengths and a
-`WANT_RECORDS` minimum before it diffs anything, and doc/Plan.md's verification
-step names the script rather than the one-liner it used to.
+`WANT_RECORDS` minimum before it diffs anything, and the verification sequence
+below names the script rather than the one-liner it used to.
 
 The errno table's prose `produced_by` column is deliberately **not** dumped. It
 is provenance documentation rather than wire format, and diffing it would make
@@ -5262,3 +5264,163 @@ regret getting wrong, was settled while it was still cheap to change.
 
 T6 was the first demoable milestone: a working async syscall interface.
 Everything after it is realism or optimization.
+
+## The scope, and what is permanently outside it
+
+koru's userspace API is Braam's, minus what this substrate cannot carry.
+[Braam](https://github.com/braamix/core) is a browser-hosted OS whose programs
+are wasm modules with no libc and no stack switching; its syscalls are a submit
+import plus a completion export and every blocking call is a C++20 coroutine —
+a different substrate making the same bet. Taking its API rather than inventing
+one is what turned the language-neutrality claim into something harder to fake
+than two demos printing the same bytes: fifty-odd programs were already written
+against it, and twenty-three of them now compile here with their include block
+as the only edit.
+
+Out of scope permanently, and not for lack of time: the host services
+(`fetch_url`, `ws_connect`, `pick`, `clip_*`, `inflate`, `verify_sig`), and
+processes, pipes, signals and job control. `tee` is the one Braam program that
+does not port, and signals are why. Also out is Braam's freestanding discipline
+— no libc, no namespaces, the 512-byte frame budget — which are wasm
+artefacts rather than design. `cwd_get` and `cwd_set` use ordinary POSIX
+calls and the binding's own documentation says so.
+
+Two adaptations the surface makes and does not hide. `DELAY_NS` caps at one
+hour where Braam's `sleep_for` takes milliseconds up to fifty days, so the
+binding chunks it. And `READ` reports end of file as `res == 0` where
+`read_chunk` reports `Err(Closed)`, so the wrapper maps it.
+
+**The terminal cell grid is in scope**, and an early version of the plan said it
+was not. Phase 9 built it as a daemon owning a window, reached over a socket the
+client adopts into the ring — which is what makes the rest of that paragraph
+true, since the argument for a socket rather than a pty depends on processes and
+job control staying out.
+
+Three screen extensions are shaped to be additive rather than a rewrite, and
+none is built. **Multiplexing** — several clients, foreground switching, and
+`attach` to a second window — is what the reserved `seq = 0` and the reserved
+`KS_OP_TERM_OPEN` leave room for. **A real pty** would replace the byte channel
+without the client being able to tell, and is what would let a shell run in the
+window. **Reconnecting** to a restarted daemon is invisible to a full-screen
+program already, because the resize path marks the whole grid damaged.
+
+## Verification
+
+Every gate in one list, in the order that finds a break soonest. `CLAUDE.md`
+has the commands themselves.
+
+1. `ctest --test-dir build -L screen` — the terminal model against Braam's own
+   cell-exact tests, the protocol server's rejection matrix through `feed()`,
+   and the five pixel oracles. **No VM, no `/dev/koru`, no display server**, so
+   this is the fastest feedback there is and should run first in practice.
+2. `scripts/abi.sh` — the two ABI dumps agree, and the screen protocol's two
+   share the runner. No VM, no device, no module.
+3. `ctest --test-dir build` — the host-only C++ half: the slab and the op
+   state machine, the symmetric-transfer depth case, the vocabulary and
+   `Args`, the option parser and the calendar, and the grid, text buffer and
+   view.
+4. `(cd rust && cargo test -p koru-sys --lib && cargo test -p koru --lib)` —
+   the host-only Rust half: the ABI assertions, the ioctl numbers, the errno
+   table, the cookie, the slab, the op state machine, the stall predicate and
+   the vocabulary. No device.
+5. `make -C test && scripts/run.sh` — the module's own check, in a VM: the
+   fuzz, the kmemleak scan past its minimum object age, the creds cases, the
+   lockdep breakages and a clean `rmmod`.
+6. `scripts/run-rust.sh` — the Rust suites in one VM boot: the kernel matrix,
+   the futures and executor, the operation layer against libc, the buffered
+   `File`, the screen client against its fake daemon, and the example programs
+   run three ways each.
+7. `scripts/run-cpp.sh` — the C++ device suite in a VM under ASan and UBSan:
+   the T4–T11 matrix, abandonment, drop safety, the operation layer, the
+   buffered stream and the screen client. It also runs the demo, `hello` and
+   `date` beside their Rust twins and compares the bytes.
+8. `scripts/run-e2e.sh` — the daemon end to end: auto-spawn, the lifecycle,
+   the byte channel, Braam's `less` in both bindings painting a
+   byte-identical window, and Braam's `edit` typed at through the scripted
+   keyboard.
+9. `scripts/run-portability.sh` — Braam's twenty-one text programs against
+   coreutils on a fixture tree, and five of them against their Rust twins.
+10. Steps 6 and 7 **concurrently**. Both must still be correct.
+
+The dev kernel must have KASAN, `PROVE_LOCKING` and `DEBUG_KMEMLEAK` on. They
+pay for themselves in the first week.
+
+## What is not being built
+
+Three ideas were carried as future tasks and are now retired. None is blocked
+by anything here; each was dropped because the case for it did not survive
+being written down.
+
+### A shared mmap'd SQ/CQ
+
+Retired unbuilt; "Boundary" above has the four reasons in full. In short: one
+`ENTER` per pump already carries the batch and the reap together, so the only
+win is syscall-free reaping and nothing here has yet shown an `ENTER` that
+exists only to reap; the surface it would have to prove in both modes doubled
+between T12 and T49b; a shared ring gives back the private-snapshot property
+the ioctl was chosen for; and the first step is a kernel patch argued upstream
+rather than koru work.
+
+### An eventfd and a tokio bridge
+
+`/dev/koru` is not pollable — `kernel::miscdevice` exposes no `poll`, and
+`POLL_ADD` polls other descriptors rather than koru's own fd — so a koru op
+cannot be awaited inside a foreign reactor without manufacturing a readiness
+signal. That was worth doing only if tokio integration became a goal, and it
+never did: the claim this project makes is one unchanged ABI under two bindings
+that share no code, and tokio is not on that path. A tokio dependency would
+also end `rust/runtime`'s zero-dependency `#![forbid(unsafe_code)]` property,
+which is worth more than the bridge until somebody wants the bridge.
+
+### A waiter thread, and the rule it was to make falsifiable
+
+The rule is `await_suspend` must not touch `this` after publishing the handle:
+once the reactor has it, the coroutine may already have been resumed and its
+frame freed. Under a single-threaded executor a violation does nothing, so the
+rule has never had an oracle, and a second thread resuming frames was to be it.
+It was prototyped — a mutex in `Reactor` and `BufPool`, `park` returning false
+where the completion had already landed, a `WaiterThread` looping on `pump` —
+and then reverted along with the task. Four things it measured first, all worth
+not rediscovering:
+
+**GCC's ThreadSanitizer defeats symmetric transfer, like its ASan.** 160 bytes
+a level, linear, so a hundred thousand nested awaits overflow the stack under
+it as they do at -O0. Unlike ASan's the number is a real measurement — ASan's
+fake stack makes the reach meaningless rather than merely large — but it is a
+measurement of TSan. Plain -O2 stays flat at 40 bytes over the whole chain.
+Clang's TSan runtime is not installed here, so this is GCC's, as T41's is.
+
+**GCC's TSan reports a data race on every cross-thread coroutine resume, and it
+is a false positive.** A minimal program that publishes the handle under a
+mutex and takes it under the same mutex is flagged on the *first* round — a
+two-byte read and write of the frame's resume index. The optimized assembly
+shows the index written before the lock is taken and the handle published
+inside it, so the happens-before chain is there. The control settles it: the
+same handoff with a plain heap struct instead of a coroutine frame is clean
+over 2000 rounds. **So TSan cannot be the oracle for this on GCC**, which is
+the opposite of what the task assumed.
+
+**A touch of `this` after publishing is usually compiled away.** At -O2 the
+members were loaded on the way into `park`, so a naive `reactor_->...` after it
+reads a register and never touches the frame at all. Making the perturbation a
+real use-after-free needs a forced load — a `volatile` read of a member. The
+awaiter itself is in the frame: `this` measured 88 bytes past
+`coroutine_handle::address()`. `yield_awaiter` is not — it holds one pointer
+and its `await_resume` is empty, so GCC keeps it in a register and its `this`
+is not frame memory at all.
+
+**And the window was never reached.** With a waiter thread pumping, 99,760 of
+100,000 frames were resumed on the waiter's thread rather than inline, so the
+machinery worked. But a deliberate touch of `this` after publishing was not
+caught — not at 100,000 rounds, and not with the submitting thread sleeping
+2 ms or 20 ms inside `await_suspend` after publishing, where ASan reported the
+frame still live in 200 of 200 cases. Part of the reason is structural: the
+reactor submits lazily, so an op's CQE cannot exist before `park` runs, and the
+resume is always at least an `ENTER` behind the publication. Why the resume
+never landed in a 20 ms window even so was **not established** before the task
+was dropped, and anyone picking this up should start there rather than trust
+the explanation.
+
+The rule stays written down where it is enforced, and the reactor stays
+single-threaded. That is the honest state: a rule kept by construction and by
+review, not by a test.

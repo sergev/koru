@@ -220,8 +220,8 @@ leaves out on purpose.
 
 The kernel surface is complete.
 
-[doc/Notes.md](doc/Notes.md) has the design and the reasoning behind it.
-[doc/Plan.md](doc/Plan.md) has the remaining tasks, each with a test.
+[doc/Notes.md](doc/Notes.md) has the design, the reasoning behind it, the
+verification sequence, and what is deliberately not being built.
 
 Requires a Linux box running a kernel ≥6.16 built with `CONFIG_RUST=y` and
 `CONFIG_USER_NS=y` — and the full build tree, since distro `linux-headers`
