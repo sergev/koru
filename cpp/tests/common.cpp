@@ -174,8 +174,22 @@ int64_t file_nr()
 
 int64_t file_nr_settled()
 {
-    sleep_ms(100);
-    return file_nr();
+    // The counter is global and lags: file structs an earlier case dropped are
+    // still counted for a while, so one sleep is not a settled reading — it is
+    // a baseline that keeps falling, and a later sample then looks *smaller*
+    // than the one it must exceed. Wait for two reads to agree instead.
+    //
+    // T49b found this: the C++ suite failed one run in five with a baseline of
+    // 92 against 32, and the tree before it failed the same way.
+    int64_t last = file_nr();
+    for (int i = 0; i < 40; i++) { // up to two seconds
+        sleep_ms(50);
+        int64_t now = file_nr();
+        if (now == last)
+            return now;
+        last = now;
+    }
+    return last;
 }
 
 size_t count_fds()

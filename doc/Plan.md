@@ -88,57 +88,32 @@ the whole grid damaged. Add them here as tasks when one of them is wanted.
 Built. Braam's whole userspace API sits on T39-T43's core: the vocabulary and
 the ambient ring, the operation layer, the buffered stream and its iterators,
 the program shell, and the screen client. `cpp/include/koru/braam.hpp` hoists
-all of it to global scope, and `hello`, `date` and `less` in `cpp/examples/`
-are each compared against a Rust twin, `less` in pixels. Only `hello` is
-Braam's own source; the other two are koru's programs in Braam's style, which
-T49 is what found out. doc/Notes.md has the design and what each task taught,
+all of it to global scope, and `hello` and `date` in `cpp/examples/` are each
+compared against a Rust twin. Only `hello` is Braam's own source; `date` is
+koru's program in Braam's style, which T49 is what found out, and `less` was
+too until T49b replaced it with Braam's. doc/Notes.md has the design and what
+each task taught,
 including the GCC bug that makes `CO_TRY(co_await ...)` clang-only.
 
 ## Phase 12 — the proof
 
-T49 is built: twenty-one of Braam's twenty-two text programs sit in `cpp/cmd/`
-with their include block as the only edit, and `scripts/run-portability.sh`
-compares each against coreutils on a fixture tree, under ASan and UBSan. Five
-of them are written again as idiomatic Rust and compared against the C++ ones
-byte for byte. `tee` is the one that does not port, and signals were out of
-scope before the surface was written. doc/Notes.md has what the real programs
-found in libkoru — five of them were bugs — and the six places Braam's
-programs are deliberately not GNU's.
+Built. Twenty-three of Braam's twenty-four `src/cmd` programs sit in
+`cpp/cmd/` with their include block as the only edit.
+`scripts/run-portability.sh` compares each of the twenty-one text ones against
+coreutils on a fixture tree, under ASan and UBSan, and five of them against
+idiomatic-Rust twins byte for byte; `scripts/run-e2e.sh` paints Braam's `less`
+beside the Rust pager and compares the two windows, and types at Braam's
+`edit` through a scripted keyboard. `tee` is the one that does not port, and
+signals were out of scope before the surface was written. doc/Notes.md has
+what the real programs found in libkoru — five of them were bugs — the six
+places Braam's programs are deliberately not GNU's, and what the full-screen
+half cost.
 
-### T49b [R] — the full-screen half
-
-What T49 left: Braam's `src/cmd/less.cpp` and `src/cmd/edit.cpp`, compiled with
-the include block as the only edit. They are the only two programs that
-exercise Phase 9's pure library end to end, and `cpp/examples/less.cpp` is
-still koru's rewrite rather than Braam's source.
-
-Five things stand in the way, all additive and none a limitation of the
-substrate — T48 already paints the same window from both bindings.
-
-**A koru `Pane` does not hold its grid**, so every write takes one:
-`bar.write(screen.grid(), line)` where Braam writes `bar.write(line)`. That
-rule came from the Rust binding, where lending one object twice is not allowed,
-and it is worth keeping for `Pane`; the answer is a second pane type that
-carries a `Grid &`, which `ProcScreen::body()`, `root()` and `status()` hand
-back and which `braam.hpp` hoists as `Pane`. `TextView::paint` needs the
-matching overload.
-
-The other four: `ProcScreen` is default-constructed and claims lazily, where
-`Screen::connect()` is an async factory; `tty_of(SYS_STDOUT)` is how a pager
-decides whether to page at all, and koru has only `detail::is_console`;
-`TextBuf`'s mutators answer `Result<void>` on Braam and `void` here; and the
-palette is `COLOR_*` rather than `KS_COLOR_*`.
-
-**A program that wants a value out of an await needs clang.** GCC cannot
-compile a statement expression holding both a `co_await` and a `co_return`, so
-`i32 n = CO_TRY(co_await f());` is an internal compiler error there;
-doc/Notes.md has the reproducer. `CO_TRY_VOID` is unaffected. None of T49's
-twenty-one programs writes one; `edit` may.
-
-Done test: both compile with no source change beyond the include, `less` paints
-a window `cmp`-identical to the Rust pager's through the same daemon — which is
-T48's assertion with Braam's own source on the C++ side — and `edit` opens a
-file, types into it, writes it back and is compared against what was typed.
+**A program that wants a value out of an await still needs clang**, and none
+of the twenty-three writes one: GCC cannot compile a statement expression
+holding both a `co_await` and a `co_return`, so `i32 n = CO_TRY(co_await f());`
+is an internal compiler error there. `CO_TRY_VOID` is unaffected, and `edit` —
+the one most likely to have wanted it — uses only that.
 
 ## Phase 13 — only if justified
 
@@ -207,8 +182,9 @@ lands:
    `/dev/koru` and no display server**, so they are the fastest feedback in the
    whole list and should run first in practice.
 9. `scripts/run-e2e.sh` — the daemon end to end (T38), the byte channel
-   (T38b), and Braam's `less` in both bindings painting a byte-identical
-   window (T48).
+   (T38b), Braam's `less` in both bindings painting a byte-identical window
+   (T48, T49b), and Braam's `edit` typed at through the daemon's scripted
+   keyboard (T49b).
 10. `scripts/run-portability.sh` — Braam's twenty-one programs against
     coreutils on a fixture tree, and five of them against their Rust twins
     (T49). It needs `/dev/koru`, so it is a VM boot like every other gate that

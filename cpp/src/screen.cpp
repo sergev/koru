@@ -707,6 +707,8 @@ task<result<void>> Screen::take_screen()
 
 void Screen::sync()
 {
+    if (!conn_)
+        return; // never connected: the grid stays empty rather than crashing
     u32 cols = conn_->cols, rows = conn_->rows;
     if (cols != 0 && rows != 0 && (grid_.cols() != cols || grid_.rows() != rows))
         grid_.resize(cols, rows);
@@ -737,6 +739,8 @@ Pane Screen::status()
 
 task<result<void>> Screen::flush()
 {
+    if (!conn_)
+        co_return Error::of(Kind::Unsupported);
     if (Option<Error> e = conn_->error())
         co_return *e;
     sync();
@@ -760,8 +764,122 @@ task<result<Key>> Screen::next_key()
 
 void Screen::geometry(u32 &cols, u32 &rows) const
 {
-    cols = conn_->cols;
-    rows = conn_->rows;
+    cols = conn_ ? conn_->cols : 0;
+    rows = conn_ ? conn_->rows : 0;
+}
+
+// ---------------------------------------------------------------------------
+// Braam's `proc/screen.h`
+// ---------------------------------------------------------------------------
+
+namespace detail {
+
+namespace {
+
+struct ProcTerm {
+    Screen s;
+    bool tried = false;
+};
+
+ProcTerm &term()
+{
+    static ProcTerm t;
+    return t;
+}
+
+} // namespace
+
+Screen &proc_screen()
+{
+    return term().s;
+}
+
+void reset_screen()
+{
+    term().s     = Screen();
+    term().tried = false;
+}
+
+task<result<void>> proc_connect()
+{
+    ProcTerm &t = term();
+    if (t.s.connected())
+        co_return ok();
+    if (t.tried)
+        co_return Error::of(Kind::Unsupported);
+    t.tried = true;
+    CO_LET(s, co_await Screen::connect());
+    t.s = std::move(s);
+    co_return ok();
+}
+
+} // namespace detail
+
+task<result<TtyInfo>> tty_of(Handle fd)
+{
+    TtyInfo info;
+    Handle h = std_fd(fd);
+    // Only a standard stream can be the terminal. `in_fd` counts: a pager
+    // reading a file still paints on the screen this process was started with.
+    if (h == 0 || (h != in_fd() && h != out_fd() && h != err_fd()))
+        co_return info;
+    CO_OK(co_await detail::proc_connect());
+    info.console = true;
+    detail::proc_screen().geometry(info.at.cols, info.at.rows);
+    co_return info;
+}
+
+task<result<void>> ProcScreen::attach(u32 term_id)
+{
+    CO_OK(co_await detail::proc_connect());
+    co_return co_await detail::proc_screen().attach(term_id);
+}
+
+task<result<void>> ProcScreen::take_keys()
+{
+    CO_OK(co_await detail::proc_connect());
+    co_return co_await detail::proc_screen().take_keys();
+}
+
+task<result<void>> ProcScreen::take_screen()
+{
+    CO_OK(co_await detail::proc_connect());
+    co_return co_await detail::proc_screen().take_screen();
+}
+
+Grid &ProcScreen::grid()
+{
+    return detail::proc_screen().grid();
+}
+
+GridPane ProcScreen::root()
+{
+    Screen &s = detail::proc_screen();
+    return GridPane(s.grid(), s.root());
+}
+
+GridPane ProcScreen::body()
+{
+    Screen &s = detail::proc_screen();
+    return GridPane(s.grid(), s.body());
+}
+
+GridPane ProcScreen::status()
+{
+    Screen &s = detail::proc_screen();
+    return GridPane(s.grid(), s.status());
+}
+
+task<result<void>> ProcScreen::flush()
+{
+    co_return co_await detail::proc_screen().flush();
+}
+
+task<result<Key>> ProcScreen::next_key()
+{
+    if (!detail::proc_screen().connected())
+        co_return Error::of(Kind::Unsupported);
+    co_return co_await detail::proc_screen().next_key();
 }
 
 // ---------------------------------------------------------------------------

@@ -229,6 +229,14 @@ inline constexpr std::nullopt_t None = std::nullopt;
 /// `u32 fd` and a program passes it around by that name.
 using Handle = uint32_t;
 
+/// Braam's `error_name`, over the whole error rather than the [`Kind`] alone.
+/// A `Str`, as Braam's is, which is why it is here and not in error.hpp: that
+/// header is what this one is built on.
+inline Str error_name(Error e)
+{
+    return Str(kind_name(e.kind()));
+}
+
 /// What `TRY` converts an error into. One overload per error type a koru
 /// program meets, which is the C++ spelling of the `From` impls koru-sys
 /// carries for the Rust binding.

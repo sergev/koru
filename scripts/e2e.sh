@@ -19,7 +19,8 @@ LESS=${LESS:-}
 HELLO=${HELLO:-}
 DATE=${DATE:-}
 DAEMON=${DAEMON:-$ROOT/build/koru-screen}
-CPPLESS=${CPPLESS:-$ROOT/build/cpp_less}
+CPPLESS=${CPPLESS:-$ROOT/build/cmd_less}
+CPPEDIT=${CPPEDIT:-$ROOT/build/cmd_edit}
 PIXEL=${PIXEL:-$ROOT/build/ks_pixel}
 RUN=/tmp/koru-e2e
 SOCK=$RUN/koru-screen.sock
@@ -73,7 +74,7 @@ echo "=== koru screen end to end ==="
 uname -r
 
 fence "environment"
-for f in "$PROBE" "$LESS" "$HELLO" "$DATE" "$DAEMON" "$CPPLESS"; do
+for f in "$PROBE" "$LESS" "$HELLO" "$DATE" "$DAEMON" "$CPPLESS" "$CPPEDIT"; do
 	if [ ! -x "$f" ]; then
 		echo "NOT BUILT: $f"
 		fail=1
@@ -378,6 +379,41 @@ want_eq "it catted the file instead" "$out" "line 200"
 out=$(KORU_SCREEN_BIN=/nonexistent "$CPPLESS" $RUN/fixture.txt 2>$RUN/cat.err | tail -1)
 want_eq "and so did the C++ one" "$out" "line 200"
 
+pkill -x -f "$DAEMON" 2>/dev/null
+
+# ------------------------------------------------------------------- edit
+#
+# T49b's other half: Braam's editor, with the daemon typing at it. The script
+# is fed one key at a time and **only while the editor is parked on a key
+# read**, so there is no sleep in this case and nothing to lose a race to.
+#
+# What it types: `Hi` at the start of the first line, Return **in the middle of
+# it**, `x`, End, Backspace, Down, Return, `y`, then ^S and ^Q. The file it
+# leaves behind is the whole assertion — and the Return has to be mid-line,
+# because a split at the end of one cuts nothing and a broken `split` passes.
+fence "edit"
+reset_run
+printf 'alpha\nbravo\n' >$RUN/edit.txt
+cat >$RUN/keys <<'KEYS'
+H
+i
+enter
+x
+end
+backspace
+down
+enter
+y
+ctrl+s
+ctrl+q
+KEYS
+
+KORU_SCREEN_KEYS=$RUN/keys "$CPPEDIT" $RUN/edit.txt >/dev/null 2>$RUN/edit.err
+want_eq "edit exited cleanly" "$?" "0"
+want_eq "edit wrote back what was typed" "$(cat $RUN/edit.txt)" \
+	"$(printf 'Hi\nxalph\nbravo\ny')"
+# Its temporary file is renamed over the target, so nothing is left beside it.
+want_eq "and left no temporary behind" "$(ls $RUN | grep -c '^edit.txt.tmp' || true)" "0"
 pkill -x -f "$DAEMON" 2>/dev/null
 
 fence "verdict"

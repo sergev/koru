@@ -82,6 +82,7 @@ using koru::usize;
 using koru::Err;
 using koru::Errno;
 using koru::Error;
+using koru::error_name;
 using koru::Kind;
 using koru::kind_name;
 
@@ -93,6 +94,7 @@ using koru::block_on;
 using koru::err_fd;
 using koru::in_fd;
 using koru::out_fd;
+using koru::proc_pid;
 using koru::spawn;
 
 // ------------------------------------------------------------ the operations
@@ -255,15 +257,37 @@ using koru::TIME_MONTHS;
 // -------------------------------------------------------------- the screen
 
 using koru::Grid;
-using koru::Pane;
 using koru::Rect;
 using koru::Screen;
 using koru::TextBuf;
 using koru::TextView;
 
+/// Braam's `Pane` carries the grid it paints on, so `bar.write(line)` is one
+/// argument there and two here. This is the one that carries it; koru's
+/// unbound `Pane` is `koru::Pane` and a `src/cmd` source never names it.
+using Pane = koru::GridPane;
+
+using koru::Geometry;
+using koru::ProcScreen;
+using koru::TtyInfo;
+using koru::tty_of;
+
 using koru::Key;
 using koru::Keys;
 using koru::Painter;
+
+using koru::ATTR_BOLD;
+using koru::ATTR_REVERSE;
+using koru::ATTR_UNDERLINE;
+using koru::COLOR_BLACK;
+using koru::COLOR_BLUE;
+using koru::COLOR_BRIGHT;
+using koru::COLOR_CYAN;
+using koru::COLOR_GREEN;
+using koru::COLOR_MAGENTA;
+using koru::COLOR_RED;
+using koru::COLOR_WHITE;
+using koru::COLOR_YELLOW;
 
 using koru::KEY_BACKSPACE;
 using koru::KEY_DELETE;

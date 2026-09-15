@@ -24,14 +24,25 @@ class TextBuf {
 public:
     /// Splits on `\n`. A trailing newline does not make an extra empty line;
     /// an empty input is one empty line.
-    void load(Str utf8);
+    result<void> load(Str utf8);
 
     /// One more line, for a reader that arrives a line at a time — the pager,
     /// which cannot hold the whole input twice.
-    void add(Str line) { lines_.emplace_back(line); }
+    result<void> add(Str line)
+    {
+        lines_.emplace_back(line);
+        return {};
+    }
 
-    /// Every line, newline-terminated. What an editor writes back out.
-    String serialize() const;
+    /// Every line, newline-terminated, appended to `out`. What an editor
+    /// writes back out.
+    ///
+    /// Everything that mutates a `TextBuf` answers a `result`, as Braam's
+    /// does: there the allocator returns null and a full disk is a value, and
+    /// an editor has to say so rather than lose the text. Here the allocator
+    /// throws and none of them can fail — but a `src/cmd` source is written
+    /// against the shape, and dropping it would be a source change.
+    result<void> serialize(String &out) const;
 
     size_t lines() const { return lines_.empty() ? 1 : lines_.size(); }
     Str line(size_t i) const { return i < lines_.size() ? Str(lines_[i]) : Str(); }
@@ -41,19 +52,17 @@ public:
 
     // All of these clamp: an out-of-range line or offset does nothing.
 
-    void insert(size_t row, size_t at, Str utf8);
+    result<void> insert(size_t row, size_t at, Str utf8);
 
     /// Removes the codepoint starting at `at`. Returns its length in bytes.
     size_t erase(size_t row, size_t at);
 
     /// Splits `row` at `at`, so the tail becomes row + 1.
-    void split(size_t row, size_t at);
+    result<void> split(size_t row, size_t at);
 
-    /// Appends row + 1 to `row`. Returns where the join happened, or npos
-    /// where there is no line after this one.
-    size_t join(size_t row);
-
-    static constexpr size_t npos = size_t(-1);
+    /// Appends row + 1 to `row`. Where the join happened, or `Invalid` when
+    /// there is no line after this one.
+    result<size_t> join(size_t row);
 
     /// The byte offsets of the previous and next codepoint boundary in `row`.
     size_t prev(size_t row, size_t at) const;
@@ -96,6 +105,9 @@ public:
 
     /// Repaints every row of the pane, blanking those past the end of the text.
     void paint(Pane &p, Grid &g, const TextBuf &b) const;
+
+    /// Braam's, over a pane that carries its grid.
+    void paint(GridPane &p, const TextBuf &b) const { paint(p.pane(), p.grid(), b); }
 
 private:
     size_t top_  = 0;

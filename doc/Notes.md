@@ -4404,13 +4404,14 @@ answer to the same question.
 One header, every name at global scope, nothing defined twice: `Task` is
 `koru::task`, `Result` is `koru::result`, `Error` is the one libkoru has had
 since T39. A Braam source compiles with that include line as its only edit, and
-none of `cpp/examples/hello.cpp`, `date.cpp` or `less.cpp` writes `koru::`,
-`std::`, or any other header.
+none of `cpp/examples/hello.cpp` or `date.cpp` writes `koru::`, `std::`, or any
+other header.
 
-**Only `hello.cpp` is Braam's own source.** The other two are koru's programs
-in Braam's style, and this paragraph used to name all three as evidence for a
-claim nothing checked. T49 is what measured it, and what the twenty-one
-programs in `cpp/cmd/` now check on every run.
+**Only `hello.cpp` is Braam's own source.** `date.cpp` and what was
+`less.cpp` are koru's programs in Braam's style, and this paragraph used to
+name all three as evidence for a claim nothing checked. T49 is what measured
+it, and what the twenty-three programs in `cpp/cmd/` now check on every run;
+`less` is Braam's own from T49b, and the example is gone.
 
 ### `CO_TRY(co_await f())` is an internal compiler error in GCC
 
@@ -4651,6 +4652,7 @@ pointed at `cpp/examples/hello.cpp`, `date.cpp` and `less.cpp` as the evidence.
 Two of those three are rewrites. `hello.cpp` is genuinely Braam's; `date.cpp`
 and `less.cpp` are koru's own programs in Braam's style, and a diff against the
 originals is most of the file. Nothing checked the claim, so nothing caught it.
+(T49b has since replaced the `less` example with Braam's own source.)
 
 What was actually missing was not small. Braam's programs reach for its whole
 freestanding standard library without thinking about it — `kernel/fmt.h`'s
@@ -4844,29 +4846,12 @@ That is the language-neutrality claim made on a real surface rather than on one
 demo. The two sides share no code; one of them is a program somebody else
 wrote.
 
-### `less` and `edit` are not done
+### `less` and `edit` came next, not here
 
-The plan's last paragraph asks for the full-screen half too, and this task does
-not deliver it. `cpp/examples/less.cpp` is still koru's rewrite, not Braam's
-source.
-
-What stands in the way is one design decision and its consequences. **A koru
-`Pane` does not hold its grid** — T37's finding, taken from the Rust binding,
-where lending one object twice is not allowed — so every write takes the grid
-as an argument: `bar.write(screen.grid(), line)` where Braam writes
-`bar.write(line)`. Braam's `less` and `edit` are written the second way, and so
-is `TextView::paint(Pane &, const TextBuf &)`.
-
-Four more follow from it: `ProcScreen` is default-constructed and claims
-lazily where `Screen::connect()` is an async factory; `tty_of(SYS_STDOUT)` is
-how a pager decides whether to page at all, and koru has only
-`detail::is_console`; `TextBuf`'s mutators answer `Result<void>` on Braam and
-`void` here; and the palette is `COLOR_*` rather than `KS_COLOR_*`.
-
-None of that is a limitation of the substrate — T48 already paints the same
-window from both bindings — and the additive shape is known: a second pane type
-that carries `Grid &`, a `ProcScreen` over `Screen`, and `tty_of` over
-`is_console`. It is a task of its own and doc/Plan.md now carries it.
+T49 stopped at the text programs. The full-screen half needed a second pane
+type, a `ProcScreen`, a `tty_of` and a `TextBuf` that answers `result` — five
+additions, none of them a limitation of the substrate — and it is T49b, whose
+section follows this one.
 
 ### What was shown to fail
 
@@ -4896,6 +4881,153 @@ that carries `Grid &`, a `ProcScreen` over `Screen`, and `tty_of` over
   `twin-uniq-count` fails. `uniq-count` against coreutils still passes, because
   the blank-squeezing normaliser cannot see a width — which is the point of
   having both comparisons.
+
+## The full-screen half
+
+T49b is the other two programs: Braam's `src/cmd/less.cpp` and
+`src/cmd/edit.cpp`, compiled with their include block as the only edit. They
+are the only two that drive Phase 9's pure library end to end, and until this
+task `cpp/examples/less.cpp` was koru's own rewrite standing in for one of
+them. That file is gone; `cpp/cmd/less.cpp` is Braam's, and it is what
+`scripts/e2e.sh` paints beside the Rust pager.
+
+Both halves of the done test pass. **The two bindings paint a byte-identical
+window with Braam's own source on the C++ side**, which is T48's assertion with
+the last piece of pretence taken out of it; and `edit` opens a file, is typed
+at, writes it back, and the file is compared against what was typed.
+
+### The bound pane is the alias made once
+
+T37 decided that **a koru `Pane` does not hold its grid**: two panes over one
+buffer are two aliases of it, and taking the grid at every write is how a
+language with no borrow checker says so. The Rust binding has no choice; the
+C++ one took the same shape on purpose.
+
+Braam's `Pane` holds a `Grid *`, and its programs are written that way —
+`bar.write(line)`, not `bar.write(screen.grid(), line)`. Both are now here.
+`koru::Pane` is unchanged, and `koru::GridPane` is a `Pane` with the grid
+beside it, which `braam.hpp` hoists as `Pane`. The alias is made once, by the
+object that owns the grid, instead of at every call.
+
+That is not a weakening of T37's rule so much as a restatement of where it
+binds. `ProcScreen` owns the grid and hands out panes over it; a program that
+wanted two aliases of one grid could always have had them by calling `body()`
+twice, and did — the pager does exactly that.
+
+One ambiguity comes with it. A translation unit that writes both
+`#include <koru/braam.hpp>` and `using namespace koru;` has two `Pane`s in
+scope and every use of the name is ill-formed. That is `cpp/tests/screen.cpp`,
+which qualifies `koru::Pane` now. A Braam source never does both — the point of
+`braam.hpp` is that there is no `koru::` anywhere in one — so the collision
+cannot reach a program.
+
+### `tty_of` asks whether there is a daemon, not whether there is a tty
+
+Braam's `tty_of(SYS_STDOUT)` is how a pager decides to page at all: on that
+system a program's stdout *is* the terminal, and the grid is cells, so there is
+no escape sequence to ask with.
+
+On koru the terminal is a daemon over a socket, and stdout is whatever the
+shell pointed it at. Answering from `fstat` — koru's `detail::is_console`, which
+is what the byte channel uses — would make **every redirected `less` a `cat`**,
+which is not what the program means to ask. So `tty_of` asks whether this
+process can reach a screen, which means it starts one if there is none, exactly
+as `Screen::connect` does. Only a standard stream can be the terminal; anything
+else answers `console` false without connecting.
+
+It is worth being plain that this has a side effect Braam's has not: asking the
+question opens a window. Only `less` asks it.
+
+### `ProcScreen` holds nothing
+
+Braam's is default-constructed and claims lazily, where koru's `Screen` is an
+async factory. So `ProcScreen` is a handle onto a **process-wide** screen,
+connected on the first claim and forgotten by `install` and `shutdown` as the
+standard streams are.
+
+Process-wide rather than per-object for a reason `less` demonstrates: it calls
+`tty_of` and then constructs a `ProcScreen`, and two connections would mean two
+clients, a stray socket the daemon must hold open, and a second window's worth
+of handshake for a question already answered. One connection is also what
+Braam's own header means by "this process's own terminal".
+
+`Screen` gained a `connected()` and three guards with it: `sync`, `flush` and
+`geometry` all dereferenced `conn_` and would have crashed on a `ProcScreen`
+whose claim never happened.
+
+### Everything that mutates a `TextBuf` answers a `result`
+
+`load`, `add`, `serialize`, `insert`, `split` answer `result<void>` and `join`
+answers `result<size_t>`, as Braam's do. None of them can fail here — the C++
+allocator throws — and that is exactly the argument `String`'s fallible
+`push`/`append` already made at T49: a `src/cmd` source is written against the
+shape, and `if (e->buf.split(row, off).is_err())` is a source change if the
+shape is not there.
+
+`join` reporting `Invalid` where there is no line after this one replaces
+returning `npos`, which is Braam's answer and one fewer sentinel.
+
+### A keystroke had no way in
+
+The pager's case asserts that it painted; the editor's has to assert what it
+typed, and a key has only ever reached the daemon from an SDL window. A shell
+test has no window and no way to press anything.
+
+So the daemon takes `KORU_SCREEN_KEYS`, a file of one key per line — a
+character, a named key, or `ctrl+x` — which it types in as if somebody were at
+the window. It joins `KORU_SCREEN_ONCE` and `KORU_SCREEN_SNAP`, which are there
+for the same reason.
+
+**A key is fed only while a client is parked on a `KEY_READ`.** `conn_parked`
+already existed for the C1 accounting, and using it as the gate makes the
+script self-paced: the program repaints, asks for the next key, and only then
+is one typed. There is no sleep anywhere in that case and no race to lose. It
+is also load-bearing rather than tidy — see below.
+
+### What was shown to fail
+
+- **The parked-reader gate, removed.** Every key is typed into the first eleven
+  turns of the daemon's loop, before the editor has connected; `server_key`
+  drops a keystroke nobody is reading, and `edit` waits for ever. The guest is
+  killed at the timeout. That is the whole argument for the gate, and it is not
+  a subtle failure.
+- **`TextBuf::split` not cutting the head back.** `edit` writes `Hialpha` where
+  the text says `Hi`, and only that assertion fails. **The first version of the
+  key script did not catch it**: it typed `End` before `Return`, so every split
+  was at the end of a line, where there is nothing to cut. The script splits
+  mid-line now, and the case comment says why.
+- **One character of Braam's `less` status line changed.** The two windows
+  differ at byte 86,547 and `cmp` says so — the same perturbation T48 used, now
+  with Braam's own source on the C++ side.
+
+### A flake that was already there
+
+Running the C++ device suite eight times over, which this task did because it
+changed so much of libkoru, turned up a failure in **one run in five**:
+
+    FAIL handles_release_drains_the_table_at_close_not_after_the_delay:
+        file-nr went from 92 to 32
+
+The case samples `/proc/sys/fs/file-nr`, opens a ring and a handle, and samples
+again; the second reading must exceed the first by two. It is a **global**
+counter and it lags — file structs an earlier case dropped are still counted
+for a while — so the baseline was still falling when it was taken, and the
+later sample came out below it. The 500-open case two above it is what supplies
+the sixty.
+
+The tree before this task fails it the same way, with the same numbers, so it
+is a T39 flake and not a T49b one; it went unnoticed because nothing had had
+reason to run that suite eight times in a row. `file_nr_settled` waits for two
+readings to agree now rather than sleeping once, in both bindings — the Rust
+suite has the same helper and the same hole, and only its test ordering hid it.
+
+### What Braam's `less` does that koru's rewrite did not
+
+Its status line is built in a `Buf<80>`, which truncates at eighty **bytes**
+where the pane clips at eighty **cells**. With a long enough path the em dash
+would be cut mid-sequence and the two bindings would disagree — the window in
+the gate is 80 cells and the fixture's path fits. It is Braam's own limit, not
+koru's, and the pane's clip is what would hide it from a shorter path.
 
 ## Known gaps, accepted for the PoC
 
@@ -5078,12 +5210,13 @@ arrive with their tasks.
 - `cpp/src/main.cpp` — the `main` a koru program does not write. Its own
   library, `koru_start`, with `proc_main.cpp` beside it as `koru_start_proc`
   for a source whose entry is Braam's.
-- `cpp/examples/read_file.cpp`, `hello.cpp`, `date.cpp`, `less.cpp` — the
-  C++20 demo and three programs in Braam's style, each with a Rust twin the
-  gates compare it against. Only `hello.cpp` is Braam's own source.
-- `cpp/cmd/` — twenty-one of Braam's `src/cmd` sources, each with its include
+- `cpp/examples/read_file.cpp`, `hello.cpp`, `date.cpp` — the C++20 demo and
+  two programs in Braam's style, each with a Rust twin the gates compare it
+  against. Only `hello.cpp` is Braam's own source.
+- `cpp/cmd/` — twenty-three of Braam's `src/cmd` sources, each with its include
   block replaced and **nothing else changed**. A diff against Braam is what
-  they are for, so they are not to be tidied.
+  they are for, so they are not to be tidied. `less` and `edit` are the
+  full-screen two.
 
 `test/koru_check` stays the kernel's own check and is not superseded by the
 Rust suite: it owns the fuzz, the two `rmmod` races and the heavy-phase leak

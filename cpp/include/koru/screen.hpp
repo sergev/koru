@@ -75,6 +75,21 @@ inline constexpr u32 KEY_END       = KS_KEY_END;
 inline constexpr u32 KEY_PAGE_UP   = KS_KEY_PAGE_UP;
 inline constexpr u32 KEY_PAGE_DOWN = KS_KEY_PAGE_DOWN;
 
+// The palette and the attributes, in Braam's spelling of the protocol's.
+inline constexpr u8 ATTR_BOLD      = KS_ATTR_BOLD;
+inline constexpr u8 ATTR_UNDERLINE = KS_ATTR_UNDERLINE;
+inline constexpr u8 ATTR_REVERSE   = KS_ATTR_REVERSE;
+
+inline constexpr u8 COLOR_BLACK   = KS_COLOR_BLACK;
+inline constexpr u8 COLOR_RED     = KS_COLOR_RED;
+inline constexpr u8 COLOR_GREEN   = KS_COLOR_GREEN;
+inline constexpr u8 COLOR_YELLOW  = KS_COLOR_YELLOW;
+inline constexpr u8 COLOR_BLUE    = KS_COLOR_BLUE;
+inline constexpr u8 COLOR_MAGENTA = KS_COLOR_MAGENTA;
+inline constexpr u8 COLOR_CYAN    = KS_COLOR_CYAN;
+inline constexpr u8 COLOR_WHITE   = KS_COLOR_WHITE;
+inline constexpr u8 COLOR_BRIGHT  = KS_COLOR_BRIGHT;
+
 /// One blit frame's payload: the header, then the cells row by row. Pure, so
 /// it is tested without a socket.
 String pack_blit(const Grid &g, Rect d);
@@ -167,6 +182,10 @@ public:
     /// What the daemon last said the terminal is, without asking again.
     void geometry(u32 &cols, u32 &rows) const;
 
+    /// Whether the handshake happened. A default-constructed `Screen` paints
+    /// nothing and answers `Unsupported`.
+    bool connected() const { return bool(conn_); }
+
 private:
     static task<result<Screen>> build(int fd, bool own);
 
@@ -177,6 +196,82 @@ private:
     Grid grid_;
     /// Closed by the destructor where this `Screen` opened it. -1 otherwise.
     int sock_ = -1;
+};
+
+// ---------------------------------------------------------------------------
+// Braam's `proc/screen.h`
+// ---------------------------------------------------------------------------
+
+/// The geometry, which every reply carries so that a resize needs no event to
+/// subscribe to.
+struct Geometry {
+    u32 cols = 0;
+    u32 rows = 0;
+};
+
+/// Whether a descriptor is the terminal, and how big it is. `at` is zero
+/// unless `console` is true.
+struct TtyInfo {
+    bool console = false;
+    Geometry at;
+};
+
+/// Braam's: the only way to tell a terminal from a pipe, because the grid is
+/// cells and there is no escape sequence to ask with.
+///
+/// **On koru the terminal is a daemon, not a descriptor**, so this asks
+/// whether this process can reach a screen — which means it starts one if
+/// there is none, exactly as `Screen::connect` does. That is the question a
+/// pager is really asking, and answering it from `fstat` instead would make
+/// every redirected `less` a `cat`. Only a standard stream can be the
+/// terminal; anything else answers `console` false.
+task<result<TtyInfo>> tty_of(Handle fd);
+
+namespace detail {
+
+/// This process's screen, whether or not it is connected yet.
+Screen &proc_screen();
+
+/// Connects it, once. `Unsupported` where there is no screen to be had, and
+/// the same answer to every later ask: a daemon that could not be started once
+/// will not be started per call.
+task<result<void>> proc_connect();
+
+/// Forget it. A new ring means a new connection, so `install` and `shutdown`
+/// call this as they call `reset_std`.
+void reset_screen();
+
+} // namespace detail
+
+/// Braam's `ProcScreen`: the terminal from inside a process, default-
+/// constructed and claimed lazily.
+///
+/// It holds nothing. The connection is the *process's*, not this object's,
+/// which is what lets `tty_of` and a `ProcScreen` made after it share one —
+/// and it is what Braam's own header means by "this process's own terminal".
+class ProcScreen {
+public:
+    ProcScreen()  = default;
+    ~ProcScreen() = default;
+
+    ProcScreen(const ProcScreen &)            = delete;
+    ProcScreen &operator=(const ProcScreen &) = delete;
+
+    /// Binds to a screen other than this process's own. Reserved for the
+    /// multiplexing this plan defers, so the daemon answers `-ENOSYS`.
+    task<result<void>> attach(u32 term_id);
+
+    task<result<void>> take_keys();
+    task<result<void>> take_screen();
+
+    Grid &grid();
+    GridPane root();
+    /// The whole grid minus the bottom row, and that row.
+    GridPane body();
+    GridPane status();
+
+    task<result<void>> flush();
+    task<result<Key>> next_key();
 };
 
 } // namespace koru

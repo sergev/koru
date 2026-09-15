@@ -27,7 +27,7 @@ size_t min_of(size_t a, size_t b)
 // TextBuf
 // ---------------------------------------------------------------------------
 
-void TextBuf::load(Str utf8)
+result<void> TextBuf::load(Str utf8)
 {
     lines_.clear();
     size_t at = 0;
@@ -45,16 +45,17 @@ void TextBuf::load(Str utf8)
     if (lines_.empty())
         lines_.emplace_back();
     modified_ = false;
+    return {};
 }
 
-String TextBuf::serialize() const
+result<void> TextBuf::serialize(String &out) const
 {
-    String out;
+    out.clear();
     for (const String &l : lines_) {
         out += l;
         out += '\n';
     }
-    return out;
+    return {};
 }
 
 void TextBuf::ensure(size_t row)
@@ -70,11 +71,12 @@ size_t TextBuf::clamp(size_t row, size_t at) const
     return is_boundary(s, at) ? at : prev(row, at);
 }
 
-void TextBuf::insert(size_t row, size_t at, Str utf8)
+result<void> TextBuf::insert(size_t row, size_t at, Str utf8)
 {
     ensure(row);
     lines_[row].insert(clamp(row, at), utf8);
     modified_ = true;
+    return {};
 }
 
 size_t TextBuf::erase(size_t row, size_t at)
@@ -87,7 +89,7 @@ size_t TextBuf::erase(size_t row, size_t at)
     return end - at;
 }
 
-void TextBuf::split(size_t row, size_t at)
+result<void> TextBuf::split(size_t row, size_t at)
 {
     ensure(row);
     size_t k    = clamp(row, at);
@@ -95,12 +97,13 @@ void TextBuf::split(size_t row, size_t at)
     lines_[row].truncate(k);
     lines_.insert(lines_.begin() + long(row) + 1, std::move(tail));
     modified_ = true;
+    return {};
 }
 
-size_t TextBuf::join(size_t row)
+result<size_t> TextBuf::join(size_t row)
 {
     if (row + 1 >= lines_.size())
-        return npos;
+        return Err(Error::Invalid);
     size_t at = lines_[row].size();
     lines_[row] += lines_[row + 1];
     lines_.erase(lines_.begin() + long(row) + 1);

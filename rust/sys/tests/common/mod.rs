@@ -238,9 +238,20 @@ pub fn file_nr() -> i64 {
 }
 
 /// `fput` can be deferred to task work, so let it settle first.
+/// The counter is global and lags: file structs an earlier test dropped are
+/// still counted for a while, so one sleep is not a settled reading. Two reads
+/// that agree is. The C++ suite is what caught this, at T49b.
 pub fn file_nr_settled() -> i64 {
-    std::thread::sleep(std::time::Duration::from_millis(100));
-    file_nr()
+    let mut last = file_nr();
+    for _ in 0..40 {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let now = file_nr();
+        if now == last {
+            return now;
+        }
+        last = now;
+    }
+    last
 }
 
 pub fn count_fds() -> usize {

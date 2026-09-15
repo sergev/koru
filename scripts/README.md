@@ -211,7 +211,7 @@ a real window under SDL's offscreen driver. It is the only gate that needs all
 three of the module, SDL and a runtime directory, which is why it is its own.
 
 ```sh
-cmake -B build && cmake --build build      # the daemon, ks_pixel and cpp_less
+cmake -B build && cmake --build build      # the daemon, ks_pixel, less and edit
 (cd rust && cargo build --examples)        # less, hello, date and screen_probe
 scripts/run-e2e.sh
 ```
@@ -226,13 +226,25 @@ terminal they were started from, while a redirected stdout is untouched; and
 `less` paints a status line whose modal colour is the palette's cyan, which is
 a pixel assertion rather than "it ran".
 
-Last of all, T48's: the same pager compiled against each binding, painting the
-same file through the same daemon, and the two window snapshots compared with
-`cmp`. Two things that case depends on. The snapshot is copied **while the
-pager is still alive**: killing it gives the alternate screen back, the daemon
-repaints the scrolling one, and two blank windows then compare equal. And the
-status line's cyan is asserted on the Rust one first, because a comparison of
-two blank windows would otherwise pass.
+Then T48's, with T49b's correction: the same pager — **Braam's own source** on
+the C++ side since T49b — compiled against each binding, painting the same file
+through the same daemon, and the two window snapshots compared with `cmp`. Two
+things that case depends on. The snapshot is copied **while the pager is still
+alive**: killing it gives the alternate screen back, the daemon repaints the
+scrolling one, and two blank windows then compare equal. And the status line's
+cyan is asserted on the Rust one first, because a comparison of two blank
+windows would otherwise pass.
+
+Last of all, T49b's other half: Braam's `edit`, typed at by the daemon. A key
+has only ever reached it from an SDL window, so `KORU_SCREEN_KEYS` names a
+file of one key per line — a character, a named key, or `ctrl+x` — which the
+daemon types in. **A key is fed only while a client is parked on a
+`KEY_READ`**, so the script is self-paced and there is no sleep in that case at
+all; without the gate every key is dropped before the editor connects and it
+waits for ever.
+What the editor leaves in the file is the assertion, and its `Return` is typed
+**mid-line**, because a split at the end of a line cuts nothing and a broken
+`TextBuf::split` would pass.
 
 The byte channel's cases need a terminal to be started from, which `script`
 supplies: the child's stdout is a pty, so what the pty saw is exactly what
@@ -278,7 +290,7 @@ an unfiltered run reached (a filter matching nothing runs none and exits 0), a
 ## The portability proof
 
 `scripts/run-portability.sh` boots the VM and runs `scripts/portability.sh` in
-it: T49's twenty-one Braam programs from `cpp/cmd/`, each against its coreutils
+it: T49's twenty-one text programs from `cpp/cmd/`, each against its coreutils
 equivalent on a fixture tree, and five of them against their idiomatic-Rust
 twins. It builds its own sanitized directory, `build-port/`, because the done
 test is that the programs are correct **and** clean under ASan and UBSan.

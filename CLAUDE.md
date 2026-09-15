@@ -335,11 +335,12 @@ slot in unspecified order and works only by luck.
 T44–T48 are Phase 11, Braam's whole userspace API in C++ over T39–T43's
 core: the vocabulary and the ambient ring, the operation layer, the buffered
 stream and its iterators, the program shell, and the screen client.
-`cpp/include/koru/braam.hpp` hoists every name to global scope, and `hello`,
-`date` and `less` in `cpp/examples/` are each compared against their Rust
-twin, `less` **in pixels**: two bindings that share no code paint a
-byte-identical window through one daemon. Only `hello` is Braam's own source,
-which is what T49 found out.
+`cpp/include/koru/braam.hpp` hoists every name to global scope, and `hello`
+and `date` in `cpp/examples/` are each compared against their Rust twin, while
+`cpp/cmd/less.cpp` is compared **in pixels**: two bindings that share no code
+paint a byte-identical window through one daemon. Only `hello` is Braam's own
+source of the two examples, which is what T49 found out; `less` is Braam's
+since T49b.
 
 Five things Phase 11 taught. **`CO_TRY(co_await f())` is an internal compiler
 error in GCC** — a statement expression holding both a `co_await` and a
@@ -358,20 +359,31 @@ frames instead, and that is what `put_fast` moves. And **the window snapshot
 has to be copied while the pager is still alive**, or the daemon repaints the
 scrolling screen on its way out and two blank windows compare equal.
 
-T49 is Phase 12, the portability proof: twenty-one of Braam's twenty-two text
-programs in `cpp/cmd/`, their include block the only edit, each compared
+T49 and T49b are Phase 12, the portability proof: twenty-three of Braam's
+twenty-four `src/cmd` programs in `cpp/cmd/`, their include block the only
+edit. `scripts/run-portability.sh` compares each of the twenty-one text ones
 against its coreutils equivalent on a fixture tree under ASan and UBSan, and
-five of them compared against idiomatic-Rust twins byte for byte.
-`scripts/run-portability.sh` is the gate — 118 cases in one VM boot.
+five of them against idiomatic-Rust twins byte for byte — 118 cases in one VM
+boot. `scripts/run-e2e.sh` has the other two: Braam's `less` painting a window
+`cmp`-identical to the Rust pager's, and Braam's `edit` typed at by a scripted
+keyboard and writing back what was typed.
 
-It needed seven headers the surface did not have (`fmt`, `text`, `path`,
+T49 needed seven headers the surface did not have (`fmt`, `text`, `path`,
 `size`, `ftoa`, `alloc`, `sysabi`), `Str`, `String` and `Vec` **derived** from
 their standard types rather than aliased, and five fixes in libkoru that real
 programs found: `OptParse` dangled a temporary `Args`, `Args` had no `v`,
 `Opt::name` had to go back to being a byte, `open_at` answers `Result<i32>`,
 and `File::err()` collided with Braam's sticky-error accessor. `tee` is the one
-program that does not port, because signals are out of scope. `less` and `edit`
-are not done and are T49b in the plan.
+program that does not port, because signals are out of scope.
+
+T49b added the five the screen needed: `GridPane`, which is a `Pane` **with**
+its grid and what `braam.hpp` hoists as `Pane`; `ProcScreen`, a handle onto a
+process-wide screen connected on the first claim; `tty_of`, which on koru asks
+whether a daemon can be reached rather than whether a descriptor is a
+character device; a `TextBuf` whose mutators answer `result`; and the `COLOR_*`
+palette. The daemon also grew `KORU_SCREEN_KEYS`, a scripted keyboard — a key
+is fed **only while a client is parked on a `KEY_READ`**, which is what makes
+the editor's case self-paced and sleep-free.
 
 T14 made the two userspace ABI mirrors a diff rather than a promise.
 `cpp/include/koru_abi.h` and `cpp/include/koru_errno.h` are the C mirrors,
@@ -401,9 +413,11 @@ its fastest gate: no VM, no device, no module.
   `koru-macros`, `#[koru::main]` alone. Cargo names the package, so `-p
   koru-sys` and `use koru_sys::` are unaffected by the directory. The examples
   in `rust/runtime/examples/` are programs, so the guest runs them.
-- `cpp/cmd/` — T49's proof: Braam's own `src/cmd` sources, each with its
-  include block replaced by `<koru/braam.hpp>` and **nothing else changed**.
-  Do not tidy them; a diff against Braam is what they are for.
+- `cpp/cmd/` — Phase 12's proof: twenty-three of Braam's own `src/cmd`
+  sources, each with its include block replaced by `<koru/braam.hpp>` and
+  **nothing else changed**. Do not tidy them; a diff against Braam is what they
+  are for. `less` and `edit` are the full-screen two, and the e2e gate is
+  theirs.
 - `cpp/` — the C++ binding. `include/koru_abi.h` and `include/koru_errno.h`
   are the C mirrors, shared with `test/`, and `tools/abi_dump.cpp` dumps them;
   `include/koru/` and `src/` are `libkoru` itself — the synchronous core, the
@@ -422,7 +436,9 @@ its fastest gate: no VM, no device, no module.
   own suite, the pixel oracles, the rejection matrix and the two fuzz oracles;
   `tools/` holds the dump, the C11 probe, the font generator and `ks_show`.
   The daemon has **zero koru dependencies** and builds on the host with no VM.
-  SDL3 is the renderer's alone: without it everything else still builds.
+  SDL3 is the renderer's alone: without it everything else still builds. Three
+  environment variables are test plumbing and nothing else: `KORU_SCREEN_ONCE`,
+  `KORU_SCREEN_SNAP` and, from T49b, `KORU_SCREEN_KEYS`, a scripted keyboard.
 - `scripts/` — the guest-side check and the host-side runner that boots the VM,
   plus the dev kernel's config fragment. It has its own README.
 

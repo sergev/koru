@@ -11,6 +11,9 @@
 // over one buffer would be two aliases of it, and every write taking the grid
 // is what says so in a language with no borrow checker either. doc/Notes.md
 // has the reasoning.
+//
+// `GridPane` below is that alias made once rather than per call, which is what
+// Braam's own `Pane` is and what its `src/cmd` sources are written against.
 
 #ifndef KORU_GRID_HPP
 #define KORU_GRID_HPP
@@ -129,6 +132,58 @@ private:
     u8 fg_    = KS_COLOR_WHITE;
     u8 bg_    = KS_COLOR_BLACK;
     u8 attrs_ = 0;
+};
+
+/// Braam's `Pane`: a [`Pane`] **with** the grid it paints on, so every call is
+/// the one-argument one a `src/cmd` source writes. `braam.hpp` hoists this as
+/// `Pane`, and `ProcScreen` is what hands one out.
+///
+/// The unbound `Pane` above stays exactly as it was: two of them over one grid
+/// are two aliases of it, and taking the grid per call is what says so in a
+/// language with no borrow checker. This is the same rule with the alias made
+/// once, by the object that owns the grid, rather than at every write.
+class GridPane {
+public:
+    GridPane() = default;
+    GridPane(Grid &g, Pane p) : g_(&g), p_(p) {}
+
+    static GridPane of(Grid &g) { return GridPane(g, Pane::of(g)); }
+
+    u32 width() const { return p_.width(); }
+    u32 height() const { return p_.height(); }
+
+    GridPane sub(u32 x, u32 y, u32 w, u32 h) const { return bind(p_.sub(x, y, w, h)); }
+    GridPane top(u32 rows) const { return bind(p_.top(rows)); }
+    GridPane bottom(u32 rows) const { return bind(p_.bottom(rows)); }
+
+    /// Braam's default is no attributes; koru's `Pane` asks for all three.
+    void style(u8 fg, u8 bg, u8 attrs = 0) { p_.style(fg, bg, attrs); }
+
+    /// Braam's name for `move_to`. Both are here: `move` is what a `src/cmd`
+    /// source writes, and `move_to` is what the rest of this binding does.
+    void move(u32 x, u32 y) { p_.move_to(x, y); }
+    void move_to(u32 x, u32 y) { p_.move_to(x, y); }
+
+    u32 cursor_x() const { return p_.cursor_x(); }
+    u32 cursor_y() const { return p_.cursor_y(); }
+
+    void put(u32 ch) { p_.put(*g_, ch); }
+    void write(Str text) { p_.write(*g_, text); }
+    void write_at(u32 x, u32 y, Str text) { p_.write_at(*g_, x, y, text); }
+    void fill_row() { p_.fill_row(*g_); }
+    void clear() { p_.clear(*g_); }
+    void place_cursor(u32 x, u32 y) const { p_.place_cursor(*g_, x, y); }
+
+    /// The two halves, for the code that still takes them apart.
+    Pane &pane() { return p_; }
+    const Pane &pane() const { return p_; }
+    Grid &grid() const { return *g_; }
+
+private:
+    GridPane bind(Pane p) const { return GridPane(*g_, p); }
+
+    Grid *g_ = nullptr;
+    Pane p_;
 };
 
 } // namespace koru

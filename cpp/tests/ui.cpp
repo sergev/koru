@@ -203,7 +203,8 @@ CASE(textbuf_editing_marks_the_buffer_and_serialising_puts_it_back)
     CHECK(b.modified());
     CHECK_EQ(b.erase(0, 1), 1);
     CHECK(b.line(0) == "ab");
-    CHECK(b.serialize() == "ab\ncd\n");
+    String out;
+    CHECK(b.serialize(out).ok() && out == "ab\ncd\n");
 }
 
 CASE(textbuf_a_split_and_a_join_are_inverses)
@@ -212,10 +213,10 @@ CASE(textbuf_a_split_and_a_join_are_inverses)
     b.split(0, 2);
     CHECK(b.line(0) == "ab");
     CHECK(b.line(1) == "cd");
-    CHECK_EQ(b.join(0), 2);
+    CHECK_EQ(b.join(0).value(), size_t(2));
     CHECK(b.line(0) == "abcd");
     CHECK_EQ(b.lines(), 1);
-    CHECK(b.join(0) == TextBuf::npos); // there is no line after the last
+    CHECK(b.join(0).error() == Kind::Invalid); // there is no line after the last
 }
 
 /// The offsets are bytes and the columns are codepoints, which is the

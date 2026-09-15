@@ -108,6 +108,7 @@ SetupConfig default_config()
 void install(Executor &ex)
 {
     detail::reset_std();
+    detail::reset_screen();
     Ambient &a = amb();
     a.ex       = &ex;
     a.screen   = 0;
@@ -163,6 +164,7 @@ void shutdown()
     if (Executor *ex = try_current())
         ex->drop_tasks();
     detail::reset_std();
+    detail::reset_screen();
     amb().ex = nullptr;
     amb().pos.clear();
     amb().screen = 0;
@@ -196,6 +198,11 @@ bool is_screen(Handle h)
 void spawn(task<void> t)
 {
     current().spawn(std::move(t));
+}
+
+u32 proc_pid()
+{
+    return u32(::getpid());
 }
 
 void at_exit(std::function<task<void>()> f)

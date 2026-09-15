@@ -199,19 +199,24 @@ permission-checks as root — the check proves that by deliberately moving one t
 a worker and watching an unprivileged process delete a file it had no business
 touching.
 
-**Twenty-one of Braam's own programs now compile against koru with their
+**Twenty-three of Braam's own programs now compile against koru with their
 include block as the only edit** — `echo`, `basename`, `dirname`, `pwd`, `seq`,
 `sleep`, `touch`, `mkdir`, `rm`, `ln`, `truncate`, `date`, `cat`, `wc`, `head`,
-`tail`, `tr`, `cut`, `uniq`, `cmp` and `grep` — and each is compared against
-its coreutils equivalent on a fixture tree, under ASan and UBSan. Five of them
+`tail`, `tr`, `cut`, `uniq`, `cmp` and `grep`, and the full-screen two, `less`
+and `edit`. Each of the twenty-one text programs is compared against its
+coreutils equivalent on a fixture tree, under ASan and UBSan, and five of them
 are written again as idiomatic Rust against the same function names and
-compared against the C++ ones byte for byte. That is the language-neutrality
-claim made on somebody else's programs rather than on a demo.
-`scripts/run-portability.sh` is the gate.
+compared against the C++ ones byte for byte.
+`scripts/run-portability.sh` is that gate.
 
-The twenty-second, `tee`, does not port: it wants signals, which this API
-leaves out on purpose. The two full-screen programs, `less` and `edit`, are not
-done either; `doc/Plan.md` says exactly what stands in the way.
+`less` and `edit` are the screen's: Braam's pager paints a window
+**byte-identical** to the Rust one's through the same daemon, and Braam's
+editor is typed at by a scripted keyboard and writes back what was typed.
+`scripts/run-e2e.sh` is that one. Language-neutrality made on somebody else's
+programs rather than on a demo — and on one that paints.
+
+The twenty-fourth, `tee`, does not port: it wants signals, which this API
+leaves out on purpose.
 
 The kernel surface is complete.
 

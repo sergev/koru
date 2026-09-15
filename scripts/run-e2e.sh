@@ -32,10 +32,12 @@ if [ ! -x "$ROOT/build/koru-screen" ]; then
 	echo "the daemon is not built: cmake -B build && cmake --build build" >&2
 	exit 1
 fi
-if [ ! -x "$ROOT/build/cpp_less" ]; then
-	echo "the C++ pager is not built: cmake -B build && cmake --build build" >&2
-	exit 1
-fi
+for prog in cmd_less cmd_edit; do
+	if [ ! -x "$ROOT/build/$prog" ]; then
+		echo "$prog is not built: cmake -B build && cmake --build build" >&2
+		exit 1
+	fi
+done
 
 # Ask cargo where the examples are, rather than globbing target/debug, where a
 # stale binary would outlive a failed build and pass.
@@ -61,7 +63,8 @@ cd "$ROOT" || exit 1
 
 out=$(timeout "$TIMEOUT" vng --run "$KDIR" --user root --memory "$MEMORY" --cpus "$CPUS" \
 	--exec "PROBE='$PROBE' LESS='$LESS' HELLO='$HELLO' DATE='$DATE' \
-		DAEMON='$ROOT/build/koru-screen' CPPLESS='$ROOT/build/cpp_less' \
+		DAEMON='$ROOT/build/koru-screen' CPPLESS='$ROOT/build/cmd_less' \
+		CPPEDIT='$ROOT/build/cmd_edit' \
 		PIXEL='$ROOT/build/ks_pixel' sh scripts/e2e.sh" 2>&1)
 
 verdict=$(echo "$out" | grep -oE 'KORU-E2E-(PASS|FAIL)' | tail -1)

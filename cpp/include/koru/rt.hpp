@@ -35,6 +35,10 @@ void reset_std();
 /// none to have. Defined by screen.cpp.
 Handle adopt_byte_channel(Executor &ex);
 
+/// Forget this process's screen. A new ring means a new connection. Defined by
+/// screen.cpp.
+void reset_screen();
+
 } // namespace detail
 
 /// A 64 KiB slot is Braam's own read budget, and eight of them is half a
@@ -77,6 +81,10 @@ bool is_screen(Handle h);
 /// Braam's `proc_spawn`, without its eight-task ceiling: the program ends when
 /// the root task returns, whatever the others are doing.
 void spawn(task<void> t);
+
+/// This process's id. Braam's `proc/rt.h` has it for the same reason `edit`
+/// does: a temporary file needs a name nothing else will pick.
+u32 proc_pid();
 
 /// Run `f` after the program's own task resolves, last registered first.
 /// A destructor cannot await, so this is where a buffered writer flushes.

@@ -158,20 +158,15 @@ target_link_libraries(cpp_date PRIVATE koru_start)
 target_compile_options(cpp_date PRIVATE ${KORU_WARNINGS} -O2 ${KORU_SAN_FLAGS})
 target_link_options(cpp_date PRIVATE ${KORU_SAN_FLAGS})
 
-# T48's: Braam's pager, painting a real window through the daemon.
-# scripts/e2e.sh runs it beside the Rust one and compares the two window
-# snapshots byte for byte.
-add_executable(cpp_less cpp/examples/less.cpp)
-target_link_libraries(cpp_less PRIVATE koru_start)
-target_compile_options(cpp_less PRIVATE ${KORU_WARNINGS} -O2 ${KORU_SAN_FLAGS})
-target_link_options(cpp_less PRIVATE ${KORU_SAN_FLAGS})
-
 # T49: Braam's own `src/cmd` programs, each with its include block replaced by
 # `<koru/braam.hpp>` and nothing else changed. They are the portability proof,
 # so they are listed one by one rather than globbed — a source that stopped
 # compiling must break the build, not quietly leave the list.
+# `less` and `edit` are the full-screen half, T49b's: they are the only two
+# that exercise the screen client end to end, and `cmd_less` is what
+# scripts/e2e.sh paints beside the Rust pager.
 set(KORU_CMD echo basename dirname pwd seq sleep touch mkdir rm ln truncate
-             date cat wc head tail tr cut uniq cmp grep)
+             date cat wc head tail tr cut uniq cmp grep less edit)
 # Braam writes `move(x)` unqualified, because its own `move` is at global
 # scope; here the name is `std::move`, and clang warns on every such call under
 # -Wunqualified-std-cast-call. The warning is about this binding's hoisting and

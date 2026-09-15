@@ -11,6 +11,7 @@
 //   KORU_SCREEN_SOCK=/tmp/s koru-screen
 //   KORU_SCREEN_ONCE=1 koru-screen    serve one connection and exit, for tests
 //   KORU_SCREEN_SNAP=/tmp/x.bmp       write every frame there, for tests
+//   KORU_SCREEN_KEYS=/tmp/k           type this script in, for tests
 
 #include "proto.h"
 #include "window.h"
@@ -35,6 +36,82 @@ struct Client {
     Conn *cn  = nullptr;
     bool gone = false; // the peer went, noticed in the read pass
 };
+
+// ------------------------------------------------------------- the key script
+//
+// KORU_SCREEN_KEYS names a file of one key per line, which this daemon types
+// in as if somebody were at the window. It exists because a keystroke has no
+// other way in: SDL's events come from a real window, and a shell test has
+// none.
+//
+// **A key is fed only while a client is parked on a KEY_READ.** That makes the
+// script self-paced — the program repaints, asks for the next key, and only
+// then is it typed — so there is no sleep anywhere in it and no race to lose.
+
+struct KsKeyStroke {
+    uint32_t code = 0;
+    uint32_t mods = 0;
+};
+
+// One token: a named key, `ctrl+x`, or a single character.
+bool parse_key(const std::string &word, KsKeyStroke &out)
+{
+    static const struct {
+        const char *name;
+        uint32_t code;
+    } NAMED[] = {
+        { "enter", KS_KEY_ENTER },         { "backspace", KS_KEY_BACKSPACE },
+        { "tab", KS_KEY_TAB },             { "escape", KS_KEY_ESCAPE },
+        { "delete", KS_KEY_DELETE },       { "insert", KS_KEY_INSERT },
+        { "up", KS_KEY_UP },               { "down", KS_KEY_DOWN },
+        { "left", KS_KEY_LEFT },           { "right", KS_KEY_RIGHT },
+        { "home", KS_KEY_HOME },           { "end", KS_KEY_END },
+        { "pgup", KS_KEY_PAGE_UP },        { "pgdn", KS_KEY_PAGE_DOWN },
+        { "space", uint32_t(' ') },
+    };
+
+    std::string w = word;
+    out           = KsKeyStroke{};
+    if (w.rfind("ctrl+", 0) == 0) {
+        out.mods = KS_MOD_CTRL;
+        w        = w.substr(5);
+    }
+    for (const auto &n : NAMED)
+        if (w == n.name) {
+            out.code = n.code;
+            return true;
+        }
+    if (w.size() == 1) {
+        out.code = uint32_t(static_cast<unsigned char>(w[0]));
+        return true;
+    }
+    return false;
+}
+
+std::vector<KsKeyStroke> read_script(const char *path)
+{
+    std::vector<KsKeyStroke> keys;
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        fprintf(stderr, "koru-screen: %s: %s\n", path, strerror(errno));
+        return keys;
+    }
+    char line[64];
+    while (fgets(line, sizeof line, f)) {
+        std::string w(line);
+        while (!w.empty() && (w.back() == '\n' || w.back() == '\r'))
+            w.pop_back();
+        if (w.empty() || w[0] == '#')
+            continue;
+        KsKeyStroke k;
+        if (parse_key(w, k))
+            keys.push_back(k);
+        else
+            fprintf(stderr, "koru-screen: unknown key '%s'\n", w.c_str());
+    }
+    fclose(f);
+    return keys;
+}
 
 std::string sock_path()
 {
@@ -134,6 +211,11 @@ int main()
     bool once = getenv("KORU_SCREEN_ONCE") != nullptr;
     bool served = false;
 
+    std::vector<KsKeyStroke> script;
+    size_t typed = 0;
+    if (const char *path = getenv("KORU_SCREEN_KEYS"))
+        script = read_script(path);
+
     std::vector<Client> clients;
     win_present(w, *t);
 
@@ -231,6 +313,15 @@ int main()
                 break;
             }
         }
+
+        // The scripted keys, one per turn and only into a parked reader.
+        if (typed < script.size())
+            for (const Client &c : clients)
+                if (conn_parked(*c.cn)) {
+                    server_key(*srv, script[typed].code, script[typed].mods);
+                    typed++;
+                    break;
+                }
 
         // One present per turn of the loop, and only what changed is drawn.
         if (screen_damage(*t).w) {

@@ -56,7 +56,14 @@ private:
 /// final fragment with no newline is a line.
 class LineReader {
 public:
-    explicit LineReader(Input src) : src_(std::move(src)) {}
+    explicit LineReader(Input &&src) : src_(std::move(src)) {}
+
+    /// Braam's `LineReader(Input &)`, which keeps a pointer and says in its
+    /// header that the `Input` must outlive it. This **moves** it in, so that
+    /// lifetime rule is enforced rather than documented — the same trade
+    /// `File(Input &)` makes. Two constructors and not one by value: an lvalue
+    /// matches both, and that is ambiguous.
+    explicit LineReader(Input &src) : src_(std::move(src)) {}
 
     /// `out` holds the next line, without its newline. `false` past the last
     /// one.

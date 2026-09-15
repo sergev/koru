@@ -409,7 +409,7 @@ std::shared_ptr<Grid> painted(u32 cols, u32 rows, u32 ch)
 {
     std::shared_ptr<Grid> g = std::make_shared<Grid>();
     g->resize(cols, rows);
-    Pane p = Pane::of(*g);
+    koru::Pane p = koru::Pane::of(*g);
     for (u32 y = 0; y < rows; y++) {
         p.move_to(0, y);
         for (u32 x = 0; x < cols; x++)
@@ -472,7 +472,7 @@ Task<void> case_out_of_order(Fakep fake, Screen screen)
     CHECK_EQ(parked.op, OP_KEY_READ);
 
     // A blit, sent after it and answered before it.
-    Pane p = screen.root();
+    koru::Pane p = screen.root();
     p.write(screen.grid(), "x");
     answer(fake, got, 3, 0, 0, words({ 8, 4 }));
     CHECK((co_await screen.flush()).ok());
@@ -626,7 +626,7 @@ Task<void> case_stale(Fakep fake, Screen screen)
 {
     Frames got = collect(fake);
     co_await claim(fake, got, &screen, 8, 4);
-    Pane p = screen.root();
+    koru::Pane p = screen.root();
     p.write(screen.grid(), "x");
 
     answer(fake, got, 1, 0, F_STALE, words({ 20, 6 }));
@@ -689,7 +689,7 @@ Task<void> case_gone(Fakep fake, Screen screen)
     CHECK(*parked); // the parked read was completed
 
     // And every later call answers from the connection, not the wire.
-    Pane p = screen.root();
+    koru::Pane p = screen.root();
     p.write(screen.grid(), "x");
     Result<void> f = co_await screen.flush();
     CHECK(!f.ok());
